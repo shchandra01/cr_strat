@@ -1,0 +1,75 @@
+# Rating-threshold mandates: who is forced to buy or sell when an instrument's
+# effective rating crosses a threshold.
+#
+# aggregation  how ratings from several agencies combine into one effective rating
+#   worst      most conservative rating (SEBI's rule for MF credit events)
+#   best       most favourable rating
+#   kth_best   k-th best rating; k = 2 means "rated at least X by two agencies"
+#   agency     one named agency's rating (set `agency`)
+# thresholds   eligible while the effective rating is at or above the threshold;
+#              crossing it in either direction is an event
+# holders      which holders the rule binds: holder_type plus a regex on the
+#              holder's category (for MFs, the AMFI/SEBI scheme category)
+# verify       true until checked against the current primary regulation. These
+#              rules come from secondary sources and have changed over time.
+
+[[mandate]]
+name = "mf_corporate_bond_fund"
+description = "Corporate Bond Funds must hold at least 80% of assets in AA+ and above."
+aggregation = "worst"
+thresholds = ["AA+"]
+instrument_classes = ["BOND"]
+holders = [{ holder_type = "MF", category_pattern = "corporate bond" }]
+verify = true
+source = "SEBI circular on categorisation and rationalisation of MF schemes (Oct 2017); temporarily relaxed in 2020. Which rating counts when agencies differ is unconfirmed."
+
+[[mandate]]
+name = "mf_issuer_limit"
+description = "MF single-issuer limits step down by rating bucket: AAA, AA, A and below."
+aggregation = "worst"
+thresholds = ["AAA", "AA-"]
+instrument_classes = ["BOND"]
+holders = [{ holder_type = "MF", category_pattern = ".*" }]
+verify = true
+source = "SEBI review of MF investment norms (2019): roughly 10% / 8% / 6% of NAV by bucket, extendable with trustee approval."
+
+[[mandate]]
+name = "mf_below_investment_grade"
+description = "Below investment grade an MF may side-pocket the instrument; NAV write-down and redemptions follow."
+aggregation = "worst"
+thresholds = ["BBB-"]
+instrument_classes = ["BOND"]
+holders = [{ holder_type = "MF", category_pattern = ".*" }]
+verify = true
+source = "SEBI circular on segregated portfolios (Dec 2018): most conservative rating governs; issuer-level credit event applied at ISIN level."
+
+[[mandate]]
+name = "insurer_approved_investment"
+description = "Corporate bonds count as approved investments for insurers only at AA or above."
+aggregation = "worst"
+thresholds = ["AA"]
+instrument_classes = ["BOND"]
+holders = [{ holder_type = "INSURER", category_pattern = ".*" }]
+verify = true
+source = "IRDA (Investment) Regulations 2016, since consolidated. Treatment after a downgrade and the multi-rating rule are unconfirmed."
+
+[[mandate]]
+name = "nps_two_agency_aa"
+description = "NPS corporate bonds must be rated AA or above by at least two agencies."
+aggregation = "kth_best"
+k = 2
+thresholds = ["AA"]
+instrument_classes = ["BOND"]
+holders = [{ holder_type = "NPS", category_pattern = ".*" }]
+verify = true
+source = "PFRDA investment guidelines as reported in 2019; a 2018 decision may allow A-rated bonds up to a 10% cap."
+
+[[mandate]]
+name = "epfo_aa_plus"
+description = "EPFO corporate bond floor reported at AA+."
+aggregation = "worst"
+thresholds = ["AA+"]
+instrument_classes = ["BOND"]
+holders = [{ holder_type = "EPFO", category_pattern = ".*" }]
+verify = true
+source = "EPFO advisory committee decision (2017). Current pattern and any exit obligation unconfirmed."

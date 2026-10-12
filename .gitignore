@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Downloaded inputs and generated outputs stay local.
+data/raw/
+data/out/
