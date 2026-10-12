@@ -15,6 +15,7 @@ from dataclasses import dataclass
 import pandas as pd
 
 from cr_strat.mandates import Mandate
+from cr_strat.rating_actions import INSTRUMENT_CLASSES
 from cr_strat.rating_scale import LIQUIDITY_LEVELS, LT_INVESTMENT_GRADE_FLOOR, LT_NOTCH, lt_grade
 
 EVENT_COLUMNS = (
@@ -189,3 +190,16 @@ def _event(
         "first_in_window": first_in_window,
         "rule_unverified": mandate.verify,
     }
+
+
+def rating_timeline(actions: pd.DataFrame) -> pd.DataFrame:
+    """Most conservative long-term rating across agencies per issuer and instrument class over time.
+
+    Columns: issuer_id, instrument_class, date, notch, grade. A None notch
+    means every agency has withdrawn. Used to put bonds in rating peer groups.
+    """
+    worst = Mandate("worst_of_agencies", "worst", ("AAA",), instrument_classes=INSTRUMENT_CLASSES)
+    timeline, _ = build_rating_events(actions, [worst])
+    return timeline.rename(columns={"effective_notch": "notch", "effective_grade": "grade"})[
+        ["issuer_id", "instrument_class", "date", "notch", "grade"]
+    ]

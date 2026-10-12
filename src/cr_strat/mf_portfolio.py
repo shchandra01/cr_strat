@@ -11,15 +11,20 @@ passes the check digit. The per-block report says what was skipped and why.
 
 from __future__ import annotations
 
-import datetime as dt
 import re
-import warnings
 from pathlib import Path
 
 import pandas as pd
 
 from cr_strat.isin import is_valid_isin
 from cr_strat.schemes import normalize_amc, normalize_scheme_name
+from cr_strat.textparse import (
+    UNIT_MULTIPLIERS,
+    cell_str,
+    detect_multiplier,
+    parse_date_text,
+    to_number,
+)
 
 HOLDINGS_COLUMNS = (
     "as_of_date", "holder_type", "holder_id", "holder_name", "amc", "category", "isin",
@@ -30,38 +35,7 @@ REPORT_COLUMNS = (
     "source_file", "sheet", "header_row", "scheme_name", "as_of_date", "mv_multiplier",
     "rows", "status", "note",
 )
-UNIT_MULTIPLIERS = {"rupee": 1.0, "thousand": 1e3, "lakh": 1e5, "crore": 1e7}
-
 _PREAMBLE_ROWS = 15
-_DATE_PATTERNS = (
-    re.compile(r"\d{4}-\d{2}-\d{2}"),
-    re.compile(r"\d{1,2}[-/. ]+[A-Za-z]{3,9}\.?[-/. ,]+\d{2,4}"),
-    re.compile(r"[A-Za-z]{3,9}\.?\s+\d{1,2},?\s+\d{4}"),
-    re.compile(r"\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}"),
-)
-
-
-def _cell_str(value: object) -> str:
-    if value is None or (isinstance(value, float) and pd.isna(value)):
-        return ""
-    if isinstance(value, (dt.datetime, dt.date, pd.Timestamp)):
-        return pd.Timestamp(value).strftime("%Y-%m-%d")
-    return re.sub(r"\s+", " ", str(value)).strip()
-
-
-def _to_number(value: object) -> float:
-    if value is None or isinstance(value, bool):
-        return float("nan")
-    if isinstance(value, (int, float)):
-        return float(value)
-    text = re.sub(r"[,\s₹]", "", str(value))
-    negative = text.startswith("(") and text.endswith(")")
-    text = text.strip("()")
-    try:
-        number = float(text)
-    except ValueError:
-        return float("nan")
-    return -number if negative else number
 
 
 def _classify_header(text: str) -> str | None:
@@ -86,7 +60,7 @@ def _classify_header(text: str) -> str | None:
 def _map_header(row: list) -> dict[str, int] | None:
     colmap: dict[str, int] = {}
     for j, cell in enumerate(row):
-        field = _classify_header(_cell_str(cell))
+        field = _classify_header(cell_str(cell))
         if field and field not in colmap:
             colmap[field] = j
     if "isin" in colmap and ("quantity" in colmap or "market_value" in colmap):
@@ -94,41 +68,11 @@ def _map_header(row: list) -> dict[str, int] | None:
     return None
 
 
-def _detect_multiplier(text: str) -> float | None:
-    t = text.lower()
-    if re.search(r"lakh|\blacs?\b|\blac\.", t):
-        return 1e5
-    if re.search(r"crore|\bcrs?\b", t):
-        return 1e7
-    if re.search(r"thousand|'000", t):
-        return 1e3
-    if re.search(r"\b(?:rs|inr|rupees)\b|₹", t):
-        return 1.0
-    return None
-
-
-def _parse_date_text(text: str) -> pd.Timestamp | None:
-    text = re.sub(r"(\d)(?:st|nd|rd|th)\b", r"\1", text, flags=re.I)
-    for pattern in _DATE_PATTERNS:
-        m = pattern.search(text)
-        if not m:
-            continue
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            if pattern is _DATE_PATTERNS[0]:
-                value = pd.to_datetime(m.group(0), format="ISO8601", errors="coerce")
-            else:
-                value = pd.to_datetime(m.group(0), dayfirst=True, errors="coerce")
-        if not pd.isna(value):
-            return pd.Timestamp(value).normalize()
-    return None
-
-
 def _row_texts(rows: list[list]) -> list[str]:
     """Joined text of each preamble row, skipping rows that hold a valid ISIN."""
     texts = []
     for row in rows:
-        cells = [_cell_str(c) for c in row]
+        cells = [cell_str(c) for c in row]
         if any(is_valid_isin(c.upper()) for c in cells if c):
             continue
         joined = " | ".join(c for c in cells if c)
@@ -141,7 +85,7 @@ def _find_as_of(texts: list[str]) -> pd.Timestamp | None:
     for text in texts:
         m = re.search(r"as\s+(?:on|at)\s*[:\-]?\s*\|?\s*(.+)", text, re.I)
         if m:
-            found = _parse_date_text(m.group(1))
+            found = parse_date_text(m.group(1))
             if found is not None:
                 return found
     return None
@@ -208,9 +152,9 @@ def parse_mf_portfolio(
             as_of_date = forced_date or _find_as_of(texts) or _find_as_of(_row_texts(rows[:hdr]))
             mult = forced_mult
             if mult is None and "market_value" in colmap:
-                mult = _detect_multiplier(_cell_str(rows[hdr][colmap["market_value"]]))
+                mult = detect_multiplier(cell_str(rows[hdr][colmap["market_value"]]))
                 if mult is None:
-                    mult = _detect_multiplier(" ".join(texts))
+                    mult = detect_multiplier(" ".join(texts))
             notes = []
             if as_of_date is None:
                 notes.append("as-of date not found; pass --as-of")
@@ -220,11 +164,11 @@ def parse_mf_portfolio(
             count, last_data = 0, hdr
             for i in range(hdr + 1, end):
                 row = rows[i]
-                isin = _cell_str(row[colmap["isin"]]).upper()
+                isin = cell_str(row[colmap["isin"]]).upper()
                 if not is_valid_isin(isin):
                     continue
                 last_data = i
-                raw_mv = _to_number(row[colmap["market_value"]]) if "market_value" in colmap else float("nan")
+                raw_mv = to_number(row[colmap["market_value"]]) if "market_value" in colmap else float("nan")
                 records.append({
                     "as_of_date": as_of_date,
                     "holder_type": "MF",
@@ -233,12 +177,12 @@ def parse_mf_portfolio(
                     "amc": amc,
                     "category": None,
                     "isin": isin,
-                    "instrument_name": _cell_str(row[colmap["name"]]) if "name" in colmap else None,
-                    "rating_disclosed": _cell_str(row[colmap["rating"]]) if "rating" in colmap else None,
-                    "quantity": _to_number(row[colmap["quantity"]]) if "quantity" in colmap else float("nan"),
+                    "instrument_name": cell_str(row[colmap["name"]]) if "name" in colmap else None,
+                    "rating_disclosed": cell_str(row[colmap["rating"]]) if "rating" in colmap else None,
+                    "quantity": to_number(row[colmap["quantity"]]) if "quantity" in colmap else float("nan"),
                     "market_value_inr": raw_mv * mult if mult is not None else float("nan"),
                     "market_value_raw": raw_mv,
-                    "pct_nav": _to_number(row[colmap["pct_nav"]]) if "pct_nav" in colmap else float("nan"),
+                    "pct_nav": to_number(row[colmap["pct_nav"]]) if "pct_nav" in colmap else float("nan"),
                     "source_file": path.name,
                     "sheet": sheet,
                 })

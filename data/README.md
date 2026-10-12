@@ -56,7 +56,8 @@ need overrides or an archived copy.
 | `instrument_class` | yes | Same vocabulary as above; plain NCDs are `BOND` |
 | `face_value_inr` | no | Per unit. Needed to value holdings at face (quantity × face value); otherwise market value is used. Note the denomination changed over time (₹10 lakh, ₹1 lakh, ₹10,000). |
 | `outstanding_face_inr` | no | Needed for ownership shares |
-| `issue_date`, `maturity_date` | no | Used to drop ISINs not live at the event or maturing within a horizon |
+| `issue_date`, `maturity_date` | no | Used to drop ISINs not live at the event or maturing within a horizon. `maturity_date` is required for the price panel (tenor and spread). |
+| `sector` | no | e.g. PSU, NBFC, HFC, bank, corporate. Add `sector` to `--match-on` to match peers on it. |
 
 Sources: NSDL ISIN search, the information memorandum or key information
 document filed with NSE/BSE, or a vendor (Bloomberg, LSEG, CMIE Prowess).
@@ -68,3 +69,34 @@ market_value_inr`. Use `holder_type` `INSURER`, `NPS` or `EPFO` to match
 `config/mandates.toml`. Insurers' quarterly public disclosures include a
 statement of downgraded investments. NPS pension fund managers publish monthly
 scheme portfolios.
+
+## Reported trades: NSE / BSE files
+
+OTC corporate bond trades are reported on the NSE and BSE reporting platforms,
+and both exchanges publish them daily, as individual trades or as ISIN-day
+summaries. Download each venue's files into its own folder and run
+`cr-strat load-trades` per venue.
+
+The loader finds the header row by its ISIN and price/yield columns, and prefers
+weighted-average columns when a summary file has several. It reads the value
+unit from the value header ("Rs. Lakhs", "Rs. Cr"). If a file has no date
+column, pass `--trade-date`. If the value header has no unit, pass
+`--amount-unit`. The `_report.csv` lists the header it mapped to each field;
+check it on the first file from each venue.
+
+Prices are per 100 of face value and yields are in percent, as reported.
+
+## Benchmark curve: `gsec_par_curve.csv` (or an OIS curve)
+
+Long format, one row per date and tenor:
+
+| Column | Notes |
+|---|---|
+| `date` | ISO date |
+| `tenor_years` | e.g. 0.25, 0.5, 1, 2, 3, 5, 7, 10, 15, 30 |
+| `yield_pct` | Percent |
+
+FBIL publishes daily G-sec par yields; an OIS curve can come from a vendor or
+dealer marks. A curve date is used for up to 7 days. Set `--benchmark-compounding`
+to the curve's convention (G-sec yields are semi-annual) and `--bond-compounding`
+to the trade yields' convention. Spreads are computed on the bond's basis.

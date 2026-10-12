@@ -227,3 +227,15 @@ def lt_grade(notch: int | None) -> str | None:
     if notch is None:
         return None
     return LT_GRADES[notch - 1]
+
+
+def rating_bucket(notch: int | None) -> str | None:
+    """Peer bucket for spread comparisons: each grade down to A-, then BBB, SUB_IG and D."""
+    if notch is None or notch != notch:  # None or NaN
+        return None
+    notch = int(notch)
+    if notch <= LT_NOTCH["A-"]:
+        return LT_GRADES[notch - 1]
+    if notch <= LT_INVESTMENT_GRADE_FLOOR:
+        return "BBB"
+    return "D" if notch == LT_NOTCH["D"] else "SUB_IG"
