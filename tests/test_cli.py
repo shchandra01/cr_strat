@@ -80,3 +80,45 @@ def test_price_pipeline(tmp_path, isin):
     assert cbf["first_post_abn_bps"] == pytest.approx(100, abs=1)
     assert pd.isna(cbf["p60_gap_cur_bps"])  # no AA-rated peers, so no current-rating benchmark
     assert (out / "peer_spreads_weekly.csv").exists()
+
+
+def test_synthetic_market_through_backtest_and_research(tmp_path):
+    raw, out = tmp_path / "raw", tmp_path / "out"
+    assert main(["synth", "--out-dir", str(raw), "--issuers", "40", "--start", "2021-01-01", "--end", "2022-06-30",
+                 "--seed", "3"]) == 0
+    assert main(["rating-events", "--actions", str(raw / "rating_actions.csv"), "--mandates", str(CONFIG),
+                 "--out-dir", str(out)]) == 0
+    assert main(["load-trades", *map(str, sorted((raw / "trades" / "nse").glob("*.csv"))), "--venue", "NSE",
+                 "--out", str(out / "trades.csv")]) == 0
+    assert main(["price-panel", "--trades", str(out / "trades.csv"), "--securities", str(raw / "securities.csv"),
+                 "--benchmark", str(raw / "gsec_par_curve.csv"), "--rating-actions", str(raw / "rating_actions.csv"),
+                 "--out-dir", str(out)]) == 0
+    market = ["--panel", str(out / "price_panel.csv"), "--securities", str(raw / "securities.csv"),
+              "--benchmark", str(raw / "gsec_par_curve.csv"), "--rating-actions", str(raw / "rating_actions.csv")]
+    config = str(CONFIG.parent / "backtest_carry.toml")
+    assert main(["backtest", "--config", config, *market, "--events", str(out / "rating_events.csv"),
+                 "--set", "strategy.n_bonds=5", "--set", "benchmark.n_bonds=10", "--out-dir", str(out / "bt"),
+                 "--synthetic"]) == 0
+    nav = pd.read_csv(out / "bt" / "nav.csv")
+    parts = ["pnl_income", "pnl_roll", "pnl_rates", "pnl_spread", "pnl_execution", "pnl_cash"]
+    assert (nav["pnl"] - nav[parts].sum(axis=1)).abs().max() < 1e-3
+    # Sells wait for a trade in the bond, so the book can hold more names than the target while exiting.
+    assert 5 <= nav["n_positions"].max() <= 10 and len(pd.read_csv(out / "bt" / "fills.csv")) > 5
+    html = (out / "bt" / "tearsheet.html").read_text()
+    assert "Synthetic data" in html and "Growth of 100" in html
+    summary = pd.read_csv(out / "bt" / "summary.csv").set_index("metric")
+    assert {"sharpe", "information_ratio", "turnover_annual", "max_drawdown"} <= set(summary.index)
+
+    assert main(["signals", *market, "--out-dir", str(out / "sig"), "--horizons", "20,60",
+                 "--signals", "rv_bps,spread_bps"]) == 0
+    sig = pd.read_csv(out / "sig" / "signal_summary.csv")
+    assert set(sig["signal"]) == {"rv_bps", "spread_bps"}
+    assert sig.loc[sig["signal"] == "spread_bps", "n_dates"].min() > 20  # few rv_bps dates: thin peer groups
+
+    assert main(["sweep", "--config", config, *market, "--grid", "strategy.n_bonds=3,6",
+                 "--split-date", "2021-12-31", "--out", str(out / "sweep.csv")]) == 0
+    assert len(pd.read_csv(out / "sweep.csv")) == 2
+
+    assert main(["regress", "--data", str(out / "sig" / "signal_panel.csv"), "--y", "xr_60d",
+                 "--x", "rv_bps,spread_bps", "--cluster", "date", "--out", str(out / "reg.csv")]) == 0
+    assert pd.read_csv(out / "reg.csv")["term"].tolist() == ["const", "rv_bps", "spread_bps"]

@@ -1,4 +1,4 @@
-"""Command-line entry points for building the research panels (``cr-strat --help``)."""
+"""Command-line entry points: research panels, backtests, signal research and the demo (``cr-strat --help``)."""
 
 from __future__ import annotations
 
@@ -118,6 +118,145 @@ def _event_prices(args: argparse.Namespace) -> int:
     return 0
 
 
+def _market(args: argparse.Namespace):
+    from cr_strat.runner import load_market
+
+    return load_market(
+        args.panel, args.securities, args.benchmark, args.rating_actions,
+        benchmark_compounding=args.benchmark_compounding, bond_compounding=args.bond_compounding,
+        match_on=args.match_on.split(","), window_days=args.window_days, min_issuers=args.min_issuers,
+        peer_adjust=not args.no_peer_adjust,
+    )
+
+
+def _events(args: argparse.Namespace):
+    events = pd.read_csv(args.events, dtype=str) if args.events else None
+    ownership = pd.read_csv(args.ownership, dtype=str) if args.ownership else None
+    return events, ownership
+
+
+def _backtest(args: argparse.Namespace) -> int:
+    from cr_strat.backtest import run_backtest
+    from cr_strat.runner import build, load_config, read_cash_rates, set_param, write_result
+
+    raw = load_config(args.config)
+    for item in args.set or []:
+        key, _, value = item.partition("=")
+        raw = set_param(raw, key.strip(), value.strip())
+    config, execution, strategy, bench_strategy = build(raw)
+    market = _market(args)
+    events, ownership = _events(args)
+    cash = read_cash_rates(args.cash_rates) if args.cash_rates else None
+    result = run_backtest(market, strategy, config=config, execution=execution, events=events,
+                          ownership=ownership, cash_rates=cash)
+    bench = None
+    if bench_strategy is not None:
+        bench = run_backtest(market, bench_strategy, config=config, execution=execution, events=events,
+                             ownership=ownership, cash_rates=cash)
+    summary = write_result(result, Path(args.out_dir), bench, report=not args.no_report, title=args.title,
+                           synthetic=args.synthetic)
+    _print_headline(summary)
+    return 0
+
+
+def _print_headline(summary: pd.DataFrame) -> None:
+    s = summary.set_index("metric")
+    pick = [("cagr", "CAGR", True), ("sharpe", "Sharpe", False), ("max_drawdown", "max drawdown", True),
+            ("ann_excess_return", "excess return over cash", True)]
+    for key, label, pct in pick:
+        if key in s.index:
+            fmt = (lambda v: f"{v:7.2%}") if pct else (lambda v: f"{v:7.2f}")
+            print(f"{label:>26}: total {fmt(s.at[key, 'total'])}   rates-hedged {fmt(s.at[key, 'hedged'])}")
+
+
+def _sweep(args: argparse.Namespace) -> int:
+    from cr_strat.runner import load_config, parse_grid, read_cash_rates, sweep
+
+    market = _market(args)
+    events, ownership = _events(args)
+    cash = read_cash_rates(args.cash_rates) if args.cash_rates else None
+    result = sweep(market, load_config(args.config), parse_grid(args.grid), events=events, ownership=ownership,
+                   cash_rates=cash, split_date=args.split_date)
+    _write(result, Path(args.out))
+    print(f"note: {len(result)} combinations tried; read deflated_sharpe, not the best raw Sharpe")
+    return 0
+
+
+def _signals(args: argparse.Namespace) -> int:
+    from cr_strat import research
+
+    market = _market(args)
+    out = Path(args.out_dir)
+    horizons = tuple(int(h) for h in args.horizons.split(","))
+    panel = research.signal_panel(market, start=args.start, end=args.end, freq=args.freq,
+                                  max_age_days=args.max_age_days)
+    panel = research.forward_returns(market, panel, horizons, entry=args.entry,
+                                     max_end_age_days=args.max_end_age_days)
+    signals = args.signals.split(",") if args.signals else research.DEFAULT_SIGNALS
+    summary, quantiles, by_date = research.evaluate_signals(
+        panel, signals, horizons, ret=args.ret, n_quantiles=args.quantiles, neutralize_by=args.neutralize_by)
+    _write(panel, out / "signal_panel.csv")
+    _write(summary, out / "signal_summary.csv")
+    _write(quantiles, out / "signal_quantiles.csv")
+    _write(by_date, out / "signal_ic_by_date.csv")
+    if len(summary):
+        cols = ["signal", "horizon_days", "avg_n", "mean_ic", "t_stat_nw", "long_short_mean", "long_short_t_nw"]
+        print(summary[cols].to_string(index=False, float_format=lambda v: f"{v:.4f}"))
+    return 0
+
+
+def _regress(args: argparse.Namespace) -> int:
+    from cr_strat.stats import ols
+
+    df = pd.read_csv(args.data)
+    for extra in args.merge or []:
+        df = df.merge(pd.read_csv(extra), on=args.on.split(","), how="left", suffixes=("", "_merged"))
+    for item in args.assign or []:
+        name, _, expr = item.partition("=")
+        df[name.strip()] = df.eval(expr)
+    if args.where:
+        df = df.query(args.where)
+    result = ols(df, args.y, args.x.split(","), cluster=args.cluster)
+    a = result.attrs
+    print(f"OLS {a['y']} on {args.x}: n={a['n']}, R2={a['r2']:.3f}, errors={a['cov']}"
+          + (f" ({a['n_clusters']} clusters)" if a["n_clusters"] else ""))
+    print(result.to_string(index=False, float_format=lambda v: f"{v:.4f}"))
+    if args.out:
+        _write(result.assign(n=a["n"], r2=a["r2"], cov=a["cov"], n_clusters=a["n_clusters"]), Path(args.out))
+    return 0
+
+
+def _synth(args: argparse.Namespace) -> int:
+    from cr_strat.synthetic import SyntheticConfig, generate_market, write_market
+
+    cfg = SyntheticConfig(start=args.start, end=args.end, n_issuers=args.issuers, seed=args.seed,
+                          overshoot_bps_per_share=args.overshoot_bps_per_share)
+    market = generate_market(cfg)
+    paths = write_market(market, Path(args.out_dir))
+    for name, path in paths.items():
+        print(f"wrote {len(market.get(name, [])) if name in market else '':>7}  {path}")
+    print(f"note: synthetic data; {len(market['truth'])} planted forced-selling events in truth_events.csv")
+    return 0
+
+
+def _demo(args: argparse.Namespace) -> int:
+    from cr_strat.demo import run_demo
+
+    return run_demo(Path(args.out_dir), seed=args.seed, n_issuers=args.issuers, start=args.start, end=args.end)
+
+
+def _add_market_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--panel", required=True, nargs="+", help="price_panel.csv from price-panel")
+    p.add_argument("--securities", required=True, help="security master with coupon_pct and maturity_date")
+    p.add_argument("--benchmark", required=True, help="curve CSV: date, tenor_years, yield_pct")
+    p.add_argument("--rating-actions", help="rating actions CSV, for ratings as of each date")
+    p.add_argument("--bond-compounding", choices=["annual", "semiannual"], default="annual")
+    p.add_argument("--benchmark-compounding", choices=["annual", "semiannual"], default="semiannual")
+    p.add_argument("--no-peer-adjust", action="store_true",
+                   help="carry stale marks flat instead of moving them with their peer group")
+    _add_peer_args(p)
+
+
 def _add_peer_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--match-on", default="instrument_class,rating_bucket,tenor_bucket",
                    help="peer-group columns; add 'sector' if the security master has it")
@@ -187,6 +326,81 @@ def main(argv: list[str] | None = None) -> int:
                    help="days relative to the event")
     _add_peer_args(p)
     p.set_defaults(func=_event_prices)
+
+    p = sub.add_parser("backtest", help="run a strategy backtest from a TOML config")
+    p.add_argument("--config", required=True, help="e.g. config/backtest_event_reversal.toml")
+    _add_market_args(p)
+    p.add_argument("--events", help="rating_events.csv, for event strategies")
+    p.add_argument("--ownership", help="event_ownership.csv, for ownership filters")
+    p.add_argument("--cash-rates", help="CSV of date, rate_pct (TREPS or MIBOR) for interest on cash")
+    p.add_argument("--set", action="append", metavar="KEY=VALUE",
+                   help="override a config value, e.g. strategy.hold_days=60 (repeatable)")
+    p.add_argument("--out-dir", required=True)
+    p.add_argument("--title", help="tearsheet title")
+    p.add_argument("--no-report", action="store_true", help="skip the HTML tearsheet")
+    p.add_argument("--synthetic", action="store_true", help="label the tearsheet as built on synthetic data")
+    p.set_defaults(func=_backtest)
+
+    p = sub.add_parser("sweep", help="rerun a backtest over a parameter grid, with in/out-of-sample statistics")
+    p.add_argument("--config", required=True)
+    _add_market_args(p)
+    p.add_argument("--events")
+    p.add_argument("--ownership")
+    p.add_argument("--cash-rates")
+    p.add_argument("--grid", required=True, action="append", metavar="KEY=V1,V2",
+                   help="e.g. strategy.hold_days=60,120,250 (repeatable)")
+    p.add_argument("--split-date", help="report statistics separately up to and after this date")
+    p.add_argument("--out", required=True)
+    p.set_defaults(func=_sweep)
+
+    p = sub.add_parser("signals", help="information coefficients and quantile returns for bond signals")
+    _add_market_args(p)
+    p.add_argument("--out-dir", required=True)
+    p.add_argument("--signals", help="comma-separated signal columns; default spread_bps, rv_bps, "
+                                     "spread_chg_20d, spread_chg_60d, trade_days")
+    p.add_argument("--horizons", default="20,60,120", help="forward return horizons, calendar days")
+    p.add_argument("--freq", default="W-FRI", help="sampling frequency")
+    p.add_argument("--start")
+    p.add_argument("--end")
+    p.add_argument("--max-age-days", type=int, default=5, help="bonds must have traded this recently")
+    p.add_argument("--entry", choices=["next_trade", "mark"], default="next_trade",
+                   help="start returns at the next reported trade (default) or the sample-date mark")
+    p.add_argument("--max-end-age-days", type=int, default=30, help="drop returns ending on staler marks")
+    p.add_argument("--ret", choices=["xr", "tr", "dspread"], default="xr",
+                   help="excess over duration-matched risk-free (xr), total (tr) or spread change")
+    p.add_argument("--quantiles", type=int, default=5)
+    p.add_argument("--neutralize-by", help="rank signals within this column first, e.g. rating_bucket")
+    p.set_defaults(func=_signals)
+
+    p = sub.add_parser("regress", help="OLS with robust or clustered errors on any research CSV")
+    p.add_argument("--data", required=True)
+    p.add_argument("--merge", action="append", help="CSV to left-join on --on (repeatable)")
+    p.add_argument("--on", default="event_id")
+    p.add_argument("--assign", action="append", metavar="NAME=EXPR",
+                   help="derived column, e.g. reversal=first_post_abn_bps-p120_abn_bps (repeatable)")
+    p.add_argument("--where", help="row filter, e.g. \"direction == 'down'\"")
+    p.add_argument("--y", required=True)
+    p.add_argument("--x", required=True, help="comma-separated regressors")
+    p.add_argument("--cluster", help="cluster errors on this column, e.g. issuer_id")
+    p.add_argument("--out")
+    p.set_defaults(func=_regress)
+
+    p = sub.add_parser("synth", help="write a synthetic market (all raw input files) with planted effects")
+    p.add_argument("--out-dir", required=True)
+    p.add_argument("--seed", type=int, default=7)
+    p.add_argument("--issuers", type=int, default=200)
+    p.add_argument("--start", default="2019-01-01")
+    p.add_argument("--end", default="2024-12-31")
+    p.add_argument("--overshoot-bps-per-share", type=float, default=300.0)
+    p.set_defaults(func=_synth)
+
+    p = sub.add_parser("demo", help="generate a synthetic market and run the whole pipeline on it")
+    p.add_argument("--out-dir", default="data/demo")
+    p.add_argument("--seed", type=int, default=7)
+    p.add_argument("--issuers", type=int, default=200)
+    p.add_argument("--start", default="2019-01-01")
+    p.add_argument("--end", default="2024-12-31")
+    p.set_defaults(func=_demo)
 
     args = parser.parse_args(argv)
     return args.func(args)

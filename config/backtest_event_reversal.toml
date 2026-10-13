@@ -1,0 +1,65 @@
+# Forced-selling reversal: buy bonds of issuers whose rating has just fallen below a
+# mandate threshold (config/mandates.toml) and hold while constrained holders sell.
+#
+# Data paths go on the command line (README, "Backtesting"). Every key is optional
+# except [strategy] name; omitted keys take the defaults in BacktestConfig,
+# ExecutionModel and the strategy class. Override any key with
+# --set strategy.hold_days=60, or sweep it with cr-strat sweep --grid.
+
+[backtest]
+# start = "2019-07-01"          # first day; defaults to the first price panel date
+# end = "2024-12-31"
+initial_capital_inr = 1e9       # Rs 100 crore
+# cash_rate_pct = 6.5           # fixed cash rate; default is the curve's shortest tenor (or --cash-rates)
+max_gross = 1.0                 # fully funded, no leverage
+max_bond_weight = 0.10
+max_issuer_weight = 0.10
+drift_tolerance = 0.25          # leave a holding alone while within 25% of its target
+min_trade_inr = 1e6             # Rs 10 lakh smallest ticket
+lot_face_inr = 1e5              # lot when the security master has no face_value_inr
+disclosure_lag_days = 10        # MF portfolios become public this long after their date
+
+[execution]
+lag_days = 1                    # orders go live the business day after the signal
+order_ttl_days = 10             # and lapse after this many business days unfilled
+trade_days_only = true          # fill only on days with a reported NSE/BSE trade in the bond
+max_participation = 0.25        # of that day's reported traded value
+impact_bps = 10.0               # extra yield give-up at 100% participation
+off_trade_multiplier = 2.0      # cost multiple when trade_days_only = false and the bond did not trade
+stamp_duty_pct = 0.0001         # on buys, debt securities transfer rate since July 2020
+
+[execution.half_spread_bps]     # yield give-up per side by rating bucket; placeholders to calibrate
+AAA = 3.0
+"AA+" = 5.0
+AA = 7.5
+"AA-" = 10.0
+"A+" = 12.5
+A = 15.0
+"A-" = 20.0
+BBB = 30.0
+SUB_IG = 75.0
+D = 150.0
+
+[strategy]
+name = "event_reversal"
+
+[strategy.params]
+rebalance = "D"
+mandates = ["mf_corporate_bond_fund"]
+entry_delay_days = 0            # calendar days after the public event date
+hold_days = 120                 # exit this many calendar days after the event
+first_in_window_only = true     # skip repeat crossings of the same threshold within a year
+min_new_grade = "BBB-"          # skip events that land below investment grade
+prior_signal = "any"            # "with" or "without" a prior negative outlook/watch, or "any"
+min_constrained_share = 0.0     # needs --ownership; e.g. 0.1 = constrained holders held 10%+
+# min_gap_bps = 25              # bond must trade at least this wide of peers at its new rating
+position_weight = 0.10
+bonds_per_issuer = 1
+exit_on_new_event = true        # exit early on a further downgrade
+
+[benchmark]                     # run alongside for relative statistics; delete to skip
+name = "universe_index"
+
+[benchmark.params]
+min_rating = "A-"
+n_bonds = 100

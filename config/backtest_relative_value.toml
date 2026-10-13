@@ -1,0 +1,39 @@
+# Relative value: hold the bonds trading widest of matched peers (same instrument class,
+# rating bucket and tenor bucket; issuer excluded). Engine and execution keys are as in
+# backtest_event_reversal.toml; omitted keys take their defaults.
+
+[backtest]
+initial_capital_inr = 1e9
+max_bond_weight = 0.10
+max_issuer_weight = 0.10
+
+[execution]
+lag_days = 1
+trade_days_only = true
+max_participation = 0.25
+
+[strategy]
+name = "relative_value"
+
+[strategy.params]
+rebalance = "M"
+min_rating = "A"
+min_tenor_years = 0.75
+max_tenor_years = 10.0
+max_signal_age_days = 5         # new entries need a trade this recent
+min_trade_days = 3              # and this many trade days in the liquidity window
+liquidity_days = 60
+n_bonds = 20
+one_bond_per_issuer = true
+min_peer_issuers = 3
+min_rv_bps = 10.0               # enter at least this wide of peers
+max_rv_bps = 300.0              # wider is more often bad news than mispricing
+hold_rv_bps = 0.0               # sell once a bond trades back inside its peers
+exclude_downgraded_days = 90
+
+[benchmark]
+name = "universe_index"
+
+[benchmark.params]
+min_rating = "A-"
+n_bonds = 100

@@ -58,6 +58,14 @@ need overrides or an archived copy.
 | `outstanding_face_inr` | no | Needed for ownership shares |
 | `issue_date`, `maturity_date` | no | Used to drop ISINs not live at the event or maturing within a horizon. `maturity_date` is required for the price panel (tenor and spread). |
 | `sector` | no | e.g. PSU, NBFC, HFC, bank, corporate. Add `sector` to `--match-on` to match peers on it. |
+| `coupon_pct` | for backtests | Annual coupon rate in percent; `0` for zero-coupon bonds. Bonds without it are marked by yield only and cannot be traded by the backtester. |
+| `coupon_freq` | no | Payments a year: 1 (default, most Indian corporate bonds), 2, 4 or 12 |
+| `redemption_pct` | no | Redemption per 100 of face; default 100 |
+
+For backtests, the engine prices each bond from `coupon_pct`, `coupon_freq`,
+`issue_date` and `maturity_date` as a plain fixed-coupon bullet. Leave
+callable, puttable, floating-rate and amortising instruments without a
+`coupon_pct` until their terms are modelled.
 
 Sources: NSDL ISIN search, the information memorandum or key information
 document filed with NSE/BSE, or a vendor (Bloomberg, LSEG, CMIE Prowess).
@@ -100,3 +108,18 @@ FBIL publishes daily G-sec par yields; an OIS curve can come from a vendor or
 dealer marks. A curve date is used for up to 7 days. Set `--benchmark-compounding`
 to the curve's convention (G-sec yields are semi-annual) and `--bond-compounding`
 to the trade yields' convention. Spreads are computed on the bond's basis.
+
+## Cash rate (optional): `treps.csv`
+
+`date, rate_pct`: the rate earned on uninvested cash, e.g. CCIL's TREPS weighted
+average rate or FBIL overnight MIBOR. Pass it to `backtest` or `sweep` as
+`--cash-rates`. Without it, cash earns the benchmark curve's shortest tenor.
+
+## Synthetic data: `cr-strat synth` / `cr-strat demo`
+
+`cr-strat synth --out-dir data/demo/raw` writes every input above (rating
+actions, security master with coupons, G-sec curve, NSE and BSE trade files,
+canonical MF holdings) for a simulated market, plus `truth_events.csv` with the
+forced-selling overshoot planted at each downgrade below AA+. A `SYNTHETIC.txt`
+marker sits in the folder. Use it to check the pipeline and research code, never
+as evidence about the market.

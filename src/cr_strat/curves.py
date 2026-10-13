@@ -69,9 +69,21 @@ class BenchmarkCurve:
     def from_csv(cls, path: str | Path, **kwargs) -> BenchmarkCurve:
         return cls(pd.read_csv(path), **kwargs)
 
+    @property
+    def dates(self) -> pd.DatetimeIndex:
+        """Dates with a curve, which serve as the business-day calendar for backtests."""
+        return pd.DatetimeIndex(self._dates)
+
+    @property
+    def shortest_tenor(self) -> float:
+        return float(min((x[0] for x, _ in self._points.values()), default=np.nan))
+
     def yields(self, dates: pd.Series, tenors: pd.Series, *, to_basis: str = "annual") -> np.ndarray:
         """Benchmark yield (percent, ``to_basis`` compounding) for each (date, tenor); NaN when stale."""
-        dates = pd.to_datetime(pd.Series(dates)).to_numpy(dtype="datetime64[ns]")
+        if isinstance(dates, np.ndarray) and dates.dtype.kind == "M":
+            dates = dates.astype("datetime64[ns]")
+        else:
+            dates = pd.to_datetime(pd.Series(dates)).to_numpy(dtype="datetime64[ns]")
         tenors = np.asarray(tenors, dtype=float)
         out = np.full(len(dates), np.nan)
         if not len(self._dates):

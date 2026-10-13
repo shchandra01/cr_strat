@@ -1,0 +1,29 @@
+# Carry: hold the widest-spread bonds above a rating floor, one per issuer.
+# Engine and execution keys are as in backtest_event_reversal.toml.
+
+[backtest]
+initial_capital_inr = 1e9
+max_bond_weight = 0.10
+max_issuer_weight = 0.10
+
+[execution]
+lag_days = 1
+trade_days_only = true
+
+[strategy]
+name = "carry"
+
+[strategy.params]
+rebalance = "M"
+min_rating = "AA-"
+signal = "spread_bps"           # or "yield_pct"
+n_bonds = 20
+hold_buffer = 2.0               # keep a holding while it ranks in the top n_bonds x hold_buffer
+exclude_downgraded_days = 90
+
+[benchmark]
+name = "universe_index"
+
+[benchmark.params]
+min_rating = "A-"
+n_bonds = 100
