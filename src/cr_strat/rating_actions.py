@@ -10,6 +10,12 @@ CRA press releases, exchange disclosures or a vendor. Required columns:
 Optional columns: issuer_name, agency, instrument, instrument_class, outlook,
 action, liquidity, isin, source_url. A missing agency is read from the rating
 string; a missing instrument_class is inferred from the instrument text.
+
+The rating string overrides the class where it is more specific: credit-enhanced
+ratings are STRUCTURED, market-linked ones MLD, short-term ones ST, and fund
+ratings (``fund_scale``, e.g. "CARE AAA mfs") OTHER, so they never reach a bond
+mandate. A string holding several ratings is reduced to one by
+``rating_scale.parse_rating``.
 """
 
 from __future__ import annotations
@@ -30,32 +36,63 @@ from cr_strat.rating_scale import (
 
 INSTRUMENT_CLASSES = ("BOND", "BANK_LOAN", "ST", "SUB", "PERP", "STRUCTURED", "MLD", "FD", "OTHER")
 
-# Checked in order; the first match wins.
+# Within one label, checked in order; the first match wins. Convertibles come first
+# ("non-convertible" is rewritten to "ncd" before matching), and BOND comes before
+# BANK_LOAN so that an issuer name with "LOANS" in an NSDL description
+# ("XYZ GOLD LOANS LIMITED SR II 9.5 NCD ...") stays a bond. The NSDL abbreviations are BD/BDS
+# (bond), LOA (letter of allotment, a bond not yet in certificate form), CCD and OCD
+# (compulsorily and optionally convertible debentures).
 _CLASS_RULES = (
+    ("OTHER", re.compile(r"\bconvertible|\b[co]cds?\b", re.I)),
     ("ST", re.compile(r"commercial paper|\bcps?\b|certificate of deposit|\bcds?\b|short[\s-]*term", re.I)),
-    ("SUB", re.compile(r"subordinat|tier[\s-]*(?:ii|2)\b|lower tier|upper tier", re.I)),
+    ("SUB", re.compile(r"sub[\s-]*ordinat|tier[\s-]*(?:ii|2)\b|lower tier|upper tier", re.I)),
     ("PERP", re.compile(r"perpetual|tier[\s-]*(?:i|1)\b|\bat[\s-]*1\b|additional tier", re.I)),
-    ("MLD", re.compile(r"market[\s-]*linked|\bmlds?\b", re.I)),
-    ("STRUCTURED", re.compile(r"pass[\s-]*through|\bptcs?\b|securiti[sz]ation|credit[\s-]*enhance", re.I)),
+    ("MLD", re.compile(r"market[\s-]*linked|\bmlds?\b|\bpp[\s-]*mlds?\b", re.I)),
+    ("STRUCTURED", re.compile(
+        r"pass[\s-]*through|\bptcs?\b(?!\s+india)|securiti[sz](?:ation|ed)|credit[\s-]*enhance|\bsdis?\b(?![/-]?\d)"
+        r"|\(sns?\)|\bsn\s+series\b|\bseries\s+\w+\s+sn\b|(?:first|second)[\s-]*loss|\b[fs]lcfs?\b", re.I)),
     ("FD", re.compile(r"fixed deposit|\bfds?\b|deposit program", re.I)),
-    ("BANK_LOAN", re.compile(r"bank (?:loan|facilit)|term loan|cash credit|fund[\s-]*based|working capital|\bloans?\b", re.I)),
-    ("BOND", re.compile(r"\bncds?\b|non[\s-]*convertible|debenture|\bbonds?\b|debt program", re.I)),
+    ("BOND", re.compile(
+        r"\bncds?\b|debenture|\bbonds?\b|\bbds?\b|\bloa\b|debt program|market borrowing", re.I)),
+    ("BANK_LOAN", re.compile(
+        r"bank (?:loan|facilit)|term loan|cash credit|fund[\s-]*based|working capital|\bloans?\b|\bblr\b", re.I)),
 )
+# A label naming several instruments ("BLR/Bond/CP", "NCD & CP") takes the class
+# that matters most for bond mandates. A "/" joining a digit or a single letter is
+# part of a series code ("SR AS/MLD/A/06"), not a list.
+_CLASS_PRIORITY = ("BOND", "SUB", "PERP", "MLD", "STRUCTURED", "FD", "BANK_LOAN", "ST", "OTHER")
+_LABEL_SPLIT_RE = re.compile(r"[/,&]|\band\b", re.I)
+_CODE_TOKEN_RE = re.compile(r"\S*/\S*")
+_CODE_PIECE_RE = re.compile(r"(?:^|/)(?:[^/]*\d[^/]*|[A-Za-z])(?:/|$)")
+_NON_CONVERTIBLE_RE = re.compile(r"non[\s-]*convertible", re.I)
 
 _REQUIRED = ("date", "issuer_id", "rating")
 
 
-def classify_instrument(instrument: object) -> str:
-    """Instrument class from free text; blank text is assumed to mean bonds."""
-    if instrument is None or (isinstance(instrument, float) and pd.isna(instrument)):
-        return "BOND"
-    text = str(instrument).strip()
-    if not text:
-        return "BOND"
+def _classify_part(text: str) -> str:
     for cls, pattern in _CLASS_RULES:
         if pattern.search(text):
             return cls
     return "OTHER"
+
+
+def classify_instrument(instrument: object) -> str:
+    """Instrument class from free text; blank text is assumed to mean bonds.
+
+    CARE's bare "Long Term", "Short Term" and "LT/ST" labels cover bank facilities
+    and unallocated limits as well as debt, so "Long Term" and "LT/ST" stay OTHER
+    unless the text names a bank facility or loan; treating them as bonds would feed
+    bank-loan ratings into bond mandates.
+    """
+    if instrument is None or (isinstance(instrument, float) and pd.isna(instrument)):
+        return "BOND"
+    text = _NON_CONVERTIBLE_RE.sub(" ncd ", str(instrument).strip())
+    if not text:
+        return "BOND"
+    text = _CODE_TOKEN_RE.sub(
+        lambda m: m.group().replace("/", "-") if _CODE_PIECE_RE.search(m.group()) else m.group(), text)
+    classes = {_classify_part(part) for part in _LABEL_SPLIT_RE.split(text) if part.strip()}
+    return min(classes, key=_CLASS_PRIORITY.index, default="OTHER")
 
 
 def _str_or_none(value: object) -> str | None:
@@ -86,7 +123,7 @@ def load_rating_actions(source: str | Path | pd.DataFrame) -> pd.DataFrame:
     fields = pd.DataFrame([asdict(p) for p in parsed], index=df.index)
     out["rating_raw"] = df["rating"]
     for col in ("scale", "grade", "provisional", "credit_enhanced", "mld", "fixed_deposit",
-                "hybrid", "issuer_not_cooperating", "sovereign"):
+                "hybrid", "issuer_not_cooperating", "sovereign", "fund_scale"):
         out[col] = fields[col]
     notch = fields["notch"].astype("Int64")
 
@@ -123,6 +160,8 @@ def load_rating_actions(source: str | Path | pd.DataFrame) -> pd.DataFrame:
     cls = cls.where(~(out["fixed_deposit"].astype(bool) & cls.isin(["BOND", "OTHER"])), "FD")
     cls = cls.where(~(out["hybrid"].astype(bool) & cls.isin(["BOND", "OTHER"])), "SUB")
     cls = cls.where(out["scale"] != "ST", "ST")
+    # A fund rating ("IND AA-mfs") rates a scheme, never an issuer's debt.
+    cls = cls.where(~out["fund_scale"].astype(bool), "OTHER")
     out["instrument_class"] = cls
 
     # A bare "D" on a short-term instrument is the short-term default grade.
