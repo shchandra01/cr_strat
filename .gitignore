@@ -8,3 +8,6 @@ venv/
 # Downloaded inputs and generated outputs stay local.
 data/raw/
 data/out/
+
+# Agent git worktrees (temporary).
+.claude/worktrees/
