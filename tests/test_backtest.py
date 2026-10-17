@@ -140,3 +140,51 @@ def test_limits_and_rebalance_dates(market_factory):
     assert all(d.weekday() == 4 for d in weekly[:-1]) and weekly[-1] == days[-1]  # last, partial week
     assert sorted(rebalance_dates(days, "M")) == [pd.Timestamp("2025-01-31"), pd.Timestamp("2025-02-28"),
                                                   pd.Timestamp("2025-03-31")]
+
+
+def test_a_run_that_never_trades_explains_itself(market_factory):
+    days = pd.bdate_range("2025-01-01", "2025-03-31")
+    md = market_factory([_bond(), _bond(isin="N", coupon_pct=None)], _trades(days), end="2025-03-31")
+    res = run_backtest(md, Hold(weights={"N": 0.5, "X": 0.5}), config=_config())
+    assert res.fills.empty
+    notes = " ".join(res.notes)
+    assert "targets for 1 bond(s) not in the security master were ignored: X" in notes
+    assert "targets for 1 bond(s) without coupon or maturity terms were ignored: N" in notes
+    assert "never traded" in notes
+    from cr_strat.strategies import EventReversal
+    res = run_backtest(md, EventReversal(), config=_config())
+    assert any("rating events" in n for n in res.notes)
+
+
+def test_inputs_as_paths_dicts_and_type_errors(market_factory, tmp_path):
+    days = pd.bdate_range("2025-01-01", "2025-02-28")
+    md = market_factory([_bond()], _trades(days), end="2025-02-28")
+    pd.DataFrame({"date": ["2025-01-01"], "rate_pct": [5.0]}).to_csv(tmp_path / "treps.csv", index=False)
+    pd.DataFrame(columns=["event_id", "issuer_id", "instrument_class", "mandate", "direction", "date"]).to_csv(
+        tmp_path / "events.csv", index=False)
+
+    @dataclass
+    class Dict(Strategy):
+        rebalance: str = "ME"  # pandas' month-end alias is accepted
+
+        def target_weights(self, ctx):
+            return {"B": 0.5}
+
+    res = run_backtest(md, Dict(), config=_config(), events=tmp_path / "events.csv", cash_rates=tmp_path / "treps.csv")
+    assert len(res.fills) and (res.nav["cash_rate_pct"] == 5.0).all() and Dict.name == "dict"
+
+    @dataclass
+    class Bad(Strategy):
+        def target_weights(self, ctx):
+            return ["B"]
+
+    with pytest.raises(TypeError, match="pandas Series"):
+        run_backtest(md, Bad(), config=_config())
+
+    class NotADataclass(Strategy):
+        rebalance = "M"
+
+    with pytest.raises(TypeError, match="@dataclass"):
+        run_backtest(md, NotADataclass(), config=_config())
+    with pytest.raises(ValueError, match="rebalance must be"):
+        run_backtest(md, Hold(rebalance="fortnightly"), config=_config())

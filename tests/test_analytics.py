@@ -50,3 +50,15 @@ def test_episodes_sum_daily_attribution():
     assert ep["pnl"] == pytest.approx(4 * 8.0 - 6.0)
     assert ep["excess_pnl"] == pytest.approx(ep["pnl"] + 4 * 5.0 - 4 * 8.0)
     assert ep["status"] == "sold" and ep["holding_days"] == 5 and ep["exit_spread_bps"] == 103
+
+
+def test_rising_nav_has_no_drawdowns_and_inputs_are_checked():
+    nav = _nav([100, 100.1, 100.2, 100.3])
+    table = analytics.drawdowns(nav)
+    assert table.empty and list(table.columns)[-2:] == ["days_to_trough", "days_underwater"]
+    frame = pd.DataFrame({"date": nav.index, "nav": nav.to_numpy()})
+    assert analytics.performance_stats(frame)["max_drawdown"] == 0.0  # BacktestResult.nav-style frame works
+    with pytest.raises(TypeError, match="indexed by date"):
+        analytics.performance_stats(pd.Series([100.0, 101.0, 102.0]))
+    with pytest.raises(ValueError, match="no dates"):
+        analytics.performance_stats(nav, cash_rate_pct=pd.Series([6.0] * 4))

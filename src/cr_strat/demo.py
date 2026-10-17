@@ -24,26 +24,16 @@ from pathlib import Path
 
 import pandas as pd
 
+from cr_strat.cli import config_dir
 from cr_strat.cli import main as cli
 from cr_strat.runner import build, load_config, load_market, write_result
 
-_REPO_CONFIG = Path(__file__).resolve().parents[2] / "config"
-
-
-def config_dir() -> Path:
-    """The repo's config folder (editable install), else ./config."""
-    return _REPO_CONFIG if (_REPO_CONFIG / "mandates.toml").exists() else Path("config")
-
-
 def _step(label: str, args: list[str], *, optional: bool = False) -> None:
     print(f"\n== {label}")
-    try:
-        if cli(args) != 0:
-            raise RuntimeError(f"{label} failed")
-    except ValueError as exc:
+    if cli(args) != 0:
         if not optional:
-            raise
-        print(f"skipped: {exc}")
+            raise RuntimeError(f"{label} failed")
+        print("skipped: too few events in this sample")
 
 
 def run_demo(out: Path, *, seed: int = 7, n_issuers: int = 200, start: str = "2019-01-01",

@@ -82,20 +82,22 @@ def test_price_pipeline(tmp_path, isin):
     assert (out / "peer_spreads_weekly.csv").exists()
 
 
-def test_synthetic_market_through_backtest_and_research(tmp_path):
+def test_synthetic_market_through_backtest_and_research(tmp_path, monkeypatch, capsys):
     raw, out = tmp_path / "raw", tmp_path / "out"
+    monkeypatch.chdir(tmp_path)  # outside the repo: default config paths must still resolve
     assert main(["synth", "--out-dir", str(raw), "--issuers", "40", "--start", "2021-01-01", "--end", "2022-06-30",
                  "--seed", "3"]) == 0
-    assert main(["rating-events", "--actions", str(raw / "rating_actions.csv"), "--mandates", str(CONFIG),
-                 "--out-dir", str(out)]) == 0
+    assert main(["rating-events", "--actions", str(raw / "rating_actions.csv"), "--out-dir", str(out)]) == 0
     assert main(["load-trades", *map(str, sorted((raw / "trades" / "nse").glob("*.csv"))), "--venue", "NSE",
                  "--out", str(out / "trades.csv")]) == 0
-    assert main(["price-panel", "--trades", str(out / "trades.csv"), "--securities", str(raw / "securities.csv"),
-                 "--benchmark", str(raw / "gsec_par_curve.csv"), "--rating-actions", str(raw / "rating_actions.csv"),
-                 "--out-dir", str(out)]) == 0
+    # A shell glob such as trades*.csv also matches the load report written next to the trades.
+    assert main(["price-panel", "--trades", str(out / "trades.csv"), str(out / "trades_report.csv"),
+                 "--securities", str(raw / "securities.csv"), "--benchmark", str(raw / "gsec_par_curve.csv"),
+                 "--rating-actions", str(raw / "rating_actions.csv"), "--out-dir", str(out)]) == 0
+    assert "ignoring 1 report file" in capsys.readouterr().out
     market = ["--panel", str(out / "price_panel.csv"), "--securities", str(raw / "securities.csv"),
               "--benchmark", str(raw / "gsec_par_curve.csv"), "--rating-actions", str(raw / "rating_actions.csv")]
-    config = str(CONFIG.parent / "backtest_carry.toml")
+    config = "carry"  # a shipped config, by strategy name
     assert main(["backtest", "--config", config, *market, "--events", str(out / "rating_events.csv"),
                  "--set", "strategy.n_bonds=5", "--set", "benchmark.n_bonds=10", "--out-dir", str(out / "bt"),
                  "--synthetic"]) == 0
@@ -122,3 +124,30 @@ def test_synthetic_market_through_backtest_and_research(tmp_path):
     assert main(["regress", "--data", str(out / "sig" / "signal_panel.csv"), "--y", "xr_60d",
                  "--x", "rv_bps,spread_bps", "--cluster", "date", "--out", str(out / "reg.csv")]) == 0
     assert pd.read_csv(out / "reg.csv")["term"].tolist() == ["const", "rv_bps", "spread_bps"]
+    assert "oos_deflated_sharpe" in pd.read_csv(out / "sweep.csv")
+
+    # A user's own strategy, named by file in a config next to it, with a --set on its params table.
+    (tmp_path / "mine.py").write_text(
+        "from dataclasses import dataclass\n"
+        "import pandas as pd\n"
+        "from cr_strat.strategies import Strategy\n\n"
+        "@dataclass\n"
+        "class WideSpreads(Strategy):\n"
+        "    rebalance: str = 'M'\n"
+        "    n_bonds: int = 3\n\n"
+        "    def target_weights(self, ctx):\n"
+        "        snap = ctx.snapshot(30, 60)\n"
+        "        snap = snap[snap['priceable'] & (snap['rating_notch'] <= 3)]\n"
+        "        top = snap.nlargest(self.n_bonds, 'spread_bps')\n"
+        "        return pd.Series(1 / self.n_bonds, index=top['isin'])\n")
+    (tmp_path / "mine.toml").write_text('[strategy]\nname = "mine.py:WideSpreads"\n')
+    monkeypatch.chdir(out)  # the strategy file resolves against the config's folder, not the cwd
+    assert main(["backtest", "--config", str(tmp_path / "mine.toml"), *market, "--set", "strategy.params.n_bonds=4",
+                 "--out-dir", str(out / "mine"), "--no-report"]) == 0
+    params = pd.read_csv(out / "mine" / "params.csv").set_index("key")["value"]
+    assert params["name"] == "wide_spreads" and params["n_bonds"] == "4"
+    assert pd.read_csv(out / "mine" / "nav.csv")["n_positions"].max() > 0
+
+    # Errors are one line, not a traceback.
+    assert main(["backtest", "--config", "no_such_config", *market, "--out-dir", str(out / "x")]) == 2
+    assert "config not found" in capsys.readouterr().err

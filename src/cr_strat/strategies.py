@@ -22,15 +22,21 @@ Built-in strategies:
 * ``universe_index``: equal- or size-weighted basket of the eligible
   universe, as a benchmark.
 
-To add a strategy, subclass ``Strategy`` and pass an instance to
-``run_backtest``, or add it to ``STRATEGIES`` to make it available by name
-in backtest config files.
+To add a strategy, write a ``@dataclass`` subclass of ``Strategy`` and pass an
+instance to ``run_backtest``. To use it from a config file, name it there as
+``"my_file.py:MyClass"`` (or ``"package.module:MyClass"``), or decorate it with
+``register_strategy`` so its ``name`` works like a built-in one.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import importlib
+import importlib.util
+import re
+import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import ClassVar
 
 import numpy as np
@@ -103,8 +109,20 @@ class Context:
 
 @dataclass
 class Strategy:
+    """Base class. Subclasses are dataclasses whose fields are the parameters.
+
+    ``name`` (a ClassVar) labels outputs and selects the strategy in config
+    files; it defaults to the class name in snake case.
+    """
+
     rebalance: str = "W-FRI"
     name: ClassVar[str] = "strategy"
+    needs_events: ClassVar[bool] = False
+
+    def __init_subclass__(cls, **kwargs) -> None:
+        super().__init_subclass__(**kwargs)
+        if "name" not in cls.__dict__:
+            cls.name = re.sub(r"(?<!^)(?=[A-Z])", "_", cls.__name__).lower()
 
     def target_weights(self, ctx: Context) -> pd.Series:
         raise NotImplementedError
@@ -161,6 +179,7 @@ class EventReversal(Strategy):
     """
 
     name: ClassVar[str] = "event_reversal"
+    needs_events: ClassVar[bool] = True
     rebalance: str = "D"
     mandates: tuple[str, ...] = ("mf_corporate_bond_fund",)
     direction: str = "down"
@@ -409,11 +428,46 @@ STRATEGIES: dict[str, type[Strategy]] = {
 }
 
 
+def register_strategy(cls: type[Strategy]) -> type[Strategy]:
+    """Class decorator that makes a strategy available by ``cls.name`` in config files."""
+    STRATEGIES[cls.name] = cls
+    return cls
+
+
+def _import_strategy(ref: str) -> type[Strategy]:
+    """``"path/to/file.py:Class"`` or ``"package.module:Class"``."""
+    target, _, attr = ref.rpartition(":")
+    if target.endswith(".py"):
+        path = Path(target).expanduser().resolve()
+        if not path.exists():
+            raise ValueError(f"strategy file not found: {path}")
+        spec = importlib.util.spec_from_file_location(path.stem, path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[path.stem] = module
+        spec.loader.exec_module(module)
+    else:
+        module = importlib.import_module(target)
+    cls = getattr(module, attr, None)
+    if not (isinstance(cls, type) and issubclass(cls, Strategy)):
+        raise ValueError(f"{ref!r} does not name a Strategy subclass")
+    return cls
+
+
 def build_strategy(name: str, params: dict | None = None) -> Strategy:
-    """Instantiate a registered strategy from config, converting lists to tuples."""
-    if name not in STRATEGIES:
-        raise ValueError(f"unknown strategy {name!r}; choose from {sorted(STRATEGIES)}")
-    cls = STRATEGIES[name]
+    """Instantiate a strategy from config, converting lists to tuples.
+
+    ``name`` is a registered name (``STRATEGIES``) or a reference to your own
+    class: ``"my_strategies.py:WideSpreads"`` (a file) or
+    ``"mypackage.strategies:WideSpreads"`` (an importable module). A relative
+    file path is resolved against the current directory.
+    """
+    if ":" in name:
+        cls = _import_strategy(name)
+    elif name in STRATEGIES:
+        cls = STRATEGIES[name]
+    else:
+        raise ValueError(f"unknown strategy {name!r}; choose from {sorted(STRATEGIES)} "
+                         "or give your own class as 'file.py:ClassName'")
     fields = {f.name for f in dataclasses.fields(cls)}
     params = dict(params or {})
     unknown = sorted(set(params) - fields)

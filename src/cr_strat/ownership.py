@@ -17,6 +17,7 @@ maturities do not look like selling.
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -54,7 +55,15 @@ def load_securities(source) -> pd.DataFrame:
     df["face_value_inr"] = _num(df, "face_value_inr")
     df["outstanding_face_inr"] = _num(df, "outstanding_face_inr")
     for col in ("issue_date", "maturity_date"):
-        df[col] = pd.to_datetime(df[col], format="ISO8601", errors="coerce") if col in df else pd.NaT
+        if col not in df:
+            df[col] = pd.NaT
+            continue
+        given = df[col].notna() & (df[col].astype(str).str.strip() != "")
+        df[col] = pd.to_datetime(df[col], format="ISO8601", errors="coerce")
+        bad = int((given & df[col].isna()).sum())
+        if bad:
+            warnings.warn(f"security master: {bad} {col} values are not ISO dates (YYYY-MM-DD) and were ignored",
+                          stacklevel=2)
     return df.drop_duplicates("isin", keep="last").reset_index(drop=True)
 
 

@@ -56,3 +56,17 @@ def test_sharpe_inference():
     assert deflated_sharpe(r, trials) < probabilistic_sharpe(sr, n, skew, kurt)
     est, lo, hi = block_bootstrap(r, np.mean, block=10, n_boot=200)
     assert lo < est < hi
+
+
+def test_student_t_p_values_and_missing_data_message(data):
+    from cr_strat.stats import _p_value
+
+    assert _p_value(2.0, 10) == pytest.approx(0.07339, abs=1e-5)
+    assert _p_value(3.0, 7) == pytest.approx(0.01994, abs=1e-5)
+    assert _p_value(1.96) == pytest.approx(0.05, abs=1e-4)
+    few = data.head(6).assign(g=[1, 1, 2, 2, 3, 3])
+    res = ols(few, "y", ["x1"], cluster="g")
+    assert res["p"].iloc[1] == pytest.approx(_p_value(res["t"].iloc[1], 2))  # G - 1 degrees of freedom
+    sparse = data.head(5).assign(x2=[1.0, np.nan, np.nan, np.nan, np.nan])
+    with pytest.raises(ValueError, match="x2 4"):
+        ols(sparse, "y", ["x1", "x2"])

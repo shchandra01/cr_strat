@@ -27,6 +27,19 @@ def _series(nav: pd.DataFrame, col: str) -> pd.Series:
     return nav.set_index("date")[col].astype(float)
 
 
+def as_nav(nav, col: str = "nav") -> pd.Series:
+    """A NAV series indexed by date, from a Series, ``BacktestResult.nav`` or a ``BacktestResult``."""
+    if isinstance(nav, BacktestResult):
+        nav = nav.nav
+    if isinstance(nav, pd.DataFrame):
+        if "date" not in nav or col not in nav:
+            raise TypeError(f"expected a frame with 'date' and '{col}' columns, like BacktestResult.nav")
+        nav = nav.set_index("date")[col]
+    if not isinstance(nav.index, pd.DatetimeIndex):
+        raise TypeError("pass a NAV Series indexed by date, e.g. result.nav.set_index('date')['nav']")
+    return nav.astype(float).dropna()
+
+
 def returns(nav: pd.Series) -> pd.Series:
     return nav.pct_change().dropna()
 
@@ -36,13 +49,20 @@ def _years(index: pd.DatetimeIndex) -> float:
 
 
 def drawdown(nav: pd.Series) -> pd.Series:
+    nav = as_nav(nav)
     return nav / nav.cummax() - 1
 
 
 def performance_stats(nav: pd.Series, *, cash_rate_pct: pd.Series | None = None,
                       benchmark: pd.Series | None = None) -> dict[str, float]:
-    """Return, risk and significance statistics for a NAV series indexed by date."""
-    nav = nav.dropna()
+    """Return, risk and significance statistics for a NAV series indexed by date.
+
+    Without ``cash_rate_pct`` excess returns are over zero. Pass the backtest's
+    ``cash_rate_pct`` column indexed by date, or use ``summary(result)``.
+    """
+    nav = as_nav(nav)
+    if cash_rate_pct is not None and not cash_rate_pct.index.isin(nav.index).any():
+        raise ValueError("cash_rate_pct shares no dates with the NAV; index both by date")
     r = returns(nav)
     if len(r) < 2:
         return {"n_obs": len(r)}
@@ -188,7 +208,7 @@ def cumulative_attribution(nav: pd.DataFrame) -> pd.DataFrame:
 
 def monthly_returns(nav: pd.Series) -> pd.DataFrame:
     """Year x month table of returns, with the calendar-year return in ``year``."""
-    nav = nav.dropna()
+    nav = as_nav(nav)
     me = nav.resample("ME").last()
     r = pd.concat([nav.iloc[:1], me]).pct_change().dropna()
     r = r[~r.index.duplicated(keep="last")]
@@ -202,7 +222,7 @@ def monthly_returns(nav: pd.Series) -> pd.DataFrame:
 
 def drawdowns(nav: pd.Series, top: int = 5) -> pd.DataFrame:
     """The ``top`` deepest drawdowns: peak, trough, recovery dates, depth and length."""
-    nav = nav.dropna()
+    nav = as_nav(nav)
     dd = drawdown(nav)
     rows, in_dd, peak = [], False, nav.index[0]
     for date, value in dd.items():
@@ -218,6 +238,8 @@ def drawdowns(nav: pd.Series, top: int = 5) -> pd.DataFrame:
         seg = dd[start:]
         rows.append({"peak": start, "trough": seg.idxmin(), "recovery": pd.NaT, "depth": seg.min()})
     out = pd.DataFrame(rows, columns=["peak", "trough", "recovery", "depth"])
+    for col in ("peak", "trough", "recovery"):  # typed even when NAV never fell
+        out[col] = pd.to_datetime(out[col])
     end = out["recovery"].fillna(nav.index[-1])
     out["days_to_trough"] = (out["trough"] - out["peak"]).dt.days
     out["days_underwater"] = (end - out["peak"]).dt.days
@@ -246,7 +268,8 @@ def concentration(positions: pd.DataFrame) -> pd.DataFrame:
 
 def rolling_stats(nav: pd.Series, window: int = 126) -> pd.DataFrame:
     """Rolling annualised return, volatility and Sharpe (no cash adjustment) over ``window`` observations."""
-    r = returns(nav.dropna())
+    nav = as_nav(nav)
+    r = returns(nav)
     ppy = len(r) / _years(nav.index)
     mean = r.rolling(window).mean() * ppy
     vol = r.rolling(window).std() * math.sqrt(ppy)

@@ -58,3 +58,11 @@ def test_snapshot_relative_value_excludes_issuer(market):
     later = md.snapshot(D0 + pd.Timedelta(days=11), max_age_days=5)
     assert "E1" not in set(later["isin"])  # its only trade is older than max_age_days
     assert md.snapshot(D0 + pd.Timedelta(days=11), max_age_days=5, issuers=["Q0"])["isin"].tolist() == ["P0"]
+
+
+def test_snapshot_volume_is_the_window_total(market):
+    factory, sec, trades = market
+    snap = factory(sec, trades).snapshot(D0 + pd.Timedelta(days=11), max_age_days=5, liquidity_days=30)
+    p0 = snap.set_index("isin").loc["P0"]
+    # P0 traded every weekday from D0 to D0+11 (10 days) at 1e8 a day.
+    assert p0["trade_days"] == 10 and p0["volume_inr"] == pytest.approx(10 * 1e8)

@@ -90,7 +90,8 @@ cr-strat ownership --events data/out/rating_events.csv \
 
 cr-strat load-trades data/raw/trades/nse/*.csv --venue NSE --out data/out/trades_nse.csv
 cr-strat load-trades data/raw/trades/bse/*.csv --venue BSE --out data/out/trades_bse.csv
-cr-strat price-panel --trades data/out/trades_*.csv --securities data/raw/securities.csv \
+cr-strat price-panel --trades data/out/trades_nse.csv data/out/trades_bse.csv \
+    --securities data/raw/securities.csv \
     --benchmark data/raw/gsec_par_curve.csv --rating-actions data/raw/rating_actions.csv \
     --out-dir data/out
 cr-strat event-prices --events data/out/rating_events.csv --panel data/out/price_panel.csv \
@@ -100,6 +101,12 @@ cr-strat event-prices --events data/out/rating_events.csv --panel data/out/price
 `event_prices.csv` and `event_ownership.csv` share `event_id`; joining them gives
 the pressure variable and the price response for each event.
 
+Commands that write a table also write side files next to it (`<out>_report.csv`,
+`<out>_scheme_matches.csv`). A glob such as `holdings_*.csv` picks those up too;
+`ownership` and `price-panel` ignore them and say so. `--mandates` and `--config`
+fall back to the repo's `config/` folder, so commands work from any directory.
+Errors print as one line; set `CR_STRAT_DEBUG=1` for the traceback.
+
 ## Try it on synthetic data first
 
 ```bash
@@ -107,13 +114,18 @@ cr-strat demo --out-dir data/demo      # about 3 minutes
 ```
 
 This simulates six years of an Indian corporate bond market (200 issuers, NSE/BSE
-trade files, CRA rating actions, month-end MF portfolios, a G-sec curve), plants a
-forced-selling overshoot after downgrades below AA+, and then runs every command
-below on it. It writes tearsheets to `data/demo/out/backtests/*/tearsheet.html`,
-signal research to `data/demo/out/signals/`, and the two forced-selling regressions
-to `data/demo/out/regressions/`. Nothing in it is market evidence. It shows the
-tools working and lets you check that the research recovers effects of known size
-(`data/demo/raw/truth_events.csv`). `cr-strat synth` writes only the raw files.
+trade files, CRA rating actions, month-end MF portfolios, a G-sec curve) and plants a
+forced-selling overshoot after downgrades below AA+. It then runs `rating-events`,
+`ownership`, `load-trades` for both venues, `price-panel` and `event-prices`; a
+backtest of each `config/backtest_*.toml` plus the benchmark; `signals`; and two
+`regress` runs. The holdings it simulates are already in the canonical format, so it
+skips `parse-mf`. Everything lands under `--out-dir` (default `data/demo`, relative to
+where you run it): raw inputs in `raw/`, tearsheets in `out/backtests/*/tearsheet.html`,
+signal research in `out/signals/`, the forced-selling regressions in `out/regressions/`
+and a strategy comparison in `out/backtests/comparison.csv`. Nothing in it is market
+evidence. It shows the tools working and lets you check that the research recovers
+effects of known size (`raw/truth_events.csv`). `cr-strat synth` writes only the raw
+files. It writes no cash-rate file, so drop `--cash-rates` when you copy commands onto it.
 
 ## Backtesting
 
@@ -131,17 +143,31 @@ cr-strat backtest --config config/backtest_event_reversal.toml \
     --set strategy.hold_days=90 --set strategy.min_constrained_share=0.1
 ```
 
-`--cash-rates` takes a CSV of `date, rate_pct` (TREPS weighted average or MIBOR);
-without it cash earns the curve's shortest tenor. Outputs:
+`--config event_reversal` (or `relative_value`, `carry`) picks a shipped config by
+name. `--set` overrides any config key, as `strategy.hold_days` or
+`strategy.params.hold_days`, `execution.lag_days`, `backtest.start` and so on. The
+data flags:
+
+* `--rating-actions`: without it, a strategy sees each bond's rating as of its last
+  trade, so a downgrade reaches it only when the bond trades again.
+* `--events`: `event_reversal` trades nothing without it.
+* `--ownership`: needed only for `min_constrained_share`.
+* `--cash-rates`: a CSV of `date, rate_pct` (TREPS weighted average or MIBOR). Without
+  it, cash earns the curve's shortest tenor.
+
+Anything that would explain an empty or thin backtest prints first as a `note:`: no
+events, targets that are not in the security master or lack coupon terms, a strategy
+that never traded. Outputs:
 
 | File | Contents |
 |---|---|
-| `nav.csv` | Daily NAV and rates-hedged NAV, cash, P&L by component, portfolio duration, DV01, spread, stale-mark share |
+| `nav.csv` | Daily NAV and rates-hedged NAV, cash, P&L by component, portfolio duration, DV01, spread, stale-mark share. `pnl` = `pnl_income + pnl_roll + pnl_rates + pnl_spread + pnl_execution + pnl_cash`; `pnl_funding` and `pnl_hedge_cash` are memo columns for the hedged series |
 | `positions.csv` | Daily holdings with marks, weights, risk and P&L by component |
-| `fills.csv`, `orders.csv` | Every fill with mark, fill yield and cost; every order with its outcome (filled, expired, replaced, cancelled) |
+| `fills.csv`, `orders.csv` | Every fill with mark, fill yield and cost; every order with its outcome: `filled`, `expired` (no fill within `order_ttl_days`), `replaced` (direction changed), `cancelled` (target dropped), `no_trade` (target already met), `matured`, `open_at_end` |
 | `episodes.csv` | One row per holding period: entry and exit spread, P&L, excess P&L over a duration-matched risk-free bond |
 | `summary.csv` | All statistics, for the total-return and rates-hedged series, plus trading statistics |
 | `attribution.csv`, `monthly_returns*.csv`, `drawdowns.csv`, `exposure_*.csv`, `concentration.csv` | Breakdowns |
+| `benchmark_nav.csv`, `params.csv` | The benchmark strategy's daily NAV (when the config has `[benchmark]`); every parameter the run used |
 | `tearsheet.html` | All of the above in one page, no external dependencies |
 
 ### How the engine trades
@@ -181,12 +207,65 @@ without it cash earns the curve's shortest tenor. Outputs:
 | `carry` | Widest-spread bonds above a rating floor, one per issuer, with a rank buffer so holdings are not churned. |
 | `universe_index` | The most traded eligible bonds, equal or outstanding-weighted. Used as the benchmark for relative statistics. |
 
-Each is a dataclass in `strategies.py`. To add one, subclass `Strategy` and implement
-`target_weights(ctx)`, returning weights of NAV by ISIN. `ctx.snapshot()` gives
-every recently traded bond with its spread, peer spread, liquidity and rating as of
-`ctx.date`. `ctx.events` and `ctx.holdings` give the rating events and current
-positions. Then pass the instance to `run_backtest`, or add it to `STRATEGIES` to
-use it from a config file.
+### Your own strategy
+
+Write a dataclass that subclasses `Strategy` and returns weights of NAV by ISIN:
+
+```python
+# my_strategies.py
+from dataclasses import dataclass
+import pandas as pd
+from cr_strat.strategies import Strategy
+
+@dataclass
+class WideHighGrade(Strategy):
+    rebalance: str = "M"          # D, W-FRI, M or Q
+    n_bonds: int = 10
+
+    def target_weights(self, ctx):
+        snap = ctx.snapshot(max_age_days=10)            # bonds traded in the last 10 days
+        snap = snap[snap["priceable"] & (snap["rating_notch"] <= 2)]   # AAA and AA+
+        top = snap.nlargest(self.n_bonds, "spread_bps")
+        return pd.Series(1 / self.n_bonds, index=top["isin"])
+```
+
+Run it from a config file whose `[strategy]` names the file and class
+(`name = "my_strategies.py:WideHighGrade"`, a path relative to the config file, or
+`"package.module:Class"`), with the same flags as above. Or run it from Python:
+
+```python
+from cr_strat.backtest import BacktestConfig, run_backtest
+from cr_strat.runner import load_market, write_result
+from my_strategies import WideHighGrade
+
+market = load_market("data/out/price_panel.csv", "data/raw/securities.csv",
+                     "data/raw/gsec_par_curve.csv", "data/raw/rating_actions.csv")
+result = run_backtest(market, WideHighGrade(n_bonds=15), config=BacktestConfig(start="2020-01-01"),
+                      events="data/out/rating_events.csv", cash_rates="data/raw/treps.csv")
+print(result.notes)
+write_result(result, "data/out/bt_mine")      # same files and tearsheet as the CLI
+```
+
+A bond drops out of `snapshot()` once it has not traded for `max_age_days`, so this
+example sells such bonds at the next rebalance (and may wait weeks to fill). Keep
+holdings explicitly from `ctx.holdings`, as the built-in ranked strategies do with
+`hold_buffer`, unless churn is what you want to measure.
+
+The class needs `@dataclass`, so its fields are its parameters (they appear in
+`params.csv` and can be swept). `name` defaults to the class name in snake case.
+`ctx` holds only what was known at the close of `ctx.date`:
+
+| `ctx.` | What it is |
+|---|---|
+| `snapshot(max_age_days=5, liquidity_days=60)` | One row per bond that traded in the last `max_age_days`: `isin`, `issuer_id`, `instrument_class`, `sector`, `obs_date` and `age_days` of its last trade, `yield_pct`, `spread_bps`, `peer_bps` (median spread of matched peers, issuer excluded; NaN with fewer than `--min-issuers` peers), `peer_issuers`, `rv_bps` (spread minus `peer_bps`), `trade_days` and `volume_inr` over `liquidity_days`, `tenor_years`, `tenor_bucket`, `rating_notch` (1 = AAA, larger is worse), `rating_bucket`, `priceable` (has coupon terms; only these can be traded) |
+| `events` | Rating events public by `ctx.date`, with pre-event `constrained_share` once the holdings disclosure is out |
+| `holdings` | Current positions by ISIN: `face`, `value`, `weight`, `issuer_id`, `entry_date` |
+| `nav`, `date`, `market` | NAV, the date, and the `MarketData` (for `market.marks(isins, date)` and the like) |
+
+Weights for bonds outside the security master or without coupon terms are ignored, and
+the run notes them. The analytics take `result.nav` directly
+(`analytics.performance_stats(result.nav)`), or use `analytics.summary(result)` for the
+full table with excess returns over the cash rate.
 
 ### Robustness
 
@@ -197,11 +276,12 @@ cr-strat sweep --config config/backtest_event_reversal.toml <data paths as above
 ```
 
 Every combination runs on the same market. The output has statistics for the
-whole period and separately up to and after `--split-date`, plus each run's
-**deflated Sharpe ratio**: the probability that its Sharpe beats the best
-Sharpe expected from that many skill-less variants. Pick parameters on the first
-period, judge them on the second, and distrust anything whose deflated Sharpe is
-not well above 0.5.
+whole period (`all_*`) and separately up to and after `--split-date` (`is_*`,
+`oos_*`), plus each run's **deflated Sharpe ratio**: the probability that its
+rates-hedged Sharpe beats the best Sharpe expected from that many skill-less
+variants. Pick parameters on the first period and judge them on the second with
+`oos_deflated_sharpe`. Distrust anything that is not well above 0.5, and anything
+with few fills, however it scores.
 
 ## Signal research
 
@@ -210,6 +290,11 @@ cr-strat signals --panel data/out/price_panel.csv --securities data/raw/securiti
     --benchmark data/raw/gsec_par_curve.csv --rating-actions data/raw/rating_actions.csv \
     --out-dir data/out/signals --horizons 20,60,120 --neutralize-by rating_bucket
 ```
+
+Outputs: `signal_panel.csv` (one row per bond and Friday, with signals and forward
+returns), `signal_summary.csv` (mean IC, Newey-West t-stat and long-short spread per
+signal and horizon), `signal_quantiles.csv` (mean forward return by quintile) and
+`signal_ic_by_date.csv`. Returns are fractions over the horizon: 0.004 is 40 bps.
 
 Every Friday, every bond that traded that week gets its signals: spread, spread
 over matched peers (`rv_bps`), spread change over 20 and 60 days, and trading
@@ -233,6 +318,11 @@ cr-strat regress --data data/out/event_prices.csv --merge data/out/event_ownersh
     --assign "reversal_bps = first_post_abn_bps - p120_abn_bps" \
     --y reversal_bps --x constrained_share,prior_signal --cluster issuer_id
 ```
+
+p-values use Student's t with clusters minus one degrees of freedom, so a study
+with eight issuers is not read as a large sample. Abnormal spreads are missing
+wherever an event bond or its peers did not trade near an anchor date. When too few
+rows are complete, the error says how many values each column is missing.
 
 ## Modules
 

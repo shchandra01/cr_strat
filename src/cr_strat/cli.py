@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import os
+import sys
 from pathlib import Path
 
 import pandas as pd
@@ -18,6 +20,38 @@ from cr_strat.rating_events import build_rating_events, rating_timeline
 from cr_strat.schemes import attach_categories, parse_amfi_navall
 from cr_strat.textparse import UNIT_MULTIPLIERS
 from cr_strat.trades import clean_trades, isin_daily, load_trades, read_trades
+
+
+_REPO_CONFIG = Path(__file__).resolve().parents[2] / "config"
+# Side files the commands write next to their outputs; a glob like trades_*.csv also matches them.
+_SIDE_FILE_SUFFIXES = ("_report.csv", "_scheme_matches.csv")
+
+
+def config_dir() -> Path:
+    """./config when run from the repo root, else the repo's config folder (editable install)."""
+    return Path("config") if (Path("config") / "mandates.toml").exists() else _REPO_CONFIG
+
+
+def _config_path(value: str) -> str:
+    """A config file as given, else from the repo's config folder: a file name or a bare strategy name."""
+    path = Path(value)
+    if path.exists():
+        return str(path)
+    for candidate in (config_dir() / path.name, config_dir() / f"backtest_{path.stem}.toml"):
+        if candidate.exists():
+            return str(candidate)
+    raise FileNotFoundError(f"config not found: {value} (also looked in {config_dir()})")
+
+
+def _inputs(paths: list[str], what: str) -> list[str]:
+    """Drop the report files a shell glob picks up alongside the real inputs, saying so."""
+    keep = [p for p in paths if not p.endswith(_SIDE_FILE_SUFFIXES)]
+    skipped = [p for p in paths if p.endswith(_SIDE_FILE_SUFFIXES)]
+    if skipped:
+        print(f"note: ignoring {len(skipped)} report file(s) among the {what}: {', '.join(skipped)}")
+    if not keep:
+        raise ValueError(f"no {what} files left after dropping report files")
+    return keep
 
 
 def _write(df: pd.DataFrame, path: Path) -> None:
@@ -66,7 +100,7 @@ def _parse_mf(args: argparse.Namespace) -> int:
 def _ownership(args: argparse.Namespace) -> int:
     horizons = tuple(int(h) for h in args.horizons.split(","))
     result = event_ownership(
-        args.events, args.holdings, args.securities, load_mandates(args.mandates),
+        args.events, _inputs(args.holdings, "holdings files"), args.securities, load_mandates(args.mandates),
         max_staleness_days=args.max_staleness_days, horizons=horizons,
         tolerance_days=args.tolerance_days,
     )
@@ -82,16 +116,20 @@ def _load_trades(args: argparse.Namespace) -> int:
         reports.append(report)
     out = Path(args.out)
     _write(pd.concat(frames, ignore_index=True), out)
-    _write(pd.concat(reports, ignore_index=True), out.with_name(out.stem + "_report.csv"))
+    report = pd.concat(reports, ignore_index=True)
+    _write(report, out.with_name(out.stem + "_report.csv"))
+    for _, r in report[report["note"].notna() | (report["status"] != "parsed")].iterrows():
+        print(f"note: {r['source_file']} [{r['sheet']}]: {r['status']}; {r['note']}")
     return 0
 
 
 def _price_panel(args: argparse.Namespace) -> int:
     out = Path(args.out_dir)
-    trades = clean_trades(
-        read_trades(args.trades), min_amount_inr=args.min_amount_inr,
-        dedupe_across_venues=args.dedupe_across_venues,
-    )
+    raw = read_trades(_inputs(args.trades, "trade files"))
+    no_yield = int(raw["yield_pct"].isna().sum())
+    if no_yield:
+        print(f"note: {no_yield} of {len(raw)} trades have no yield and are dropped; spreads need reported yields")
+    trades = clean_trades(raw, min_amount_inr=args.min_amount_inr, dedupe_across_venues=args.dedupe_across_venues)
     curve = BenchmarkCurve.from_csv(args.benchmark, compounding=args.benchmark_compounding)
     ratings = rating_timeline(load_rating_actions(args.rating_actions))
     panel = build_price_panel(
@@ -137,7 +175,8 @@ def _events(args: argparse.Namespace):
 
 def _backtest(args: argparse.Namespace) -> int:
     from cr_strat.backtest import run_backtest
-    from cr_strat.runner import build, load_config, read_cash_rates, set_param, write_result
+    from cr_strat.backtest import read_cash_rates
+    from cr_strat.runner import build, load_config, set_param, write_result
 
     raw = load_config(args.config)
     for item in args.set or []:
@@ -170,7 +209,8 @@ def _print_headline(summary: pd.DataFrame) -> None:
 
 
 def _sweep(args: argparse.Namespace) -> int:
-    from cr_strat.runner import load_config, parse_grid, read_cash_rates, sweep
+    from cr_strat.backtest import read_cash_rates
+    from cr_strat.runner import load_config, parse_grid, sweep
 
     market = _market(args)
     events, ownership = _events(args)
@@ -220,7 +260,7 @@ def _regress(args: argparse.Namespace) -> int:
     a = result.attrs
     print(f"OLS {a['y']} on {args.x}: n={a['n']}, R2={a['r2']:.3f}, errors={a['cov']}"
           + (f" ({a['n_clusters']} clusters)" if a["n_clusters"] else ""))
-    print(result.to_string(index=False, float_format=lambda v: f"{v:.4f}"))
+    print(result.to_string(index=False, float_format=lambda v: f"{v:.4g}"))
     if args.out:
         _write(result.assign(n=a["n"], r2=a["r2"], cov=a["cov"], n_clusters=a["n_clusters"]), Path(args.out))
     return 0
@@ -323,12 +363,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--panel", required=True, help="price_panel.csv")
     p.add_argument("--out-dir", required=True)
     p.add_argument("--anchors", default=",".join(str(a) for a in DEFAULT_ANCHORS),
-                   help="days relative to the event")
+                   help="days relative to the event; write --anchors=-60,10,60 when the first is negative")
     _add_peer_args(p)
     p.set_defaults(func=_event_prices)
 
     p = sub.add_parser("backtest", help="run a strategy backtest from a TOML config")
-    p.add_argument("--config", required=True, help="e.g. config/backtest_event_reversal.toml")
+    p.add_argument("--config", required=True,
+                   help="e.g. config/backtest_event_reversal.toml, or just event_reversal for a shipped config")
     _add_market_args(p)
     p.add_argument("--events", help="rating_events.csv, for event strategies")
     p.add_argument("--ownership", help="event_ownership.csv, for ownership filters")
@@ -342,7 +383,7 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(func=_backtest)
 
     p = sub.add_parser("sweep", help="rerun a backtest over a parameter grid, with in/out-of-sample statistics")
-    p.add_argument("--config", required=True)
+    p.add_argument("--config", required=True, help="as for backtest")
     _add_market_args(p)
     p.add_argument("--events")
     p.add_argument("--ownership")
@@ -403,4 +444,15 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(func=_demo)
 
     args = parser.parse_args(argv)
-    return args.func(args)
+    try:
+        if getattr(args, "mandates", None) == "config/mandates.toml":
+            args.mandates = str(config_dir() / "mandates.toml")
+        if getattr(args, "config", None):
+            args.config = _config_path(args.config)
+        return args.func(args)
+    except (ValueError, TypeError, FileNotFoundError, KeyError) as exc:
+        if os.environ.get("CR_STRAT_DEBUG"):
+            raise
+        print(f"error: {exc}", file=sys.stderr)
+        print("(set CR_STRAT_DEBUG=1 for the full traceback)", file=sys.stderr)
+        return 2

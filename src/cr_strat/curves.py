@@ -56,7 +56,11 @@ class BenchmarkCurve:
         df["date"] = pd.to_datetime(df["date"], format="ISO8601", errors="coerce")
         df["tenor_years"] = pd.to_numeric(df["tenor_years"], errors="coerce")
         df["yield_pct"] = pd.to_numeric(df["yield_pct"], errors="coerce")
+        n_rows = len(df)
         df = df.dropna(subset=["date", "tenor_years", "yield_pct"]).sort_values(["date", "tenor_years"])
+        if n_rows and df.empty:
+            raise ValueError("no usable benchmark curve rows: dates must be ISO (YYYY-MM-DD), "
+                             "tenor_years and yield_pct numeric")
         self.compounding = compounding
         self.max_staleness = pd.Timedelta(days=max_staleness_days)
         self._dates = np.array(sorted(df["date"].unique()), dtype="datetime64[ns]")

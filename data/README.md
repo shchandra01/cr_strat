@@ -1,7 +1,10 @@
 # Input data
 
 Put downloaded files under `data/raw/` and generated files under `data/out/`.
-Both directories are git-ignored. Dates are ISO (`YYYY-MM-DD`) everywhere.
+Both directories are git-ignored. Dates are ISO (`YYYY-MM-DD`) everywhere: in the
+security master and the curve, other formats are not guessed. The curve then fails
+with an error, and the security master warns how many dates it ignored. Re-save
+exports from Excel or FBIL with ISO dates.
 
 ## Rating actions: `rating_actions.csv`
 
@@ -16,7 +19,7 @@ file with NSE/BSE. A vendor feed works too.
 | `issuer_id` | yes | Stable key shared with the security master. CIN is a good choice. |
 | `rating` | yes | Rating string as published, e.g. `CRISIL AA+/Stable`, `[ICRA]AA (Negative)`, `Withdrawn` |
 | `issuer_name` | no | |
-| `agency` | no | Read from the rating string when blank |
+| `agency` | when the rating string does not name it | Read from the rating string when blank. A bare `Withdrawn` names no agency, so withdrawals need this column filled or the row is rejected. |
 | `instrument` | no | e.g. `Non-convertible debentures`, `Commercial paper`, `Tier II bonds`. Blank is taken to mean bonds. |
 | `instrument_class` | no | Overrides the inferred class: `BOND`, `BANK_LOAN`, `ST`, `SUB`, `PERP`, `STRUCTURED`, `MLD`, `FD`, `OTHER` |
 | `outlook` | no | If the outlook or watch is in a separate column |
@@ -92,7 +95,11 @@ column, pass `--trade-date`. If the value header has no unit, pass
 `--amount-unit`. The `_report.csv` lists the header it mapped to each field;
 check it on the first file from each venue.
 
-Prices are per 100 of face value and yields are in percent, as reported.
+Prices are per 100 of face value and yields are in percent, as reported. The
+price panel is built from **yields**: trades without a yield column load but are
+dropped by `price-panel`, which says how many. Without a traded-value column (or its
+unit, see `--amount-unit`), fills in a backtest are not capped by participation;
+`load-trades` prints a note when it cannot find the unit.
 
 ## Benchmark curve: `gsec_par_curve.csv` (or an OIS curve)
 
@@ -117,9 +124,11 @@ average rate or FBIL overnight MIBOR. Pass it to `backtest` or `sweep` as
 
 ## Synthetic data: `cr-strat synth` / `cr-strat demo`
 
-`cr-strat synth --out-dir data/demo/raw` writes every input above (rating
-actions, security master with coupons, G-sec curve, NSE and BSE trade files,
-canonical MF holdings) for a simulated market, plus `truth_events.csv` with the
-forced-selling overshoot planted at each downgrade below AA+. A `SYNTHETIC.txt`
-marker sits in the folder. Use it to check the pipeline and research code, never
-as evidence about the market.
+`cr-strat synth --out-dir data/demo/raw` writes a simulated market in these formats:
+`rating_actions.csv`, `securities.csv` (with coupons), `gsec_par_curve.csv`,
+`trades/nse/*.csv`, `trades/bse/*.csv` and `holdings_mf.csv`. The holdings are already
+in the canonical format, so there are no AMC workbooks, no `NAVAll.txt` and no
+`parse-mf` step. There is no cash-rate file either. It also writes `truth_events.csv`
+with the forced-selling overshoot planted at each downgrade below AA+, and a
+`SYNTHETIC.txt` marker. Use it to check the pipeline and research code, never as
+evidence about the market.

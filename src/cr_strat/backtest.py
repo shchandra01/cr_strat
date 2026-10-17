@@ -39,8 +39,10 @@ The run ends with positions still open, marked to model.
 
 from __future__ import annotations
 
+import dataclasses
 import math
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -115,12 +117,39 @@ class _Order:
     n_fills: int = 0
 
 
+_FREQ_ALIASES = {"DAILY": "D", "WEEKLY": "W-FRI", "W": "W-FRI", "MONTHLY": "M", "ME": "M", "BM": "M", "BME": "M",
+                 "QUARTERLY": "Q", "QE": "Q", "BQ": "Q", "BQE": "Q"}
+
+
 def rebalance_dates(dates: pd.DatetimeIndex, freq: str) -> set[pd.Timestamp]:
-    """Last calendar date in each period of ``freq`` ("D", "W-FRI", "M", "Q", ...)."""
-    if freq.upper() in ("D", "DAILY"):
+    """Last calendar date in each period of ``freq``: "D", "W-FRI" (any W-xxx), "M" or "Q"."""
+    freq = _FREQ_ALIASES.get(str(freq).upper(), freq)
+    if freq.upper() == "D":
         return set(dates)
-    periods = dates.to_period(freq)
+    try:
+        periods = dates.to_period(freq)
+    except ValueError:
+        raise ValueError(f"rebalance must be D, W-FRI (or another W-xxx), M or Q; got {freq!r}") from None
     return set(pd.Series(dates, index=periods).groupby(level=0).max())
+
+
+def read_cash_rates(source) -> pd.Series:
+    """Cash rate CSV with ``date`` and ``rate_pct`` (e.g. TREPS weighted average, MIBOR), as a Series."""
+    if isinstance(source, pd.Series):
+        return source
+    df = pd.read_csv(source)
+    df.columns = [c.strip().lower() for c in df.columns]
+    if not {"date", "rate_pct"} <= set(df.columns):
+        raise ValueError("cash rate file needs columns date, rate_pct")
+    return pd.Series(pd.to_numeric(df["rate_pct"], errors="coerce").to_numpy(),
+                     index=pd.to_datetime(df["date"], format="ISO8601")).dropna()
+
+
+def _frame(source) -> pd.DataFrame | None:
+    """Events or ownership as given: a DataFrame, a CSV path, or None."""
+    if source is None or isinstance(source, pd.DataFrame):
+        return source
+    return pd.read_csv(Path(source), dtype=str)
 
 
 class _Engine:
@@ -144,6 +173,7 @@ class _Engine:
         self.nav_rows: list[dict] = []
         self.pos_rows: list[dict] = []
         self.notes: list[str] = []
+        self.dropped: dict[str, set] = {}
         self.next_order_id = 0
         self.sectors = market.securities["sector"].to_dict() if "sector" in market.securities else {}
         self._event_dates = events["date"].to_numpy(dtype="datetime64[ns]")
@@ -304,11 +334,25 @@ class _Engine:
             "weight": value / nav if nav else np.nan,
         }, index=pd.Index(list(self.book), name="isin", dtype=object))
 
-    def _limit(self, weights: pd.Series) -> pd.Series:
+    def _limit(self, weights) -> pd.Series:
+        if weights is None:
+            weights = pd.Series(dtype=float)
+        elif isinstance(weights, dict):
+            weights = pd.Series(weights, dtype=float)
+        elif not isinstance(weights, pd.Series):
+            raise TypeError(f"{self.strategy.name}.target_weights must return a pandas Series of weights "
+                            f"indexed by ISIN, got {type(weights).__name__}")
         w = pd.to_numeric(weights, errors="coerce")
         if not w.index.is_unique:
             w = w.groupby(level=0).sum()
-        w = w[(w > 0).to_numpy() & np.array([i in self.market.cashflows for i in w.index], dtype=bool)]
+        w = w[(w > 0).to_numpy()]
+        known = np.array([i in self.market.securities.index for i in w.index], dtype=bool)
+        priced = np.array([i in self.market.cashflows for i in w.index], dtype=bool)
+        for reason, mask in (("not in the security master", ~known),
+                             ("without coupon or maturity terms", known & ~priced)):
+            if mask.any():
+                self.dropped.setdefault(reason, set()).update(w.index[mask])
+        w = w[priced]
         if w.empty:
             return w
         w = w.clip(upper=self.cfg.max_bond_weight)
@@ -387,6 +431,9 @@ class _Engine:
             })
 
     def run(self) -> None:
+        if not len(self.market.cashflows.index):
+            raise ValueError("no security has coupon_pct and maturity_date, so nothing can be priced or traded; "
+                             "add them to the security master (see data/README.md)")
         nav_prev = hedged = self.cash
         prev = None
         for i, t in enumerate(self.dates):
@@ -445,24 +492,45 @@ def run_backtest(
     *,
     config: BacktestConfig | None = None,
     execution: ExecutionModel | None = None,
-    events: pd.DataFrame | None = None,
-    ownership: pd.DataFrame | None = None,
-    cash_rates: pd.Series | None = None,
+    events: pd.DataFrame | str | Path | None = None,
+    ownership: pd.DataFrame | str | Path | None = None,
+    cash_rates: pd.Series | str | Path | None = None,
 ) -> BacktestResult:
     """Run ``strategy`` over the market and return daily NAV, positions, fills and orders.
 
-    ``cash_rates`` (percent by date, e.g. the TREPS weighted average or MIBOR)
+    ``events`` (``rating_events.csv``) and ``ownership`` (``event_ownership.csv``)
+    may be DataFrames or paths. ``cash_rates`` (percent by date, e.g. the TREPS
+    weighted average or MIBOR; a Series or a CSV of ``date, rate_pct``)
     overrides ``config.cash_rate_pct`` and the curve's shortest tenor as the
-    rate earned on cash.
+    rate earned on cash. Anything that probably explains an empty or partial
+    backtest is listed in ``result.notes``.
     """
+    if not dataclasses.is_dataclass(strategy) or "__dataclass_fields__" not in type(strategy).__dict__:
+        raise TypeError(f"{type(strategy).__name__} must be decorated with @dataclass, like the built-in "
+                        "strategies, or its parameters are ignored")
     config = config or BacktestConfig()
     execution = execution or ExecutionModel()
+    events, ownership = _frame(events), _frame(ownership)
+    cash_rates = read_cash_rates(cash_rates) if cash_rates is not None else None
     engine = _Engine(market, strategy, config, execution,
                      prepare_events(events, ownership, disclosure_lag_days=config.disclosure_lag_days),
                      cash_rates)
     engine.run()
+    notes = engine.notes
+    if getattr(strategy, "needs_events", False) and (events is None or not len(events)):
+        notes.append(f"{strategy.name} trades on rating events but none were given (--events rating_events.csv)")
+    if getattr(strategy, "min_constrained_share", 0) and ownership is None:
+        notes.append("min_constrained_share is set but no ownership was given (--ownership event_ownership.csv), "
+                     "so no event qualifies")
+    for reason, isins in engine.dropped.items():
+        shown = ", ".join(sorted(map(str, isins))[:5]) + (", ..." if len(isins) > 5 else "")
+        notes.append(f"targets for {len(isins)} bond(s) {reason} were ignored: {shown}")
     if len(market.unpriced):
-        engine.notes.append(f"{len(market.unpriced)} securities lack coupon or maturity terms and cannot be traded")
+        notes.append(f"{len(market.unpriced)} of {len(market.securities)} securities lack coupon or maturity "
+                     "terms and cannot be traded")
+    if not engine.fills:
+        notes.append("the strategy never traded: check its filters, the events and ownership inputs, and that "
+                     "target bonds have coupon terms and reported trades after the signal")
     return BacktestResult(
         strategy=strategy.name, params=strategy.params(), config=config, execution=execution,
         nav=pd.DataFrame(engine.nav_rows, columns=list(NAV_COLUMNS)),

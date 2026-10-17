@@ -156,8 +156,9 @@ class MarketData:
         last["peer_bps"] = [p[0] for p in peers]
         last["peer_issuers"] = [p[1] for p in peers]
         last["rv_bps"] = last["spread_bps"] - last["peer_bps"]
-        snap = last.rename(columns={"date": "obs_date", "rating_bucket": "obs_rating_bucket",
-                                    "tenor_bucket": "obs_tenor_bucket"})
+        # Liquidity is the window's total, not the last day's volume carried on the panel row.
+        snap = last.drop(columns=["volume_inr", "trade_days"], errors="ignore").rename(
+            columns={"date": "obs_date", "rating_bucket": "obs_rating_bucket", "tenor_bucket": "obs_tenor_bucket"})
         snap = snap.merge(liq, left_on="isin", right_index=True, how="left")
         snap["age_days"] = (t - snap["obs_date"]).dt.days
         maturity = pd.to_datetime(self.securities["maturity_date"].reindex(snap["isin"]).to_numpy())
