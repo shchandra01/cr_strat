@@ -66,3 +66,12 @@ def test_snapshot_volume_is_the_window_total(market):
     p0 = snap.set_index("isin").loc["P0"]
     # P0 traded every weekday from D0 to D0+11 (10 days) at 1e8 a day.
     assert p0["trade_days"] == 10 and p0["volume_inr"] == pytest.approx(10 * 1e8)
+
+
+def test_snapshot_liquidity_window_and_typed_empty_result(market):
+    factory, sec, trades = market
+    md = factory(sec, trades)
+    snap = md.snapshot(D0 + pd.Timedelta(days=11), max_age_days=30, liquidity_days=3).set_index("isin")
+    assert snap.loc["P0", "trade_days"] == 3  # Wed-Fri: only the last 3 days count towards liquidity
+    empty = md.snapshot(D0 - pd.Timedelta(days=100))
+    assert empty.empty and empty.nlargest(3, "spread_bps").empty and empty["priceable"].dtype == bool

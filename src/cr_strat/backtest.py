@@ -28,8 +28,9 @@ Each position also carries ``funding``: minus the benchmark yield at its tenor
 on its value, the carry of a duration-matched risk-free bond. ``total -
 rates + funding`` is then the position's credit excess return: spread carry,
 spread change and costs. ``nav_hedged`` swaps every bond's return for that
-excess plus the cash rate on the bond's value (``hedge_cash``), as a costless
-total-return swap against a duration-matched risk-free bond would. Its excess
+excess plus the cash rate on the bond's value, as a costless total-return swap
+against a duration-matched risk-free bond would, and earns the cash rate on its
+own cash balance (both in ``hedge_cash``). Its excess
 over cash is the strategy's pure credit return. The overlay has no cost, basis
 or margin: it isolates what the strategy earns from credit, not what a hedged
 account would have netted.
@@ -137,12 +138,14 @@ def read_cash_rates(source) -> pd.Series:
     """Cash rate CSV with ``date`` and ``rate_pct`` (e.g. TREPS weighted average, MIBOR), as a Series."""
     if isinstance(source, pd.Series):
         return source
-    df = pd.read_csv(source)
-    df.columns = [c.strip().lower() for c in df.columns]
+    df = source.copy() if isinstance(source, pd.DataFrame) else pd.read_csv(source)
+    df.columns = [str(c).strip().lower() for c in df.columns]
     if not {"date", "rate_pct"} <= set(df.columns):
-        raise ValueError("cash rate file needs columns date, rate_pct")
-    return pd.Series(pd.to_numeric(df["rate_pct"], errors="coerce").to_numpy(),
-                     index=pd.to_datetime(df["date"], format="ISO8601")).dropna()
+        raise ValueError("cash rates need columns date, rate_pct")
+    dates = pd.to_datetime(df["date"], format="ISO8601", errors="coerce")
+    if dates.isna().any():
+        raise ValueError(f"cash rate dates must be ISO (YYYY-MM-DD); {int(dates.isna().sum())} are not")
+    return pd.Series(pd.to_numeric(df["rate_pct"], errors="coerce").to_numpy(), index=dates).dropna()
 
 
 def _frame(source) -> pd.DataFrame | None:
@@ -446,6 +449,9 @@ class _Engine:
                 cash_pnl = self.cash * rate / 100 * (t - prev).days / 365
                 self.cash += cash_pnl
                 pnl, closed = self._revalue(t, prev, self.cash_rates[i - 1], day)
+                # The hedged account earns interest on its own cash, which differs from the
+                # real account's by the gap between the two NAVs.
+                pnl["hedge_cash"] += (hedged - nav_prev) * self.cash_rates[i - 1] / 100 * (t - prev).days / 365
             n_fills = len(self.fills)
             cost = self._execute(i, t, nav_prev, day, closed)
             pnl["execution"] -= cost
@@ -519,6 +525,9 @@ def run_backtest(
     notes = engine.notes
     if getattr(strategy, "needs_events", False) and (events is None or not len(events)):
         notes.append(f"{strategy.name} trades on rating events but none were given (--events rating_events.csv)")
+    elif getattr(strategy, "exclude_downgraded_days", 0) and events is None:
+        notes.append("exclude_downgraded_days needs rating events (--events rating_events.csv); without them "
+                     "recently downgraded issuers were not excluded")
     if getattr(strategy, "min_constrained_share", 0) and ownership is None:
         notes.append("min_constrained_share is set but no ownership was given (--ownership event_ownership.csv), "
                      "so no event qualifies")

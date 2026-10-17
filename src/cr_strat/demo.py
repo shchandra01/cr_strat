@@ -96,6 +96,7 @@ def run_demo(out: Path, *, seed: int = 7, n_issuers: int = 200, start: str = "20
                      "hedged_sharpe": summary.at["sharpe", "hedged"]})
     comparison = pd.DataFrame(rows)
     comparison.to_csv(work / "backtests" / "comparison.csv", index=False)
+    print(f"wrote {len(comparison):>7} rows  {work / 'backtests' / 'comparison.csv'}")
 
     market_args = ["--panel", str(work / "price_panel.csv"), "--securities", str(raw / "securities.csv"),
                    "--benchmark", str(raw / "gsec_par_curve.csv"), "--rating-actions", str(raw / "rating_actions.csv")]

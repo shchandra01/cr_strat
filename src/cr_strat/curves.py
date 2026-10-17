@@ -15,6 +15,7 @@ Each issuer counts once per day, and the issuer being studied is excluded.
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -57,10 +58,14 @@ class BenchmarkCurve:
         df["tenor_years"] = pd.to_numeric(df["tenor_years"], errors="coerce")
         df["yield_pct"] = pd.to_numeric(df["yield_pct"], errors="coerce")
         n_rows = len(df)
+        bad = int(df["date"].isna().sum())
         df = df.dropna(subset=["date", "tenor_years", "yield_pct"]).sort_values(["date", "tenor_years"])
         if n_rows and df.empty:
             raise ValueError("no usable benchmark curve rows: dates must be ISO (YYYY-MM-DD), "
                              "tenor_years and yield_pct numeric")
+        if bad:
+            warnings.warn(f"benchmark curve: {bad} of {n_rows} rows have no ISO date (YYYY-MM-DD) and were dropped",
+                          stacklevel=2)
         self.compounding = compounding
         self.max_staleness = pd.Timedelta(days=max_staleness_days)
         self._dates = np.array(sorted(df["date"].unique()), dtype="datetime64[ns]")

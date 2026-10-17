@@ -78,8 +78,8 @@ Input formats and where to get each file: [`data/README.md`](data/README.md).
 ## Quickstart
 
 ```bash
-pip install -e ".[dev,xls]"
-pytest
+python -m pip install -e ".[dev,xls]"
+python -m pytest
 
 cr-strat rating-events --actions data/raw/rating_actions.csv --out-dir data/out
 cr-strat parse-mf data/raw/mf/hdfc/*.xlsx --amc "HDFC Mutual Fund" \
@@ -144,13 +144,16 @@ cr-strat backtest --config config/backtest_event_reversal.toml \
 ```
 
 `--config event_reversal` (or `relative_value`, `carry`) picks a shipped config by
-name. `--set` overrides any config key, as `strategy.hold_days` or
-`strategy.params.hold_days`, `execution.lag_days`, `backtest.start` and so on. The
+name. `--set` overrides any config key: `strategy.hold_days` (or
+`strategy.params.hold_days`), `execution.lag_days`, `execution.half_spread_bps.AAA`,
+`backtest.start` and so on. The
 data flags:
 
 * `--rating-actions`: without it, a strategy sees each bond's rating as of its last
   trade, so a downgrade reaches it only when the bond trades again.
-* `--events`: `event_reversal` trades nothing without it.
+* `--events`: `event_reversal` trades nothing without it. `carry` and
+  `relative_value` use it to skip recently downgraded issuers
+  (`exclude_downgraded_days`).
 * `--ownership`: needed only for `min_constrained_share`.
 * `--cash-rates`: a CSV of `date, rate_pct` (TREPS weighted average or MIBOR). Without
   it, cash earns the curve's shortest tenor.
@@ -167,7 +170,7 @@ that never traded. Outputs:
 | `episodes.csv` | One row per holding period: entry and exit spread, P&L, excess P&L over a duration-matched risk-free bond |
 | `summary.csv` | All statistics, for the total-return and rates-hedged series, plus trading statistics |
 | `attribution.csv`, `monthly_returns*.csv`, `drawdowns.csv`, `exposure_*.csv`, `concentration.csv` | Breakdowns |
-| `benchmark_nav.csv`, `params.csv` | The benchmark strategy's daily NAV (when the config has `[benchmark]`); every parameter the run used |
+| `benchmark_nav.csv`, `params.csv` | The benchmark strategy's daily NAV (when the config has `[benchmark]`); the strategy, backtest, execution and benchmark settings the run used (the data-file and market flags are the command line's) |
 | `tearsheet.html` | All of the above in one page, no external dependencies |
 
 ### How the engine trades
@@ -277,7 +280,7 @@ cr-strat sweep --config config/backtest_event_reversal.toml <data paths as above
 
 Every combination runs on the same market. The output has statistics for the
 whole period (`all_*`) and separately up to and after `--split-date` (`is_*`,
-`oos_*`), plus each run's **deflated Sharpe ratio**: the probability that its
+`oos_*`, including fill counts), plus each run's **deflated Sharpe ratio**: the probability that its
 rates-hedged Sharpe beats the best Sharpe expected from that many skill-less
 variants. Pick parameters on the first period and judge them on the second with
 `oos_deflated_sharpe`. Distrust anything that is not well above 0.5, and anything

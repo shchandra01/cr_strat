@@ -47,6 +47,15 @@ SNAPSHOT_COLUMNS = (
 )
 
 
+def _empty_snapshot() -> pd.DataFrame:
+    """A snapshot with no rows but the right column types, so strategies can filter and rank it."""
+    text = {"isin", "issuer_id", "instrument_class", "sector", "obs_rating_bucket", "obs_tenor_bucket",
+            "tenor_bucket", "rating_bucket"}
+    dtypes = {c: object if c in text else "datetime64[ns]" if c == "obs_date" else bool if c == "priceable"
+              else float for c in SNAPSHOT_COLUMNS}
+    return pd.DataFrame({c: pd.Series(dtype=d) for c, d in dtypes.items()})
+
+
 class MarketData:
     """Price panel, security terms and benchmark curve, queried as of a date."""
 
@@ -146,9 +155,9 @@ class MarketData:
             window = window[window["issuer_id"].isin([str(i) for i in issuers])]
         recent = window[window["date"] > t - pd.Timedelta(days=max_age_days)]
         if recent.empty:
-            return pd.DataFrame(columns=list(SNAPSHOT_COLUMNS))
+            return _empty_snapshot()
         last = recent.groupby("isin", sort=False).tail(1).copy()
-        g = window.groupby("isin")
+        g = window[window["date"] > t - pd.Timedelta(days=liquidity_days)].groupby("isin")
         liq = pd.DataFrame({"trade_days": g["date"].nunique(), "volume_inr": g["volume_inr"].sum(min_count=1)})
         keys = last[list(self.match_on)].to_numpy(dtype=object)
         peers = [self.bench.level(tuple(k), d, iss) if np.isfinite(s) else (np.nan, 0)

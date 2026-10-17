@@ -1,10 +1,11 @@
 # Input data
 
 Put downloaded files under `data/raw/` and generated files under `data/out/`.
-Both directories are git-ignored. Dates are ISO (`YYYY-MM-DD`) everywhere: in the
-security master and the curve, other formats are not guessed. The curve then fails
-with an error, and the security master warns how many dates it ignored. Re-save
-exports from Excel or FBIL with ISO dates.
+Both directories are git-ignored. Dates are ISO (`YYYY-MM-DD`) everywhere. Other
+formats are not guessed. The curve warns about rows it drops and fails if none
+parse. The security master and holdings warn how many dates they ignored. A
+cash-rate file fails, and rating actions with bad dates go to
+`rating_parse_failures.csv`. Re-save exports from Excel or FBIL with ISO dates.
 
 ## Rating actions: `rating_actions.csv`
 
@@ -46,7 +47,8 @@ If a layout hides the date or value unit, pass `--as-of` or `--mv-unit`. Check
 `https://www.amfiindia.com/spages/NAVAll.txt` lists every live scheme under its
 SEBI category heading. Pass it as `--navall` to attach categories. Schemes it
 cannot match land in `<out>_scheme_matches.csv` with `match = none`. Map those
-in a CSV of `amc, scheme_name, category` and pass it as `--scheme-overrides`.
+in a CSV of `amc, scheme_name, category` and pass it as `--scheme-overrides`
+(together with `--navall`; the overrides are applied during that matching).
 Closed or merged schemes are missing from the current file, so older periods
 need overrides or an archived copy.
 

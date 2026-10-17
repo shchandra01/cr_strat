@@ -444,6 +444,8 @@ def _import_strategy(ref: str) -> type[Strategy]:
         spec = importlib.util.spec_from_file_location(path.stem, path)
         module = importlib.util.module_from_spec(spec)
         sys.modules[path.stem] = module
+        if str(path.parent) not in sys.path:  # so the file can import helpers sitting next to it
+            sys.path.insert(0, str(path.parent))
         spec.loader.exec_module(module)
     else:
         module = importlib.import_module(target)

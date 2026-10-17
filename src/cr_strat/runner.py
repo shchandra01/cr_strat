@@ -59,6 +59,9 @@ def load_config(source: str | Path | dict) -> dict:
                 local = Path(source).resolve().parent / file
                 if local.exists():
                     raw[section] = dict(raw[section], name=f"{local}:{cls}")
+                elif not Path(file).exists():
+                    raise ValueError(f"strategy file {file} not found next to the config ({local}) "
+                                     "or in the current directory")
     return raw
 
 
@@ -82,6 +85,9 @@ def set_param(raw: dict, key: str, value) -> dict:
     table = out.setdefault(section, {})
     if section in ("strategy", "benchmark") and name != "name":
         table["params"] = dict(table.get("params", {}), **{name: value})
+    elif "." in name:  # one nested table, e.g. execution.half_spread_bps.AAA
+        sub, _, leaf = name.partition(".")
+        table[sub] = dict(table.get(sub, {}), **{leaf: value})
     else:
         table[name] = value
     return out
@@ -156,6 +162,12 @@ def write_result(result: BacktestResult, out_dir: str | Path, benchmark: Backtes
     params = [{"section": "strategy", "key": "name", "value": result.strategy}]
     params += [{"section": "strategy", "key": k, "value": v} for k, v in result.params.items()]
     params += [{"section": "backtest", "key": k, "value": v} for k, v in dataclasses.asdict(result.config).items()]
+    for k, v in dataclasses.asdict(result.execution).items():
+        items = v.items() if isinstance(v, dict) else [(None, v)]
+        params += [{"section": "execution", "key": k if sub is None else f"{k}.{sub}", "value": x} for sub, x in items]
+    if benchmark is not None:
+        params += [{"section": "benchmark", "key": "name", "value": benchmark.strategy}]
+        params += [{"section": "benchmark", "key": k, "value": v} for k, v in benchmark.params.items()]
     _write(pd.DataFrame(params), out / "params.csv")
     if report:
         from cr_strat.report import tearsheet
@@ -200,12 +212,7 @@ def sweep(
     rows, excess, excess_oos = [], [], []
     combos = list(itertools.product(*(grid[k] for k in keys)))
     split = pd.Timestamp(split_date) if split_date else None
-    if split is not None:
-        cal = market.curve.dates
-        before, after = (cal <= split).sum(), (cal > split).sum()
-        if min(before, after) < 60:
-            print(f"note: --split-date {split.date()} leaves {before} curve dates before and {after} after; "
-                  "one side is too short to judge")
+    notes: dict[str, int] = {}
     for n, values in enumerate(combos, start=1):
         cfg = raw
         for k, v in zip(keys, values):
@@ -213,7 +220,14 @@ def sweep(
         config, execution, strategy, _ = build(cfg)
         res = run_backtest(market, strategy, config=config, execution=execution, events=events,
                            ownership=ownership, cash_rates=cash_rates)
+        for note in res.notes:
+            notes[note] = notes.get(note, 0) + 1
         nav = res.nav.set_index("date")
+        if n == 1 and split is not None:
+            before, after = (nav.index <= split).sum(), (nav.index > split).sum()
+            if min(before, after) < 60:
+                print(f"note: --split-date {split.date()} leaves {before} backtest days before it and {after} "
+                      "after; one side is too short to judge")
         r = nav["nav_hedged"].pct_change().dropna()
         rf = (nav["cash_rate_pct"].shift(1) / 100 * nav.index.to_series().diff().dt.days / 365).reindex(r.index)
         excess.append(r - rf.fillna(0.0))
@@ -224,6 +238,8 @@ def sweep(
         if split is not None:
             row.update({f"is_{k}": v for k, v in _period_stats(res.nav, end=split).items()})
             row.update({f"oos_{k}": v for k, v in _period_stats(res.nav, start=split + pd.Timedelta(days=1)).items()})
+            fill_dates = pd.to_datetime(res.fills["date"])
+            row.update(is_n_fills=int((fill_dates <= split).sum()), oos_n_fills=int((fill_dates > split).sum()))
         trading = analytics.trading_stats(res)
         row.update({k: trading.get(k) for k in ("avg_positions", "turnover_annual", "cost_bps_annual", "n_fills")})
         rows.append(row)
@@ -238,6 +254,8 @@ def sweep(
         # Selection happens before the split, so judge on what comes after it.
         oos = [sharpe_moments(e)[0] for e in excess_oos]
         out["oos_deflated_sharpe"] = [deflated_sharpe(e, oos) for e in excess_oos]
+    for note, count in notes.items():
+        print(f"note: {note} ({count} of {len(combos)} runs)")
     return out
 
 

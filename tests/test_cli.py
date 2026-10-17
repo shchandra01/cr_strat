@@ -144,10 +144,15 @@ def test_synthetic_market_through_backtest_and_research(tmp_path, monkeypatch, c
     monkeypatch.chdir(out)  # the strategy file resolves against the config's folder, not the cwd
     assert main(["backtest", "--config", str(tmp_path / "mine.toml"), *market, "--set", "strategy.params.n_bonds=4",
                  "--out-dir", str(out / "mine"), "--no-report"]) == 0
-    params = pd.read_csv(out / "mine" / "params.csv").set_index("key")["value"]
+    params = pd.read_csv(out / "mine" / "params.csv")
+    assert {"strategy", "backtest", "execution"} <= set(params["section"])
+    params = params[params["section"] == "strategy"].set_index("key")["value"]
     assert params["name"] == "wide_spreads" and params["n_bonds"] == "4"
     assert pd.read_csv(out / "mine" / "nav.csv")["n_positions"].max() > 0
 
     # Errors are one line, not a traceback.
     assert main(["backtest", "--config", "no_such_config", *market, "--out-dir", str(out / "x")]) == 2
     assert "config not found" in capsys.readouterr().err
+    assert main(["regress", "--data", str(out / "reg.csv"), "--where", "nosuchcol == 1", "--y", "coef",
+                 "--x", "se"]) == 2
+    assert "nosuchcol" in capsys.readouterr().err

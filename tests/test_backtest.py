@@ -188,3 +188,17 @@ def test_inputs_as_paths_dicts_and_type_errors(market_factory, tmp_path):
         run_backtest(md, NotADataclass(), config=_config())
     with pytest.raises(ValueError, match="rebalance must be"):
         run_backtest(md, Hold(rebalance="fortnightly"), config=_config())
+
+
+def test_a_flat_book_earns_exactly_cash_in_both_series(market_factory):
+    days = pd.bdate_range("2025-01-01", "2025-12-31")
+    md = market_factory([_bond(maturity_date="2025-06-30")], _trades(days[days < "2025-06-27"]), end="2025-12-31")
+    res = run_backtest(md, Hold(), config=_config(cash_rate_pct=6.0), execution=ExecutionModel(**FREE))
+    nav = res.nav.set_index("date")
+    after = nav[nav.index > "2025-07-15"]  # the bond has matured; both books are all cash
+    assert (after["n_positions"] == 0).all()
+    growth = after["nav"].pct_change().dropna(), after["nav_hedged"].pct_change().dropna()
+    assert (growth[0] - growth[1]).abs().max() < 1e-15  # the hedged book earns cash on its own cash
+    from cr_strat import analytics
+    flat = analytics.performance_stats(after["nav_hedged"], cash_rate_pct=after["cash_rate_pct"])
+    assert np.isnan(flat["sharpe"]) and np.isnan(flat["excess_t_stat_nw"])

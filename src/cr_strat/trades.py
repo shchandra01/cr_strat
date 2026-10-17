@@ -130,6 +130,10 @@ def load_trades(
         notes = []
         if mult is None and "amount" in colmap:
             notes.append("traded value unit not found; pass --amount-unit")
+        if "amount" not in colmap:
+            notes.append("no traded value column; backtest fills will not be capped by participation")
+        if "yield_pct" not in colmap:
+            notes.append("no yield column; price-panel needs reported yields and will drop these trades")
         if not valid_date[valid_isin].any():
             notes.append("no trade dates; pass --trade-date")
         report.append({
@@ -153,6 +157,10 @@ def read_trades(source) -> pd.DataFrame:
         df = source.copy()
     elif isinstance(source, (str, Path)):
         df = pd.read_csv(source, dtype={"isin": str, "venue": str, "source_file": str})
+        missing = [c for c in ("trade_date", "isin", "yield_pct") if c not in df]
+        if missing:
+            raise ValueError(f"{source} is not a load-trades output (no {', '.join(missing)} column); "
+                             "run cr-strat load-trades on the venue files first")
     else:
         return pd.concat([read_trades(s) for s in source], ignore_index=True)
     for col in ("trade_date", "settlement_date"):

@@ -43,6 +43,10 @@ def _config_path(value: str) -> str:
     raise FileNotFoundError(f"config not found: {value} (also looked in {config_dir()})")
 
 
+def _debug() -> bool:
+    return os.environ.get("CR_STRAT_DEBUG", "") not in ("", "0")
+
+
 def _inputs(paths: list[str], what: str) -> list[str]:
     """Drop the report files a shell glob picks up alongside the real inputs, saying so."""
     keep = [p for p in paths if not p.endswith(_SIDE_FILE_SUFFIXES)]
@@ -50,7 +54,7 @@ def _inputs(paths: list[str], what: str) -> list[str]:
     if skipped:
         print(f"note: ignoring {len(skipped)} report file(s) among the {what}: {', '.join(skipped)}")
     if not keep:
-        raise ValueError(f"no {what} files left after dropping report files")
+        raise ValueError(f"no {what} left after dropping report files")
     return keep
 
 
@@ -85,6 +89,8 @@ def _parse_mf(args: argparse.Namespace) -> int:
         reports.append(report)
     holdings = pd.concat(frames, ignore_index=True)
     out = Path(args.out)
+    if args.scheme_overrides and not args.navall:
+        raise ValueError("--scheme-overrides is applied while matching against --navall; pass both")
     if args.navall:
         overrides = pd.read_csv(args.scheme_overrides) if args.scheme_overrides else None
         holdings, matches = attach_categories(holdings, parse_amfi_navall(args.navall), overrides)
@@ -129,6 +135,10 @@ def _price_panel(args: argparse.Namespace) -> int:
     no_yield = int(raw["yield_pct"].isna().sum())
     if no_yield:
         print(f"note: {no_yield} of {len(raw)} trades have no yield and are dropped; spreads need reported yields")
+    no_amount = int(raw["amount_inr"].isna().sum())
+    if no_amount:
+        print(f"note: {no_amount} of {len(raw)} trades have no traded value; backtest fills on those days are not "
+              "capped by participation")
     trades = clean_trades(raw, min_amount_inr=args.min_amount_inr, dedupe_across_venues=args.dedupe_across_venues)
     curve = BenchmarkCurve.from_csv(args.benchmark, compounding=args.benchmark_compounding)
     ratings = rating_timeline(load_rating_actions(args.rating_actions))
@@ -218,7 +228,8 @@ def _sweep(args: argparse.Namespace) -> int:
     result = sweep(market, load_config(args.config), parse_grid(args.grid), events=events, ownership=ownership,
                    cash_rates=cash, split_date=args.split_date)
     _write(result, Path(args.out))
-    print(f"note: {len(result)} combinations tried; read deflated_sharpe, not the best raw Sharpe")
+    judge = "oos_deflated_sharpe and the oos_* columns" if args.split_date else "deflated_sharpe"
+    print(f"note: {len(result)} combinations tried; judge by {judge}, not the best raw Sharpe")
     return 0
 
 
@@ -239,9 +250,13 @@ def _signals(args: argparse.Namespace) -> int:
     _write(summary, out / "signal_summary.csv")
     _write(quantiles, out / "signal_quantiles.csv")
     _write(by_date, out / "signal_ic_by_date.csv")
-    if len(summary):
-        cols = ["signal", "horizon_days", "avg_n", "mean_ic", "t_stat_nw", "long_short_mean", "long_short_t_nw"]
-        print(summary[cols].to_string(index=False, float_format=lambda v: f"{v:.4f}"))
+    cols = ["signal", "horizon_days", "avg_n", "mean_ic", "t_stat_nw", "long_short_mean", "long_short_t_nw"]
+    if summary.empty or "mean_ic" not in summary:
+        print("note: no signal had enough bonds with forward returns; check the horizons against the data's "
+              "dates, and that the security master has coupon_pct and maturity_date")
+    else:
+        print(f"forward return: {args.ret}, entry: {args.entry}, neutralized by: {args.neutralize_by or 'none'}")
+        print(summary.reindex(columns=cols).to_string(index=False, float_format=lambda v: f"{v:.4f}"))
     return 0
 
 
@@ -445,14 +460,17 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     try:
-        if getattr(args, "mandates", None) == "config/mandates.toml":
-            args.mandates = str(config_dir() / "mandates.toml")
+        if getattr(args, "mandates", None) and not Path(args.mandates).exists():
+            fallback = config_dir() / Path(args.mandates).name
+            if fallback.exists():
+                args.mandates = str(fallback)
         if getattr(args, "config", None):
             args.config = _config_path(args.config)
         return args.func(args)
-    except (ValueError, TypeError, FileNotFoundError, KeyError) as exc:
-        if os.environ.get("CR_STRAT_DEBUG"):
+    except Exception as exc:  # one line for the user; CR_STRAT_DEBUG=1 for the traceback
+        if _debug():
             raise
-        print(f"error: {exc}", file=sys.stderr)
+        kind = "" if isinstance(exc, (ValueError, TypeError, OSError, KeyError)) else f"{type(exc).__name__}: "
+        print(f"error: {kind}{exc}", file=sys.stderr)
         print("(set CR_STRAT_DEBUG=1 for the full traceback)", file=sys.stderr)
         return 2

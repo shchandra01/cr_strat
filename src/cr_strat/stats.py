@@ -94,6 +94,9 @@ def ols(
     for c in [y, *x]:
         df[c] = pd.to_numeric(df[c].map(lambda v: float(v) if isinstance(v, (bool, np.bool_)) else v),
                               errors="coerce")
+    text = [c for c in [y, *x] if df[c].isna().all() and data[c].notna().any()]
+    if text:
+        raise ValueError(f"columns {text} are not numeric; regress needs numbers or booleans")
     complete = df.dropna()
     if len(complete) <= len(x) + int(add_constant):
         missing = ", ".join(f"{c} {int(df[c].isna().sum())}" for c in cols if df[c].isna().any())
@@ -153,7 +156,7 @@ def sharpe_moments(returns) -> tuple[float, int, float, float]:
     """Per-period Sharpe ratio, observations, skewness and (non-excess) kurtosis."""
     r = pd.Series(returns, dtype=float).dropna()
     sd = r.std(ddof=1)
-    sr = float(r.mean() / sd) if sd > 0 else np.nan
+    sr = float(r.mean() / sd) if sd > 1e-10 else np.nan  # flat series: rounding noise, not risk
     return sr, len(r), float(r.skew()), float(r.kurt()) + 3.0
 
 

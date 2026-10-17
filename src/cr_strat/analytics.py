@@ -81,6 +81,10 @@ def performance_stats(nav: pd.Series, *, cash_rate_pct: pd.Series | None = None,
     monthly = nav.resample("ME").last()
     monthly = pd.concat([nav.iloc[:1], monthly]).pct_change().dropna()
     sr, n, skew, kurt = sharpe_moments(ex)
+    # An all-cash book has excess returns of rounding noise; its "Sharpe" means nothing.
+    flat = not ex.std(ddof=1) > 1e-10
+    if flat:
+        sr = np.nan
     downside = math.sqrt((np.minimum(ex, 0.0) ** 2).mean()) * math.sqrt(ppy)
     q05 = r.quantile(0.05)
     total = nav.iloc[-1] / nav.iloc[0] - 1
@@ -91,16 +95,16 @@ def performance_stats(nav: pd.Series, *, cash_rate_pct: pd.Series | None = None,
         "start": nav.index[0], "end": nav.index[-1], "years": years, "n_obs": len(r),
         "total_return": total, "cagr": cagr, "ann_vol": vol,
         "ann_excess_return": ex.mean() * ppy, "sharpe": sr * math.sqrt(ppy) if np.isfinite(sr) else np.nan,
-        "sortino": ex.mean() * ppy / downside if downside > 0 else np.nan,
+        "sortino": ex.mean() * ppy / downside if downside > 0 and not flat else np.nan,
         "max_drawdown": dd.min(), "max_drawdown_date": dd.idxmin(), "longest_drawdown_days": longest,
         "calmar": cagr / abs(dd.min()) if dd.min() < 0 else np.nan,
         "skew": skew, "excess_kurtosis": kurt - 3, "var_95_daily": -q05, "cvar_95_daily": -r[r <= q05].mean(),
         "hit_rate_daily": (r > 0).mean(), "hit_rate_monthly": (monthly > 0).mean() if len(monthly) else np.nan,
         "best_month": monthly.max(), "worst_month": monthly.min(),
-        "excess_t_stat_nw": t_nw, "prob_sharpe_gt_0": probabilistic_sharpe(sr, n, skew, kurt),
+        "excess_t_stat_nw": np.nan if flat else t_nw, "prob_sharpe_gt_0": probabilistic_sharpe(sr, n, skew, kurt),
     }
     if benchmark is not None:
-        b = returns(benchmark.dropna()).reindex(r.index)
+        b = returns(as_nav(benchmark)).reindex(r.index)
         both = pd.concat([r, b], axis=1, keys=["s", "b"]).dropna()
         if len(both) > 2:
             active = both["s"] - both["b"]

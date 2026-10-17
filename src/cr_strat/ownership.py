@@ -75,7 +75,12 @@ def load_holdings(source) -> pd.DataFrame:
     missing = [c for c in ("as_of_date", "holder_type", "holder_id", "isin") if c not in df]
     if missing:
         raise ValueError(f"holdings missing columns: {missing}")
+    given = df["as_of_date"].notna() & (df["as_of_date"].astype(str).str.strip() != "")
     df["as_of_date"] = pd.to_datetime(df["as_of_date"], format="ISO8601", errors="coerce")
+    bad = int((given & df["as_of_date"].isna()).sum())
+    if bad:
+        warnings.warn(f"holdings: {bad} rows have an as_of_date that is not ISO (YYYY-MM-DD) and were dropped",
+                      stacklevel=2)
     df["holder_type"] = df["holder_type"].str.strip().str.upper()
     df["isin"] = df["isin"].str.strip().str.upper()
     if "category" not in df:
