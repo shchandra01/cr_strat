@@ -3,18 +3,24 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 from pathlib import Path
 
 import pandas as pd
 
+from cr_strat.amfi_debt_trades import build_mf_trades, mapping_report, to_price_trades
+from cr_strat.cra_disclosures import disclosure_summary, load_cra_disclosures, unmapped_issuers
 from cr_strat.curves import BenchmarkCurve, SpreadBenchmark
 from cr_strat.event_prices import DEFAULT_ANCHORS, event_price_paths
+from cr_strat.fbil import GSEC_KINDS, MM_KINDS, combine_curves, load_fbil_gsec_curve, load_fbil_money_market
+from cr_strat.flows import DEFAULT_WINDOWS, event_flows, parse_windows
 from cr_strat.mandates import load_mandates
 from cr_strat.mf_portfolio import parse_mf_portfolio
 from cr_strat.ownership import event_ownership, load_events, load_securities
 from cr_strat.price_panel import build_price_panel, read_price_panel
 from cr_strat.rating_actions import load_rating_actions
 from cr_strat.rating_events import build_rating_events, rating_timeline
+from cr_strat.rating_scale import parse_rating, parse_ratings
 from cr_strat.schemes import attach_categories, parse_amfi_navall
 from cr_strat.textparse import UNIT_MULTIPLIERS
 from cr_strat.trades import clean_trades, isin_daily, load_trades, read_trades
@@ -92,7 +98,10 @@ def _price_panel(args: argparse.Namespace) -> int:
         read_trades(args.trades), min_amount_inr=args.min_amount_inr,
         dedupe_across_venues=args.dedupe_across_venues,
     )
-    curve = BenchmarkCurve.from_csv(args.benchmark, compounding=args.benchmark_compounding)
+    curve = BenchmarkCurve.from_csv(
+        args.benchmark, compounding=args.benchmark_compounding,
+        max_extrapolation_years=args.benchmark_max_extrapolation_years,
+    )
     ratings = rating_timeline(load_rating_actions(args.rating_actions))
     panel = build_price_panel(
         isin_daily(trades), load_securities(args.securities), curve, ratings,
@@ -115,6 +124,66 @@ def _event_prices(args: argparse.Namespace) -> int:
     )
     _write(bonds, out / "event_bond_prices.csv")
     _write(events, out / "event_prices.csv")
+    return 0
+
+
+def _cra_disclosures(args: argparse.Namespace) -> int:
+    out = Path(args.out)
+    actions = load_cra_disclosures(
+        args.files, args.agency, kind=args.kind, issuer_map=args.issuer_map, as_of=args.as_of
+    )
+    _write(actions, out)
+    _write(disclosure_summary(actions), out.with_name(out.stem + "_summary.csv"))
+    _write(unmapped_issuers(actions), out.with_name(out.stem + "_unmapped_issuers.csv"))
+    return 0
+
+
+def _amfi_trades(args: argparse.Namespace) -> int:
+    out = Path(args.out)
+    trades, matches = build_mf_trades(
+        args.files, navall=args.navall, scheme_overrides=args.scheme_overrides,
+        keep_no_isin=args.keep_no_isin,
+    )
+    _write(trades, out)
+    _write(mapping_report(trades), out.with_name(out.stem + "_mappings.csv"))
+    if matches is not None:
+        _write(matches, out.with_name(out.stem + "_scheme_matches.csv"))
+    if args.price_trades_out:
+        _write(to_price_trades(trades, include_inter_scheme=args.include_inter_scheme), Path(args.price_trades_out))
+    return 0
+
+
+def _flows(args: argparse.Namespace) -> int:
+    windows = parse_windows(args.windows) if args.windows else DEFAULT_WINDOWS
+    result = event_flows(args.events, args.mf_trades, args.securities, load_mandates(args.mandates), windows=windows)
+    _write(result, Path(args.out))
+    return 0
+
+
+def _fbil_curve(args: argparse.Namespace) -> int:
+    _write(combine_curves(load_fbil_gsec_curve(f, args.kind) for f in args.files), Path(args.out))
+    return 0
+
+
+def _fbil_mm(args: argparse.Namespace) -> int:
+    _write(combine_curves(load_fbil_money_market(f, args.kind) for f in args.files), Path(args.out))
+    return 0
+
+
+def _parse_ratings(args: argparse.Namespace) -> int:
+    df = pd.read_csv(args.input, dtype=str)
+    keep = [c for c in (args.keep or "").split(",") if c]
+    rows = []
+    for _, row in df.iterrows():
+        raw = row[args.column]
+        chosen = {k: v for k, v in asdict(parse_rating(raw)).items() if k != "raw"}
+        for i, seg in enumerate(parse_ratings(raw)):
+            fields = asdict(seg)
+            rec = {c: row.get(c) for c in keep}
+            rec.update(segment_index=i, segment_raw=fields.pop("raw"), **fields, is_plain=seg.is_plain)
+            rec["selected"] = fields == chosen
+            rows.append(rec)
+    _write(pd.DataFrame(rows), Path(args.out))
     return 0
 
 
@@ -176,6 +245,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--benchmark-compounding", choices=["annual", "semiannual"], default="semiannual")
     p.add_argument("--min-amount-inr", type=float, default=0.0, help="drop trades smaller than this")
     p.add_argument("--dedupe-across-venues", action="store_true")
+    p.add_argument("--benchmark-max-extrapolation-years", type=float,
+                   help="leave spreads empty beyond the curve's longest tenor plus this (default: flat)")
     _add_peer_args(p)
     p.set_defaults(func=_price_panel)
 
@@ -187,6 +258,53 @@ def main(argv: list[str] | None = None) -> int:
                    help="days relative to the event")
     _add_peer_args(p)
     p.set_defaults(func=_event_prices)
+
+    p = sub.add_parser("cra-disclosures", help="rating actions from CRAs' SEBI movement/history spreadsheets")
+    p.add_argument("files", nargs="+")
+    p.add_argument("--agency", required=True, help="e.g. ICRA, CARE, 'India Ratings', Acuite, Infomerics, Brickwork")
+    p.add_argument("--kind", choices=["movement", "history"], help="default: detect both")
+    p.add_argument("--issuer-map", help="CSV of name, issuer_id")
+    p.add_argument("--as-of", help="snapshot date (YYYY-MM-DD) for current-rating rows when the file has none")
+    p.add_argument("--out", required=True)
+    p.set_defaults(func=_cra_disclosures)
+
+    p = sub.add_parser("amfi-trades", help="MF debt and money-market trades from AMFI's daily disclosure")
+    p.add_argument("files", nargs="+", help="AMFI xlsx exports or saved JSON pages")
+    p.add_argument("--out", required=True)
+    p.add_argument("--navall", help="AMFI NAVAll.txt, to attach scheme categories")
+    p.add_argument("--scheme-overrides", help="CSV of amc, scheme_name, category")
+    p.add_argument("--keep-no-isin", action="store_true", help="keep TREPS/repo rows that have no ISIN")
+    p.add_argument("--price-trades-out", help="also write market trades in the load-trades format")
+    p.add_argument("--include-inter-scheme", action="store_true", help="keep inter-scheme transfers as prices")
+    p.set_defaults(func=_amfi_trades)
+
+    p = sub.add_parser("flows", help="MF selling and buying of event bonds, by constrained and other funds")
+    p.add_argument("--events", required=True)
+    p.add_argument("--mf-trades", required=True, nargs="+", help="CSVs written by amfi-trades")
+    p.add_argument("--securities", required=True)
+    p.add_argument("--mandates", default="config/mandates.toml")
+    p.add_argument("--windows", help="day windows around the event, e.g. -30:-1,0:10,0:30")
+    p.add_argument("--out", required=True)
+    p.set_defaults(func=_flows)
+
+    p = sub.add_parser("fbil-curve", help="G-sec par or zero curve from FBIL daily workbooks")
+    p.add_argument("files", nargs="+")
+    p.add_argument("--kind", choices=tuple(GSEC_KINDS), default="par")
+    p.add_argument("--out", required=True)
+    p.set_defaults(func=_fbil_curve)
+
+    p = sub.add_parser("fbil-mm", help="MIBOR-OIS or T-bill curve from FBIL data, on an annual basis")
+    p.add_argument("files", nargs="+")
+    p.add_argument("--kind", choices=MM_KINDS, required=True)
+    p.add_argument("--out", required=True)
+    p.set_defaults(func=_fbil_mm)
+
+    p = sub.add_parser("parse-ratings", help="split and parse rating strings in a CSV column, for auditing a source")
+    p.add_argument("input")
+    p.add_argument("--column", default="rating")
+    p.add_argument("--keep", help="comma-separated columns to carry through")
+    p.add_argument("--out", required=True)
+    p.set_defaults(func=_parse_ratings)
 
     args = parser.parse_args(argv)
     return args.func(args)
