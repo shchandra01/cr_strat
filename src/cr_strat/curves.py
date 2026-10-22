@@ -5,7 +5,17 @@ OIS) so each bond trade can be turned into a spread. Corporate bond yields
 and G-sec yields are usually quoted on different compounding bases (Indian
 corporate bonds annualised, G-secs semi-annual), which is worth 10-20 bps at
 typical yields, so the curve is converted to the bond basis before
-subtracting. Check the convention of each source.
+subtracting. Check the convention of each source. Money-market quotes (T-bill
+yields, OIS up to 1Y) are simple Act/365 rates; ``money_market_to_annual``
+turns them into annual-compounding equivalents.
+
+A curve frame may carry a ``basis`` column (the FBIL loaders write one); if it
+does, it must agree with ``compounding``, so a curve normalised to annual
+compounding cannot be read as semi-annual by mistake.
+
+The curve is held flat beyond its shortest and longest tenors. Set
+``max_extrapolation_years`` to stop the long end at the longest tenor plus that
+many years: a 5Y OIS curve should not silently price a 10Y bond.
 
 ``SpreadBenchmark`` is the matched-peer benchmark for event studies: the
 median spread of other issuers' bonds in the same peer group (instrument
@@ -38,27 +48,60 @@ def convert_yield(yield_pct, from_basis: str, to_basis: str):
     return 2 * (np.sqrt(1 + y) - 1) * 100
 
 
+def money_market_to_annual(rate_pct, days):
+    """Annual-compounding equivalent (percent) of a simple Act/365 rate for a term of ``days``."""
+    r = np.asarray(rate_pct, dtype=float) / 100
+    d = np.asarray(days, dtype=float)
+    return ((1 + r * d / 365) ** (365 / d) - 1) * 100
+
+
+def _check_basis(basis: pd.Series, compounding: str) -> None:
+    found = {str(v).strip().lower() for v in basis.dropna()} - {""}
+    if found and found != {compounding}:
+        raise ValueError(
+            f"curve rows are on basis {sorted(found)} but compounding={compounding!r}; "
+            "pass the curve's basis as compounding"
+        )
+
+
 def tenor_bucket(tenor_years: pd.Series) -> pd.Series:
     return pd.cut(tenor_years, TENOR_EDGES, labels=TENOR_LABELS, right=True).astype(object)
 
 
 class BenchmarkCurve:
-    """Daily curve from rows of (date, tenor_years, yield_pct); linear in tenor, flat beyond the ends."""
+    """Daily curve from rows of (date, tenor_years, yield_pct); linear in tenor, flat beyond the ends.
 
-    def __init__(self, curve: pd.DataFrame, *, compounding: str = "semiannual", max_staleness_days: int = 7):
+    ``max_staleness_days``: how long a curve date stays usable. ``max_extrapolation_years``:
+    ``None`` holds the longest tenor's yield flat forever; a number gives NaN for tenors
+    more than that many years past the longest tenor of the curve date used.
+    """
+
+    def __init__(
+        self,
+        curve: pd.DataFrame,
+        *,
+        compounding: str = "semiannual",
+        max_staleness_days: int = 7,
+        max_extrapolation_years: float | None = None,
+    ):
         if compounding not in COMPOUNDING:
             raise ValueError(f"compounding must be one of {COMPOUNDING}")
+        if max_extrapolation_years is not None and not max_extrapolation_years >= 0:
+            raise ValueError("max_extrapolation_years must be None or >= 0")
         df = curve.copy()
         df.columns = [c.strip().lower() for c in df.columns]
         missing = [c for c in ("date", "tenor_years", "yield_pct") if c not in df]
         if missing:
             raise ValueError(f"benchmark curve missing columns: {missing}")
+        if "basis" in df:
+            _check_basis(df["basis"], compounding)
         df["date"] = pd.to_datetime(df["date"], format="ISO8601", errors="coerce")
         df["tenor_years"] = pd.to_numeric(df["tenor_years"], errors="coerce")
         df["yield_pct"] = pd.to_numeric(df["yield_pct"], errors="coerce")
         df = df.dropna(subset=["date", "tenor_years", "yield_pct"]).sort_values(["date", "tenor_years"])
         self.compounding = compounding
         self.max_staleness = pd.Timedelta(days=max_staleness_days)
+        self.max_extrapolation_years = max_extrapolation_years
         self._dates = np.array(sorted(df["date"].unique()), dtype="datetime64[ns]")
         self._points = {
             np.datetime64(d, "ns"): (g["tenor_years"].to_numpy(), g["yield_pct"].to_numpy())
@@ -70,7 +113,10 @@ class BenchmarkCurve:
         return cls(pd.read_csv(path), **kwargs)
 
     def yields(self, dates: pd.Series, tenors: pd.Series, *, to_basis: str = "annual") -> np.ndarray:
-        """Benchmark yield (percent, ``to_basis`` compounding) for each (date, tenor); NaN when stale."""
+        """Benchmark yield (percent, ``to_basis`` compounding) for each (date, tenor).
+
+        NaN when the curve is stale or the tenor lies beyond ``max_extrapolation_years``.
+        """
         dates = pd.to_datetime(pd.Series(dates)).to_numpy(dtype="datetime64[ns]")
         tenors = np.asarray(tenors, dtype=float)
         out = np.full(len(dates), np.nan)
@@ -84,7 +130,10 @@ class BenchmarkCurve:
             if not len(rows):
                 continue
             x, y = self._points[curve_date]
-            out[rows] = np.interp(tenors[rows], x, y)
+            values = np.interp(tenors[rows], x, y)
+            if self.max_extrapolation_years is not None:
+                values[tenors[rows] > x[-1] + self.max_extrapolation_years] = np.nan
+            out[rows] = values
         return convert_yield(out, self.compounding, to_basis)
 
 

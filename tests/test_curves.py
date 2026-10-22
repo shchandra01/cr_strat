@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from cr_strat.curves import BenchmarkCurve, SpreadBenchmark, convert_yield, tenor_bucket
+from cr_strat.curves import BenchmarkCurve, SpreadBenchmark, convert_yield, money_market_to_annual, tenor_bucket
 
 
 def test_convert_yield_round_trip():
@@ -21,6 +21,48 @@ def test_curve_interpolation_and_staleness():
     assert got[0] == pytest.approx(6.2)
     assert got[1] == pytest.approx(6.8)  # flat beyond the longest tenor
     assert np.isnan(got[2]) and np.isnan(got[3])  # stale, and before the first curve
+
+
+def test_money_market_to_annual():
+    assert money_market_to_annual(6.0, 365) == pytest.approx(6.0)
+    assert money_market_to_annual(6.0, 182.5) == pytest.approx(6.09)  # (1.03^2 - 1)
+    got = money_market_to_annual([5.0, 5.0], [7, 91.25])
+    assert got[0] > got[1] > 5.0  # shorter terms compound more often
+
+
+def _two_dates_curve(**kwargs) -> BenchmarkCurve:
+    return BenchmarkCurve(pd.DataFrame({
+        "date": ["2026-03-02"] * 3 + ["2026-03-03"] * 2,
+        "tenor_years": [1, 3, 5, 1, 10],
+        "yield_pct": [6.0, 6.2, 6.4, 6.0, 6.9],
+    }), compounding="annual", **kwargs)
+
+
+def test_max_extrapolation_years():
+    dates = pd.Series(pd.to_datetime(["2026-03-02"] * 4 + ["2026-03-03"] * 2))
+    tenors = [0.25, 5.0, 6.5, 7.5, 7.5, 13.0]
+    flat = _two_dates_curve().yields(dates, tenors)
+    assert flat.tolist() == pytest.approx([6.0, 6.4, 6.4, 6.4, 6.0 + 0.9 * 6.5 / 9, 6.9])
+    capped = _two_dates_curve(max_extrapolation_years=2).yields(dates, tenors)
+    assert capped[:3].tolist() == pytest.approx(flat[:3].tolist())  # short end stays flat
+    assert np.isnan(capped[3])  # 7.5y is more than 2y past the 5y end of 2026-03-02
+    assert capped[4] == pytest.approx(flat[4]) and np.isnan(capped[5])  # 2026-03-03 ends at 10y
+    exact = _two_dates_curve(max_extrapolation_years=0).yields(dates, tenors)
+    assert exact[1] == pytest.approx(6.4) and np.isnan(exact[2])
+    with pytest.raises(ValueError, match="max_extrapolation_years"):
+        _two_dates_curve(max_extrapolation_years=-1)
+
+
+def test_curve_basis_column_must_match_compounding():
+    frame = pd.DataFrame({"date": ["2026-03-02"] * 2, "tenor_years": [1, 5], "yield_pct": [6.0, 6.4],
+                          "Basis": ["annual", None]})
+    day = pd.Series(pd.to_datetime(["2026-03-02"]))
+    assert BenchmarkCurve(frame, compounding="annual").yields(day, [1.0])[0] == pytest.approx(6.0)
+    with pytest.raises(ValueError, match="basis"):
+        BenchmarkCurve(frame)
+    frame["Basis"] = ["annual", "semiannual"]
+    with pytest.raises(ValueError, match="basis"):
+        BenchmarkCurve(frame, compounding="annual")
 
 
 def test_tenor_bucket():
