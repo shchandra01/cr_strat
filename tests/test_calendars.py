@@ -33,15 +33,15 @@ def cal():
 
 def test_shipped_list(cal):
     holidays = load_holidays(DEFAULT_HOLIDAYS_CSV)
-    assert cal.years == {2025, 2026} and len(cal.holidays) == len(holidays) == 47
+    assert cal.years == set(range(2015, 2027)) and len(cal.holidays) == len(holidays) == 239
     assert holidays["source"].str.startswith("https://").all()  # one source URL per row
-    gazette_2026 = [d for d, ok in zip(holidays["date"], holidays["confirmed"]) if d.year == 2026 and ok]
+    gazette_2026 = [d for d in holidays["date"] if d.year == 2026 and d != D(2026, 1, 15)]  # 15 Jan: ad hoc
     # NSE Clearing's 2026 debt-segment settlement holidays (circular 0399/2025) number 19 weekdays
     # and 4 weekend days, the same as the Maharashtra gazette list (count via a search summary).
     assert sum(d.weekday() < 5 for d in gazette_2026) == 19
     assert sum(d.weekday() >= 5 for d in gazette_2026) == 4
     unconfirmed = holidays.loc[~holidays["confirmed"], "date"].tolist()
-    assert unconfirmed == [D(2026, 1, 15)]
+    assert unconfirmed == [D(2015, 7, 1), D(2017, 2, 21)]  # no RBI, CCIL or auction evidence either way
 
 
 def test_holidays_and_weekends(cal):
@@ -100,8 +100,8 @@ def test_years_outside_the_list_raise(cal):
     with pytest.raises(CalendarCoverageError, match="lenient"):
         cal.add_business_days(D(2026, 12, 31), 1)  # 1 Jan 2027 is a Friday nobody has listed
     with pytest.raises(CalendarCoverageError):
-        cal.add_business_days(D(2025, 1, 1), -1)  # 31 Dec 2024
-    assert cal.settlement_date(D(2024, 12, 31), 1) == D(2025, 1, 1)  # only the dates examined must be covered
+        cal.add_business_days(D(2015, 1, 1), -1)  # 31 Dec 2014
+    assert cal.settlement_date(D(2014, 12, 31), 1) == D(2015, 1, 1)  # only the dates examined must be covered
     assert isinstance(CalendarCoverageError("x"), ValueError)
     assert not cal.is_business_day(D(2027, 1, 2))  # weekends need no list
     assert not cal.covers(D(2027, 1, 4)) and cal.covers("2026-06-01")
@@ -118,8 +118,9 @@ def test_lenient_calendar(cal):
 
 def test_unconfirmed_holidays_can_be_dropped():
     cal = mumbai_settlement_calendar(include_unconfirmed=False)
-    assert cal.is_business_day(D(2026, 1, 15))
-    assert cal.years == {2025, 2026}
+    assert cal.is_business_day(D(2017, 2, 21)) and not mumbai_settlement_calendar().is_business_day(D(2017, 2, 21))
+    assert not cal.is_business_day(D(2026, 1, 15))  # confirmed by CCIL notification CCIL/Legal/26/01
+    assert cal.years == set(range(2015, 2027))
     with pytest.raises(CalendarCoverageError):
         mumbai_settlement_calendar(years=[2026]).is_business_day(D(2025, 6, 2))
 
@@ -164,14 +165,18 @@ def test_calendar_constructor():
 
 
 def test_shipped_coverage():
-    coverage = load_coverage(coverage_path(DEFAULT_HOLIDAYS_CSV))
-    assert coverage["year"].tolist() == [2025, 2026] and coverage["complete"].all()
-    assert coverage["source"].str.startswith("https://www.fimmda.org/").all()  # the gazette lists
+    coverage = load_coverage(coverage_path(DEFAULT_HOLIDAYS_CSV)).set_index("year")
+    assert coverage.index.tolist() == list(range(2015, 2027)) and coverage["complete"].all()
+    assert coverage.loc[[2025, 2026], "source"].str.startswith("https://www.fimmda.org/").all()  # the gazette lists
+    # 2015-2024: the clearing houses' settlement-holiday lists (NSE, NSE Clearing, CCIL), which track the NI Act list
+    assert coverage.loc[2015:2023, "source"].str.startswith("https://nsearchives.nseindia.com/").all()
+    assert coverage.loc[2024, "source"].startswith("https://www.ccilindia.com/")
 
 
 def test_coverage_is_declared_not_inferred(tmp_path):
     # One 2027 row (Republic Day is a fixed date, tempting to add early) must not cover 2027.
     shipped = load_holidays(DEFAULT_HOLIDAYS_CSV)
+    shipped = shipped[[d.year in (2025, 2026) for d in shipped["date"]]]
     extra = pd.concat([shipped, pd.DataFrame([{"date": D(2027, 1, 26), "name": "Republic Day",
                                                "source": "https://example.org/2027", "confirmed": True}])],
                       ignore_index=True)
@@ -234,9 +239,9 @@ def test_calendar_from_hand_built_frames():
     assert not no_flag.is_business_day(D(2026, 1, 15))
     # Read straight from the CSV, confirmed is yes/no text.
     raw = pd.read_csv(DEFAULT_HOLIDAYS_CSV)
-    text = calendar_from_holidays(raw, name="x", years=[2025, 2026], include_unconfirmed=False)
-    assert text.is_business_day(D(2026, 1, 15)) and not text.is_business_day(D(2026, 1, 26))
-    assert text.holidays == mumbai_settlement_calendar(include_unconfirmed=False).holidays
+    text = calendar_from_holidays(raw, name="x", years=[2017, 2025, 2026], include_unconfirmed=False)
+    assert text.is_business_day(D(2017, 2, 21)) and not text.is_business_day(D(2026, 1, 26))
+    assert text.holidays == mumbai_settlement_calendar(include_unconfirmed=False, years=[2017, 2025, 2026]).holidays
     with pytest.raises(ValueError, match="'date' column"):
         calendar_from_holidays(shipped.rename(columns={"date": "day"}), name="x", years=[2026])
     with pytest.raises(ValueError, match="confirmed must be yes or no"):
@@ -279,3 +284,48 @@ def test_holiday_list_ships_inside_the_package():
     assert coverage_path(DEFAULT_HOLIDAYS_CSV).exists()
     pyproject = tomllib.loads((Path(__file__).resolve().parents[1] / "pyproject.toml").read_text())
     assert "data/*.csv" in pyproject["tool"]["setuptools"]["package-data"]["cr_strat"]
+
+
+# 2015-2024: weekday holidays per year from the clearing houses' settlement-holiday lists (NSCCL, NSE Clearing,
+# NSE currency segment, CCIL), with the ad hoc and moved days of each year.
+@pytest.mark.parametrize("year, weekdays", [(2015, 21), (2016, 20), (2017, 18), (2018, 20), (2019, 19), (2020, 17),
+                                            (2021, 20), (2022, 17), (2023, 18), (2024, 22)])
+def test_added_years_weekday_holidays(year, weekdays):
+    holidays = load_holidays(DEFAULT_HOLIDAYS_CSV)
+    days = [d for d in holidays["date"] if d.year == year]
+    assert len(days) == weekdays and all(d.weekday() < 5 for d in days)  # weekend holidays are not listed
+    assert holidays.loc[[d.year == year for d in holidays["date"]], "source"].str.startswith("https://").all()
+
+
+@pytest.mark.parametrize("trade, settle", [
+    (D(2015, 4, 30), D(2015, 5, 5)),  # Maharashtra Day 1 May and Buddha Pournima 4 May 2015 (yields rule out 1 May)
+    (D(2016, 4, 7), D(2016, 4, 11)),  # Gudi Padwa 8 Apr 2016
+    (D(2017, 8, 24), D(2017, 8, 28)),  # Ganesh Chaturthi 25 Aug 2017
+    (D(2018, 11, 8), D(2018, 11, 9)),  # 9 Nov 2018 (Bhai Duj) was dropped from the revised 2018 list
+    (D(2018, 11, 22), D(2018, 11, 26)),  # Gurunanak Jayanti 23 Nov 2018
+    (D(2019, 4, 26), D(2019, 4, 30)),  # Lok Sabha polling 29 Apr 2019: RBI dates 7.69% GS 2043 from 30 Apr
+    (D(2019, 10, 18), D(2019, 10, 22)),  # Assembly polling 21 Oct 2019
+    (D(2020, 4, 9), D(2020, 4, 13)),  # Good Friday 10 Apr 2020
+    (D(2021, 11, 18), D(2021, 11, 22)),  # Gurunanak Jayanti 19 Nov 2021
+    (D(2022, 2, 4), D(2022, 2, 8)),  # 7 Feb 2022, declared on 6 Feb (CCIL rolled settlement to 8 Feb)
+    (D(2023, 6, 27), D(2023, 6, 28)),  # Bakri Id moved from 28 to 29 Jun 2023: 28 Jun a business day
+    (D(2023, 6, 28), D(2023, 6, 30)),
+    # Id-E-Milad 2023: Maharashtra cancelled the 28 Sep holiday and declared 29 Sep, but RBI kept its markets open
+    # and settling on 29 Sep (press release 2023-2024/1005); the 28 Sep auction's yields pin settlement to 29 Sep
+    (D(2023, 9, 27), D(2023, 9, 28)),
+    (D(2023, 9, 28), D(2023, 9, 29)),
+    (D(2024, 1, 19), D(2024, 1, 23)),  # 22 Jan 2024, declared on 19 Jan
+    (D(2024, 9, 13), D(2024, 9, 16)),  # Id-E-Milad moved from 16 to 18 Sep 2024
+    (D(2024, 9, 17), D(2024, 9, 19)),
+    (D(2024, 11, 19), D(2024, 11, 21)),  # Assembly polling 20 Nov 2024: SDL new issues dated 21 Nov
+])
+def test_t_plus_1_in_the_added_years(cal, trade, settle):
+    assert cal.settlement_date(trade, 1) == settle
+
+
+def test_unconfirmed_days_of_the_added_years():
+    # Kept as holidays by default; nothing confirms or refutes their effect on RBI settlement.
+    strict, loose = mumbai_settlement_calendar(), mumbai_settlement_calendar(include_unconfirmed=False)
+    for day in (D(2015, 7, 1), D(2017, 2, 21)):
+        assert not strict.is_business_day(day) and loose.is_business_day(day)
+    assert strict.settlement_date(D(2015, 6, 30), 1) == D(2015, 7, 2)

@@ -157,3 +157,220 @@ def test_bond_price_options(capsys):
     out = _fields(capsys.readouterr().out)
     assert float(out["yield (%)"]) == pytest.approx(-6.762015, abs=1e-6)
     assert float(out["modified duration"]) > 0 and float(out["dv01 (per 100)"]) > 0
+
+
+def _release_files(tmp_path):
+    import rbi_fixtures as fx
+
+    src = tmp_path / "rbi"
+    src.mkdir()
+    goi = fx.release_page("Government Stock - Full Auction Results", "Nov 13, 2026",
+                          fx.body("", fx.results_table([fx.GOI_6_94])), prid=63970)
+    (src / "goi_full_63970.html").write_text(goi, encoding="utf-8")
+    switch = fx.body("", fx.switch_table(fx.SWITCH_PAIRS), pr_no="2026-2027/1504")
+    items = [dict(title="Result: Conversion/Switch Auction of Government of India Securities", prid=63982,
+                  pub="Mon, 16 Nov 2026 14:55:00", html=switch),
+             dict(title="Money Market Operations as on November 15, 2026", prid=63981,
+                  pub="Mon, 16 Nov 2026 12:05:00", html=fx.body("Tables."))]
+    (src / "pr_feed_20261116.xml").write_bytes(fx.feed(items))
+    (src / "strips_3973.html").write_text(fx.blocked_page(), encoding="utf-8")
+    return src
+
+
+def test_rbi_releases_appends_idempotently(tmp_path, capsys):
+    src = _release_files(tmp_path)
+    out = tmp_path / "out"
+    files = [str(p) for p in sorted(src.iterdir())]
+    assert main(["rbi-releases", *files, "--out-dir", str(out)]) == 0
+    printed = capsys.readouterr().out
+    assert "no parser for money_market_operations yet" in printed and "Support ID" in printed
+    first = {p.name: p.read_bytes() for p in out.iterdir()}
+    assert set(first) == {"gsec_result.csv", "switch_result.csv", "releases.csv"}
+    assert main(["rbi-releases", *files, "--out-dir", str(out)]) == 0
+    assert main(["rbi-releases", files[1], "--out-dir", str(out)]) == 0  # one file again: no duplicates
+    assert {p.name: p.read_bytes() for p in out.iterdir()} == first
+    goi = pd.read_csv(out / "gsec_result.csv")
+    assert len(goi) == 1 and goi.loc[0, "comp_accepted_cr"] == 33947.718 and goi.loc[0, "cutoff_yield"] == 7.3203
+    switch = pd.read_csv(out / "switch_result.csv")
+    assert len(switch) == 3 and switch["published"].eq("2026-11-16T14:55:00").all()
+    index = pd.read_csv(out / "releases.csv")
+    assert sorted(index["status"]) == ["parsed", "parsed", "skipped", "skipped"]
+
+
+def test_rbi_releases_uses_stored_greenshoe(tmp_path):
+    import rbi_fixtures as fx
+
+    out = tmp_path / "out"
+    result = fx.release_page("Government Stock - Full Auction Results", "Nov 20, 2026", fx.body("", fx.results_table(
+        [dict(fx.GOI_SECOND, notified="6,000", uw="6,000", uw_acc="6,000")])), prid=64001)
+    (tmp_path / "result.html").write_text(result, encoding="utf-8")
+    # 14,000 accepted on 6,000 notified: refused while no announcement gives the greenshoe
+    assert main(["rbi-releases", str(tmp_path / "result.html"), "--out-dir", str(out)]) == 0
+    assert not (out / "gsec_result.csv").exists()
+    announcement = fx.release_page("Auction of Government of India Dated Securities", "Nov 16, 2026",
+                                   fx.body(fx.GSEC_ANNOUNCEMENT_TEXT.replace("2,000", "8,000"),
+                                           fx.gsec_announcement_table()), prid=63983)
+    (tmp_path / "announcement.html").write_text(announcement, encoding="utf-8")
+    assert main(["rbi-releases", str(tmp_path / "announcement.html"), "--out-dir", str(out)]) == 0
+    assert main(["rbi-releases", str(tmp_path / "result.html"), "--out-dir", str(out)]) == 0
+    goi = pd.read_csv(out / "gsec_result.csv")
+    assert goi["greenshoe_cr"].tolist() == [8000.0] and goi["total_accepted_cr"].tolist() == [14000.0]
+    index = pd.read_csv(out / "releases.csv").set_index("release_id")
+    assert index.loc[64001, "status"] == "parsed" and index.loc[63983, "rows"] == 2
+
+
+def test_sovereign_master_keeps_dated_snapshots(tmp_path):
+    import rbi_fixtures as fx
+
+    (tmp_path / "goi_1116.html").write_text(fx.goi_list_page(), encoding="utf-8")
+    (tmp_path / "goi_1113.html").write_text(fx.goi_list_page(as_of="November 13, 2026", rows=fx.GOI_LIST_ROWS[:3]),
+                                            encoding="utf-8")
+    (tmp_path / "far.html").write_text(fx.far_page(), encoding="utf-8")
+    snapshots, out = tmp_path / "goi_outstanding.csv", tmp_path / "master.csv"
+    args = ["sovereign-master", "--far", str(tmp_path / "far.html"), "--snapshots", str(snapshots),
+            "--out", str(out)]
+    assert main([*args, "--goi-list", str(tmp_path / "goi_1113.html")]) == 0
+    assert main([*args, "--goi-list", str(tmp_path / "goi_1116.html"), str(tmp_path / "goi_1113.html")]) == 0
+    first = snapshots.read_bytes(), out.read_bytes()
+    assert main([*args, "--goi-list", str(tmp_path / "goi_1116.html")]) == 0
+    assert (snapshots.read_bytes(), out.read_bytes()) == first
+    stacked = pd.read_csv(snapshots)
+    assert stacked.groupby("as_of").size().to_dict() == {"2026-11-13": 3, "2026-11-16": len(fx.GOI_LIST_ROWS)}
+    master = pd.read_csv(out).set_index("isin")
+    assert len(master) == len({r[2] for r in fx.GOI_LIST_ROWS} | {r[1] for r in fx.FAR_ROWS})
+    assert master.loc["IN0020140060", "first_listed"] == "2026-11-13" and master.loc["IN0020260025", "far"]
+    assert master.loc["IN0020180488", "matured"] and not master.loc["IN0020180488", "in_latest_list"]
+
+
+def _ledger_inputs(tmp_path):
+    """Saved RBI pages and lists (synthetic), FIMMDA workbooks and a Handbook page, and the CSVs they give."""
+    import datetime as dt
+
+    import auction_fixtures as af
+    import rbi_fixtures as fx
+
+    pages = tmp_path / "pages"
+    pages.mkdir()
+    (pages / "goi_63970.html").write_text(fx.release_page(
+        "Government Stock - Full Auction Results", "Nov 13, 2026", fx.body("", fx.results_table([fx.GOI_6_94]))),
+        encoding="utf-8")
+    (pages / "switch_63982.html").write_text(fx.release_page(
+        "Result: Conversion/Switch Auction of Government of India Securities", "Nov 16, 2026",
+        fx.body("", fx.switch_table(fx.SWITCH_PAIRS), pr_no="2026-2027/1504"), prid=63982), encoding="utf-8")
+    assert main(["rbi-releases", *map(str, sorted(pages.iterdir())), "--out-dir", str(tmp_path / "rbi")]) == 0
+    (tmp_path / "goi.html").write_text(fx.goi_list_page(), encoding="utf-8")
+    (tmp_path / "far.html").write_text(fx.far_page(), encoding="utf-8")
+    assert main(["sovereign-master", "--goi-list", str(tmp_path / "goi.html"), "--far", str(tmp_path / "far.html"),
+                 "--snapshots", str(tmp_path / "snapshots.csv"), "--out", str(tmp_path / "master.csv")]) == 0
+    gsec = af.gsec_workbook(tmp_path / "Gsec_Auction_data_2026_2027.xlsx", {"2026-2027": [
+        (dt.datetime(2026, 5, 8), "6.94% GS 2036", 32000, 31990.5, 100, 6.94)]})
+    sdl = af.sdl_workbook(tmp_path / "SDL_Auction_Data.xlsx", {"January": [
+        ("02-01-2024", "IN1020230679", "07.74 AP SGS 2032 03 JAN", "03-01-2032", 7.74, 7.7151, "NEW", 7.74, "AP",
+         "#REF!", 1000, 7740)]})
+    (tmp_path / "hbs.html").write_text(af.handbook_page([
+        ("08-May-2026", "11-May-2026", "32000", "10.00", "300", "60000", "3", "9", "120", "31991", "3", "9", "0",
+         "100/6.94", "6.94% GS 2036")], fy="2026-27"), encoding="utf-8")
+    return ["--fimmda-gsec", str(gsec), "--fimmda-sdl", str(sdl), "--handbook", str(tmp_path / "hbs.html"),
+            "--releases", str(tmp_path / "rbi"), "--master", str(tmp_path / "master.csv"),
+            "--snapshots", str(tmp_path / "snapshots.csv")]
+
+
+def test_auctions_command_writes_table_ledger_and_report(tmp_path, capsys):
+    from cr_strat.auctions import read_auctions
+    from cr_strat.issuance import read_ledger
+
+    args = _ledger_inputs(tmp_path)
+    out = tmp_path / "out"
+    assert main(["auctions", *args, "--out-dir", str(out)]) == 0
+    printed = capsys.readouterr().out
+    assert "3 auction rows" in printed and "validation:" in printed
+    assert {p.name for p in out.iterdir()} == {
+        "auctions.csv", "switches.csv", "ledger.csv", "ledger_coverage.csv", "supply_monthly.csv",
+        "settlement_evidence.csv", "reconciliation.csv", "validation.csv"}
+    a = read_auctions(out / "auctions.csv").set_index("auction_date")
+    new, nov = a.loc[pd.Timestamp("2026-05-08")], a.loc[pd.Timestamp("2026-11-13")]
+    assert (new["isin"], new["issue_type"], new["settlement_source"], new["accepted_cr"]) == (
+        "IN0020260025", "new", "handbook", 31999.5)  # FIMMDA competitive plus the Handbook's non-competitive
+    assert (nov["sources"], nov["repricing"], nov["settlement_date"], nov["accepted_cr"]) == (
+        "rbi_result", "reproduced", pd.Timestamp("2026-11-16"), 34000.0)
+    ledger = read_ledger(out / "ledger.csv")
+    mine = ledger[ledger["key"] == "IN0020260025"]
+    assert mine["event"].tolist() == ["issue", "reissue", "maturity"]
+    assert mine["amount_cr"].tolist()[:2] == [31999.5, 34000.0]
+    assert mine["amount_basis"].iloc[-1] == "snapshot" and mine["amount_cr"].iloc[-1] == -272000
+    assert set(ledger.loc[ledger["source"] == "rbi_switch", "event"]) == {"switch_in", "switch_out"}
+    rec = pd.read_csv(out / "reconciliation.csv").set_index("key")
+    assert rec.loc["IN0020260025", "ledger_cr"] == 65999.5 and rec.loc["IN0020260025", "rbi_cr"] == 272000
+    report = pd.read_csv(out / "validation.csv")
+    assert {"reconciliation", "fimmda_file"} <= set(report["check"])
+    first = {p.name: p.read_bytes() for p in out.iterdir()}
+    assert main(["auctions", *args, "--out-dir", str(out)]) == 0  # the same inputs give the same files
+    assert {p.name: p.read_bytes() for p in out.iterdir()} == first
+
+
+def test_outstanding_command(tmp_path, capsys):
+    args = _ledger_inputs(tmp_path)
+    out = tmp_path / "out"
+    assert main(["auctions", *args, "--out-dir", str(out)]) == 0
+    capsys.readouterr()
+    ledger, snap = str(out / "ledger.csv"), str(tmp_path / "snapshots.csv")
+    assert main(["outstanding", "--ledger", ledger, "--date", "2026-11-13", "--snapshot", snap, "--by-bucket",
+                 "--out", str(tmp_path / "o.csv")]) == 0
+    printed = capsys.readouterr().out
+    assert "2026-11-13: " in printed and "with a complete history" in printed
+    o = pd.read_csv(tmp_path / "o.csv").set_index("key")
+    assert o.loc["IN0020260025", "outstanding_cr"] == 272000 - 34000 and o.loc["IN0020260025", "method"] == "backward"
+    assert (tmp_path / "o_by_bucket.csv").exists()
+    assert main(["outstanding", "--ledger", ledger, "--date", "2026-06-30", "--out", str(tmp_path / "f.csv")]) == 0
+    forward = pd.read_csv(tmp_path / "f.csv").set_index("key")
+    assert forward.loc["IN0020260025", "outstanding_cr"] == 31999.5 and forward.loc["IN0020260025", "method"] == \
+        "forward"
+    assert main(["outstanding", "--ledger", ledger, "--date", "13/11/2026", "--out", str(tmp_path / "x.csv")]) == 2
+    assert "--date" in capsys.readouterr().err
+
+
+def test_rbi_releases_output_does_not_depend_on_the_file_order(tmp_path):
+    import rbi_fixtures as fx
+
+    src = _release_files(tmp_path)
+    (src / "switch_63982.html").write_text(fx.release_page(  # the feed's switch release, also saved as a page
+        "Result: Conversion/Switch Auction of Government of India Securities", "Nov 16, 2026",
+        fx.body("", fx.switch_table(fx.SWITCH_PAIRS), pr_no="2026-2027/1504"), prid=63982), encoding="utf-8")
+    files = [str(p) for p in sorted(src.iterdir())]
+    a, b = tmp_path / "a", tmp_path / "b"
+    assert main(["rbi-releases", *files, "--out-dir", str(a)]) == 0
+    assert main(["rbi-releases", *reversed(files), "--out-dir", str(b)]) == 0
+    first = {p.name: p.read_bytes() for p in a.iterdir()}
+    assert {p.name: p.read_bytes() for p in b.iterdir()} == first
+    assert main(["rbi-releases", *reversed(files), "--out-dir", str(a)]) == 0  # a rerun in the other order
+    assert {p.name: p.read_bytes() for p in a.iterdir()} == first
+    switch = pd.read_csv(a / "switch_result.csv")
+    assert switch["source_file"].eq("switch_63982.html").all()  # the saved page, with the feed's time
+    assert switch["published"].eq("2026-11-16T14:55:00").all()
+    index = pd.read_csv(a / "releases.csv").set_index("source_file")
+    assert index.loc["pr_feed_20261116.xml#1", "status"] == "duplicate"
+
+
+def test_sovereign_master_names_an_extra_row_without_an_isin(tmp_path, capsys):
+    extra = tmp_path / "sdl_isins.csv"
+    extra.write_text("isin,name\nIN2020230123,7.74% KL SGS 2033\n,8.00% KL SGS 2034\n", encoding="utf-8")
+    assert main(["sovereign-master", "--extra", str(extra), "--out", str(tmp_path / "m.csv")]) == 2
+    err = capsys.readouterr().err
+    assert "extra listing sdl_isins.csv" in err and "row 3 ('8.00% KL SGS 2034')" in err
+    assert not (tmp_path / "m.csv").exists()
+
+
+def test_auctions_command_reads_competitive_only_rows(tmp_path):
+    import datetime as dt
+
+    import auction_fixtures as af
+    from cr_strat.issuance import read_ledger
+
+    gsec = af.gsec_workbook(tmp_path / "g.xlsx", {"2025-2026": [  # no Handbook line: competitive amount only
+        (dt.datetime(2025, 7, 4), "New GS 2040", 16000, 15990.554, 100, 6.68)]})
+    for choice, amount, basis in (("notified", 16000.0, "notified_assumed_full"),
+                                  ("accepted", 15990.554, "competitive_only")):
+        out = tmp_path / choice
+        assert main(["auctions", "--fimmda-gsec", str(gsec), "--competitive-only", choice, "--out-dir", str(out)]) == 0
+        issue = read_ledger(out / "ledger.csv").iloc[0]
+        assert (issue["amount_cr"], issue["amount_basis"]) == (amount, basis)

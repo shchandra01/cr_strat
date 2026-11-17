@@ -5,10 +5,11 @@ The conventions behind [`conventions.py`](../src/cr_strat/conventions.py),
 [`bonds.py`](../src/cr_strat/bonds.py), with their sources, as of 17 Nov 2026.
 The main source is FIMMDA's
 [Handbook of Market Practices 2026](https://www.fimmda.org/UploadPopupPageFiles/Fimmda_Handbook_2026_Final_Ver.pdf)
-("the handbook" below). RBI's own pages could not be read: www.rbi.org.in
-returned HTTP 418 and rbidocs serves a bot challenge, so nothing here rests on
-an RBI document read first-hand. The published numbers come from FIMMDA's
-compiled RBI auction files. Where a rule was not found, the engine uses the
+("the handbook" below). Of RBI's own documents only a few saved pages were
+read (Nov 2026 auction results, Handbook Table 221, the GoI list): www.rbi.org.in
+rate-limits, rbidocs serves a bot challenge, and no RBI rule book was read.
+The published numbers come from FIMMDA's compiled RBI auction files and those
+pages. Where a rule was not found, the engine uses the
 market-standard reading as a named parameter, listed
 [below](#rules-not-found).
 
@@ -102,6 +103,19 @@ Published pairs reproduced, all in [`tests/test_bonds.py`](../tests/test_bonds.p
   the price at RBI's yield rounds to the cut-off price.
 - **The handbook's bill-rediscounting example** (6.3.2): ₹10 crore for 45 days
   at 10.25% front-ended pays ₹9,87,36,301 (`discount="front"`).
+- **The whole auction table** (`auctions.build_auctions` on FIMMDA's
+  2015-2027 files, Handbook Table 221 and the Nov 2026 releases, saved on
+  16-17 Nov 2026): the yield from the cut-off price at T+1 on the calendar
+  reproduces the printed yield on 1,341 of 1,452 priced G-sec, green-bond
+  and SDL reissues (three after rolling over a holiday declared after the
+  auction). Of the rest, 95 settle in an odd first coupon period
+  ([open questions](#open-questions)), 11 are conversion lines, 2 fit only on
+  or before their auction date (29 Sep 2016) and 3 look mistyped in FIMMDA's
+  file. Reproduced in FY2022-23 and FY2025-27 without exception.
+- **12 SDL reissues** of RBI's 9 Nov 2026 result (7.83% Assam SGS 2046 at
+  97.55 for 8.0814% and eleven more), settling on 11 Nov after the Diwali
+  holiday, with each maturity on the anniversary of the first issue date the
+  result prints: all 12 to 4 decimals, on the G-sec conventions.
 
 Smoke tests only, which no day count can fail (at par on a coupon or issue
 date, a price of 100 gives the coupon):
@@ -110,8 +124,8 @@ date, a price of 100 gives the coupon):
 - **2 SDL new issues** at par from FIMMDA's
   [SDL file](https://www.fimmda.org/uploadpopuppagefiles/SDL_Auction_Data_11Feb2025New.xlsx):
   07.25 GJ SGS 2026 (auctioned 6 Feb 2024, a 2-year loan) and 07.42 KL SGS
-  2064 (19 Mar 2024). No priced SDL pair has been tested. One would need an
-  SDL reissue's cut-off price, which the file does not give.
+  2064 (19 Mar 2024). FIMMDA's file gives no SDL prices; the priced SDL
+  reissues above come from RBI's result.
 
 The same pairs reject the alternatives. Actual/Actual (ICMA) misses 13 of the
 26 at the fourth decimal (6.36% GS 2031 on 15 May 2026: 6.8775 against
@@ -124,18 +138,81 @@ maturity by one day, also breaks the match. No pair separates 30E/360 from
 
 `src/cr_strat/data/holidays_mumbai.csv` ships inside the package, so any
 install finds it. It has one row per date: `date`, `name`, `source` (a URL)
-and `confirmed`. It holds the Maharashtra Government's NI Act holidays
-for 2025 and 2026 from the gazette notifications FIMMDA hosts
+and `confirmed`. It covers 2015 to 2026.
+
+**2025 and 2026** are the Maharashtra Government's NI Act holidays from the
+gazette notifications FIMMDA hosts
 ([2025](https://www.fimmda.org/UploadPopupPageFiles/RBI_List_Of_Holidays_2025.pdf),
 [2026](https://www.fimmda.org/UploadPopupPageFiles/Maharashtra_State_List_Of_Holidays_2026.pdf)),
 plus:
 
 - **8 Sep 2025, not 5 Sep.** Maharashtra moved Id-E-Milad for Mumbai to 8 Sep
   and RBI moved its money-market holiday to match (news reports only).
-- **15 Jan 2026, `confirmed = no`.** An ad hoc NI Act holiday for municipal
-  elections; NSE and BSE shut, RBI and CCIL settlement not confirmed. It counts
-  as a holiday by default (an NI Act holiday in Mumbai normally closes them);
-  `include_unconfirmed=False` drops it.
+- **15 Jan 2026.** An ad hoc NI Act holiday for municipal elections, declared
+  on 6 Jan 2026. CCIL's notification CCIL/Legal/26/01 (9 Jan 2026) closed all
+  its settlement segments that day.
+
+**2015 to 2024** come from the clearing houses' settlement-holiday lists, which
+follow the NI Act list (for 2025 NSE's currency-segment list matched the
+gazette exactly): NSCCL for 2015 and 2016, the NSE currency segment for 2017
+to 2021 and 2023, NSE Clearing for 2022, and CCIL's own NI Act list for 2024.
+The source of each year is in `holidays_mumbai_years.csv`, each row's in
+the list. Only weekday holidays are listed; weekend ones change nothing.
+Ad hoc and moved days are in: municipal polls on 21 Feb 2017, the general and
+assembly elections on 29 Apr 2019, 21 Oct 2019, 20 May 2024 and 20 Nov 2024,
+7 Feb 2022 (declared on 6 Feb), Bakri Id moved to 29 Jun 2023, 22 Jan 2024
+(declared on 19 Jan) and Id-E-Milad moved to 18 Sep 2024. Left out on
+purpose: 9 Nov 2018 (dropped from NSE's revised list), 16 Sep 2024 (the
+holiday moved), and 28 and 29 Sep 2023. NSE's 2023 list (CD54832, issued in
+December 2022), the year's source, has 28 Sep 2023 (Id-E-Milad) as a
+settlement holiday. Maharashtra later cancelled that holiday and declared
+29 Sep instead, and RBI kept the G-sec, forex, money and rupee derivative
+markets open and settling on 29 Sep for the half-year end. The
+dated-securities auction moved from 29 to 28 Sep and settled on 29 Sep; the
+T-bill auction of 27 Sep settled on 29 Sep, not at T+1 (RBI press release
+2023-2024/1005 of 27 Sep 2023,
+[prid=56455](https://www.rbi.org.in/Scripts/BS_PressReleaseDisplay.aspx?prid=56455),
+read through web-search excerpts and news reports; the page was not
+fetched). The 28 Sep auction's yields agree: three of its four securities
+fit settlement on 29 Sep and no other day. Exchange segments followed their
+own notices and need their own calendar.
+
+Two days are `confirmed = no`, holidays by default and dropped by
+`include_unconfirmed=False`: **1 Jul 2015**, "Annual Closing of RBI", an NSCCL
+settlement holiday but not an NI Act holiday; and **21 Feb 2017**, the
+municipal polls, known only from NSCCL. No auction settles near either.
+
+**Checked against the auctions.** `auctions.settlement_evidence` compares
+the calendar with what 2,500 G-sec, SDL and T-bill auctions of 2015-2026 say
+about their settlement: the days on which the cut-off price reproduces the
+printed yield, RBI's dates of issue (Handbook Table 221, the first issue
+dates in RBI's list) and the issue dates of FIMMDA's SDL new issues (each
+matures on the anniversary of its issue). Of 1,991 pieces of evidence, none
+shows a listed holiday on which an auction settled or a business day the
+list misses, apart from holidays declared or moved after the auction: the
+yields of 19 Jan 2024 and 4 Feb 2022 were fixed for 22 Jan and 7 Feb, which
+became holidays, and those auctions settled the next business day (RBI's list
+dates the green bond auctioned on 19 Jan 2024 from 23 Jan); the 4 Sep 2025
+auction settled on 9 Sep (below). Fifty of the 192 listed weekday holidays of
+2015-2024 are confirmed outright, an auction's evidence ruling out the
+holiday and fitting the next business day; the three polling days of 2019
+and 2024 are among them, so they are marked confirmed. T+1 on the calendar
+matched all 74 new issues' first issue dates in RBI's list, 89 of the 91
+Handbook dates of issue and every auction whose yield could be checked,
+except those three.
+
+**Saturdays.** G-secs, SDLs, T-bills, forex and OTC rupee derivatives never
+settle on a Saturday: RBI's August 2015 release (seen through press copies)
+kept those markets closed "on all Saturdays, as hitherto" when the 2nd and
+4th Saturdays became bank holidays, and no auction yield of 2015-2026 fits a
+Saturday where no weekday fits (the one hit is a conversion line priced
+otherwise). The calendar's weekend is right for G-sec, SDL, T-bill and OIS
+work. It is wrong for call, notice and term money, market repo and CBLO (now
+TREPS), which deal on the 1st, 3rd and 5th Saturdays from 1 Sep 2015, and
+probably on every non-holiday Saturday before (not confirmed). A
+money-market calendar would need `weekend={6}` with the 2nd and 4th
+Saturdays as holidays from September 2015; it is not built, and when such
+Saturday dealing stopped, if it did, was not found.
 
 Coverage is declared, not inferred from the rows, so one early row (say
 26 Jan 2027) cannot make a year look covered. `holidays_mumbai_years.csv`,
@@ -169,8 +246,10 @@ circulars were not opened), NSE traded but did not settle debt on 19 Feb,
 | "No. of days to maturity" for bills, CP and CD | Maturity minus settlement in calendar days | `days=` on each call |
 | Days for a bill maturing on a holiday | To the scheduled maturity | Pass the payment date as `maturity`, or `days=` |
 | Yield rounding | None; RBI prints 4 decimals | Round when comparing |
-| Primary settlement lag for CMB and SDL auctions | T+1 | `settlement_lag` (applied by `calendars.settlement_date`) |
-| Whether 15 Jan 2026 closed RBI settlement | Closed | `include_unconfirmed` |
+| Primary settlement lag for CMB auctions | T+1 | `settlement_lag` (applied by `calendars.settlement_date`) |
+| SDL auctions settle T+1 | T+1 | Not a rule found, but every one of FIMMDA's 791 SDL new issues of 2024-25 matures on the anniversary of T+1, and RBI's 9 Nov 2026 reissues reprice at T+1 |
+| Whether 1 Jul 2015 and 21 Feb 2017 closed RBI settlement | Closed | `include_unconfirmed` |
+| Rule for a reissue settling before the first coupon of a security issued off its coupon schedule | Odd first period accrued from the issue date (Excel ODDFPRICE-like) | None; see [open questions](#open-questions) |
 | Money markets on working Saturdays (open in 2015, per a search summary of RBI's release; current status unknown) | Closed, as for G-secs | `BusinessCalendar.weekend` |
 
 ## Where the sources disagree
@@ -183,9 +262,13 @@ circulars were not opened), NSE traded but did not settle debt on 19 Feb,
   engine follows FIMMDA. Read primer Annex 6 when RBI is reachable.
 - **The 4 Sep 2025 auction.** T+1 on the calendar is 5 Sep, but at 5 Sep the
   cut-off price gives 6.5495, not RBI's 6.5497; 8 Sep and 9 Sep both fit.
-  Probably the settlement date was fixed before Id-E-Milad moved (unconfirmed).
-  The calendar keeps 5 Sep as a business day and the test settles on 9 Sep.
-  Take auction settlement dates from RBI's release, not from T+1.
+  Probably the settlement date was fixed before Id-E-Milad moved (unconfirmed);
+  the Handbook dates the issue 9 Sep. The calendar keeps 5 Sep as a business
+  day and the test settles on 9 Sep. The auctions of 19 Jan 2024 and 4 Feb
+  2022 are the same case: their yields fit 22 Jan and 7 Feb, holidays
+  declared after the auction, and they settled the next business day.
+  `auctions.reprice` rolls such a date forward (`yield_rolled`). Take auction
+  settlement dates from RBI's release, not from T+1.
 - **The shut-period pitfall.** [`rates_data_sources.md`](rates_data_sources.md)
   said G-secs cannot settle in a shut period before a coupon. The 29 Dec 2025
   pair, and the 2014 report, say otherwise; the pitfall is now corrected.
@@ -201,6 +284,19 @@ circulars were not opened), NSE traded but did not settle debt on 19 Feb,
   the 2024 dates.
 
 ## Open questions
+
+- **Reissues in an odd first coupon period.** A security issued off its
+  coupon schedule (7.16% GS 2050 was issued on 20 Apr 2020 with coupons on
+  20 Mar and 20 Sep) and reissued before its first coupon does not reproduce
+  RBI's yields: on 96 such FIMMDA rows of 2015-2021 the printed yield is 4 to
+  15 hundredths of a basis point below the engine's (median 7). The engine's
+  odd first period (coupon and accrual from the issue date, compounded on
+  the regular fraction, as Excel's ODDFPRICE) is wrong for them, and so are
+  a full first coupon, a regular bond, simple interest to the first coupon,
+  and actual/actual or actual/365 for the broken period: none reproduces
+  more than 15 of the 90 priced rows. Reissues after the first coupon
+  reproduce. Every security in RBI's list first issued since 2022 (59) was
+  issued on its coupon schedule, against 22 of 41 of those first issued in 2015-2021.
 
 - **Accrued interest past the coupon.** Under FIMMDA's 30E/360, 28 Feb to
   30 Aug is 182 days, so a 7% bond maturing 31 Aug accrues 3.5389 by 30 Aug

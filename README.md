@@ -73,6 +73,15 @@ cr-strat event-prices --events data/out/rating_events.csv --panel data/out/price
     --out-dir data/out
 
 cr-strat bond-price --coupon 6.94 --maturity 2036-05-11 --settlement 2026-11-16 --price 97.43
+
+cr-strat rbi-releases data/raw/rbi/releases/*.html data/raw/rbi/feeds/*.xml --out-dir data/out/rbi
+cr-strat sovereign-master --goi-list data/raw/rbi/goi_outstanding_*.html --far data/raw/rbi/far.html \
+    --snapshots data/out/goi_outstanding.csv --out data/out/sovereign_master.csv
+cr-strat auctions --fimmda-gsec data/raw/fimmda/Gsec_Auction_data_*.xlsx --fimmda-sdl data/raw/fimmda/SDL_*.xlsx \
+    --handbook data/raw/rbi/hbs_t221.html --releases data/out/rbi --master data/out/sovereign_master.csv \
+    --snapshots data/out/goi_outstanding.csv --out-dir data/out/ledger
+cr-strat outstanding --ledger data/out/ledger/ledger.csv --date 2024-03-31 \
+    --snapshot data/out/goi_outstanding.csv --out data/out/outstanding_20240331.csv
 ```
 
 `event_prices.csv` and `event_ownership.csv` share `event_id`; joining them gives
@@ -94,6 +103,11 @@ the pressure variable and the price response for each event.
 | `conventions` | Day counts (30E/360 for G-secs and SDLs, 30/360 US, Act/365F, Act/Act ICMA), yield-basis conversions, and each instrument type's conventions with their sources |
 | `calendars` | Mumbai settlement calendar from the holiday list shipped in the package (`src/cr_strat/data/`): business days, date rolls, T+n settlement dates from an instrument's conventions; refuses years not declared complete |
 | `bonds` | G-sec, SDL, STRIPS, T-bill, CMB, CP and CD pricing: coupon schedules, accrued interest, price and yield, duration, DV01, convexity |
+| `htmlparse` | Tables, text and links from saved HTML pages with the standard library: nested tables kept apart, colspan and rowspan expanded; strict number and date cells; firewall-page detection |
+| `rbi_releases` | RBI press releases from saved pages and the RSS feed: GoI, T-bill and SDL auction results, underwriting and switch results, auction announcements. A registry of release types; checks that refuse a release rather than misread it |
+| `sovereign` | Sovereign security names (G-sec, SDL, T-bill, FRB, green bond) parsed to a join key; state codes; RBI's GoI-outstanding and FAR lists; a master with one row per ISIN; name-to-ISIN matching |
+| `auctions` | One table of G-sec, SDL and T-bill auctions from FIMMDA's yearly and SDL workbooks, RBI's Handbook Table 221 and RBI's releases: ISINs, settlement dates, and a check that the cut-off price reproduces the printed yield, which infers settlement and missing maturity dates |
+| `issuance` | Ledger of issues, reissues, switches, buybacks and maturities per ISIN; outstanding stock on any date, backward from RBI's lists or forward, with completeness flags; reconciliation with RBI's list; supply by month and tenor bucket |
 | `price_panel` | ISIN-day yields, spreads, tenor and as-of rating buckets |
 | `event_prices` | Spread paths around each event: pre-event level, first trade after, and anchors at t-60/+10/+60/+120/+250 |
 
@@ -128,8 +142,25 @@ the pressure variable and the price response for each event.
   set to the market-standard reading ([`docs/conventions.md`](docs/conventions.md)).
   Accrued interest is not capped in the 181-182 day half-years FIMMDA's
   30E/360 gives bonds paying on 29-31 August, so it can exceed the coupon.
-  Whether CCIL caps it is an open question. No priced SDL pair has been
-  tested; the SDL tests are smoke tests. The holiday list covers 2025 and 2026,
+  Whether CCIL caps it is an open question. The only priced SDL pairs are
+  the 12 reissues of one RBI result (9 Nov 2026), with maturities taken as the
+  anniversary of the first issue. The holiday list covers 2015 to 2026,
   declared complete in `holidays_mumbai_years.csv`; the calendar refuses other
-  years unless told to treat their weekdays as business days. Corporate bonds
-  and floating-rate bonds are not priced yet.
+  years unless told to treat their weekdays as business days. Reissues
+  settling before the first coupon of a security issued off its coupon
+  schedule (96 FIMMDA rows, 2015-2021) do not reproduce RBI's yields: the
+  broken-period rule is not known. Corporate bonds and floating-rate bonds
+  are not priced yet.
+- **The issuance ledger has gaps.** The saved FIMMDA files hold no FY2024-25
+  G-sec auctions and stop in May 2026, the Handbook edition in June 2026, the
+  SDL file in January 2025; no history of switches or buybacks exists. The
+  ledger marks each security's history complete or not, and reconciles with
+  RBI's list (18 of 122 G-secs agree to the crore on 16 Nov 2026). A
+  security with no known maturity date (FRB 2024) is redeemed on a
+  placeholder date, the last business day of the year in its name.
+- **The RBI parsers have seen one saved page per release type** (Nov 2026).
+  A GoI result with several securities or for a new issue, an FRB result and
+  the feed titles of full results were not sampled; a page whose labels
+  differ is refused, not guessed. RBI's SDL and STRIPS lists sit behind
+  rbidocs' bot challenge and have no loader, so the master holds G-secs
+  unless SDL ISINs are added with `--extra`.

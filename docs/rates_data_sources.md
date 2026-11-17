@@ -289,7 +289,12 @@ zero-curve, MIBOR-OIS and T-bill files.
   valuation methods; circulars, including a monthly list of liquid securities
   for short selling; [auction data files](https://www.fimmda.org/PageContent.aspx?Iid=MTQ3)
   (yearly G-sec files from 2015-16 to 2026-27, but the monthly files stop in
-  Feb 2025 and the SDL files in 2023; not opened).
+  Feb 2025 and the SDL files in 2023). Opened on 17 Nov 2026: each yearly
+  file repeats FY2015-16 to FY2023-24 and adds one later year, under names
+  that do not say which; none of the 2023-24 to 2026-27 files holds FY2024-25.
+  The SDL "Latest Month" file covers Jan 2024 to Jan 2025, with two sheets that
+  repeat 2024 months as 2025; the 2023 SDL file is a pivot by state and tenor,
+  with no securities.
 
 ### NSE and BSE
 
@@ -463,14 +468,24 @@ What can be built now, with no licence:
    settlement, MIBOR fixing and the exchanges; day counts (30/360,
    actual/365, actual/actual); settlement lags, shut periods and holiday rules
    for coupons and redemptions. Sources: FIMMDA's handbook and holiday lists,
-   RBI's Master Directions. Built for Mumbai settlement
-   ([`conventions.md`](conventions.md)); MIBOR fixing and exchange calendars
-   remain.
+   RBI's Master Directions. Built for Mumbai settlement, with holiday lists
+   for 2015 to 2026 checked against the settlement dates RBI prints and the
+   auction yields imply ([`conventions.md`](conventions.md#calendar)); MIBOR
+   fixing and exchange calendars remain.
 2. **Sovereign security master and issuance ledger.** One row per ISIN per
    issue, reissue, switch, buyback and maturity, so outstanding stock is known
    on any past date. Sources: RBI's lists kept as daily snapshots from now;
    auction results from the RSS feed going forward; FIMMDA's yearly auction
-   files for back history.
+   files for back history. Built: RBI releases and the feed in
+   [`rbi_releases.py`](../src/cr_strat/rbi_releases.py); names, lists and the
+   security master in [`sovereign.py`](../src/cr_strat/sovereign.py); the
+   auction table from FIMMDA's files, Handbook Table 221 and the releases, with
+   every cut-off price repriced against its printed yield, in
+   [`auctions.py`](../src/cr_strat/auctions.py); the ledger, outstanding stock
+   on any date and its reconciliation with RBI's list in
+   [`issuance.py`](../src/cr_strat/issuance.py). The saved files leave FY2024-25
+   and June to November 2026 uncovered for G-secs, and SDLs outside January
+   2024 to January 2025; no switch or buyback history exists yet.
 3. **Bond pricing engine.** Cash flows, price and yield, accrued interest,
    DV01 and convexity for G-secs, SDLs and T-bills, tested against RBI's
    auction price and yield pairs. Built in
@@ -527,6 +542,16 @@ fundamentals for S8 and S10.
   each date. Quarter-end and 31 March funding spikes are real.
 - **Survivorship.** Current lists drop matured, switched and bought-back
   securities; stack snapshots. T-bill ISINs live under a year.
+- **Compiled auction files.** FIMMDA's "Amount Accepted" is the total
+  accepted up to FY2023-24 and the competitive amount from FY2025-26 (the
+  ledger books the notified amount where the competitive one is 95-100% of
+  it: non-competitive bids took the rest), and it never includes
+  devolvement on primary dealers, which in 2017-2022 was often
+  most of an auction (5.77% GS 2030 on 25 Sep 2020: ₹136 crore of ₹18,000
+  crore accepted, the rest devolved). Its files also list conversions as
+  auction lines. Some auction yields were fixed before a holiday was declared
+  (19 Jan 2024 for 22 Jan): the security settled a day later than the yield
+  says.
 - **Reported corporate trades.** The same trade can appear on both exchanges;
   inter-scheme transfers print at valuation prices; reported yields may be to
   call or put.

@@ -10,13 +10,36 @@ from pathlib import Path
 import pandas as pd
 
 from cr_strat.amfi_debt_trades import build_mf_trades, mapping_report, to_price_trades
+from cr_strat.auctions import (
+    REPORT_COLUMNS,
+    build_auctions,
+    holiday_discrepancies,
+    load_fimmda_gsec,
+    load_fimmda_sdl,
+    load_handbook_auctions,
+    normalise_switches,
+    read_release_tables,
+    settlement_evidence,
+)
 from cr_strat.bonds import FixedRateBond, ZeroCouponBond
+from cr_strat.calendars import mumbai_settlement_calendar
 from cr_strat.conventions import CONVENTIONS, FINAL_PERIOD_RULES, as_date
 from cr_strat.cra_disclosures import disclosure_summary, load_cra_disclosures, unmapped_issuers
 from cr_strat.curves import BenchmarkCurve, SpreadBenchmark
 from cr_strat.event_prices import DEFAULT_ANCHORS, event_price_paths
 from cr_strat.fbil import GSEC_KINDS, MM_KINDS, combine_curves, load_fbil_gsec_curve, load_fbil_money_market
 from cr_strat.flows import DEFAULT_WINDOWS, event_flows, parse_windows
+from cr_strat.issuance import (
+    build_ledger,
+    coverage,
+    coverage_path,
+    outstanding_by_bucket,
+    outstanding_on,
+    read_ledger,
+    read_snapshots,
+    reconcile,
+    supply_summary,
+)
 from cr_strat.mandates import load_mandates
 from cr_strat.mf_portfolio import parse_mf_portfolio
 from cr_strat.ownership import event_ownership, load_events, load_securities
@@ -24,7 +47,10 @@ from cr_strat.price_panel import build_price_panel, read_price_panel
 from cr_strat.rating_actions import load_rating_actions
 from cr_strat.rating_events import build_rating_events, rating_timeline
 from cr_strat.rating_scale import parse_rating, parse_ratings
+from cr_strat.rbi_releases import COLUMNS as RELEASE_COLUMNS
+from cr_strat.rbi_releases import INDEX_COLUMNS, parse_releases
 from cr_strat.schemes import attach_categories, parse_amfi_navall
+from cr_strat.sovereign import GOI_LIST_COLUMNS, build_master, load_far_list, load_goi_outstanding, read_master
 from cr_strat.textparse import UNIT_MULTIPLIERS
 from cr_strat.trades import clean_trades, isin_daily, load_trades, read_trades
 
@@ -170,6 +196,175 @@ def _fbil_curve(args: argparse.Namespace) -> int:
 
 def _fbil_mm(args: argparse.Namespace) -> int:
     _write(combine_curves(load_fbil_money_market(f, args.kind) for f in args.files), Path(args.out))
+    return 0
+
+
+def _as_csv_text(df: pd.DataFrame) -> pd.DataFrame:
+    """``df`` as the strings a CSV holds: dates ISO, ``published`` with its time, blanks empty."""
+    out = df.copy()
+    for col in out.columns:
+        if pd.api.types.is_datetime64_any_dtype(out[col]):
+            fmt = "%Y-%m-%dT%H:%M:%S" if col == "published" else "%Y-%m-%d"
+            out[col] = out[col].dt.strftime(fmt)
+    out = out.astype(object).where(out.notna(), "")
+    return out.map(lambda v: v if isinstance(v, str) else (f"{v:.15g}" if isinstance(v, float) else str(v)))
+
+
+def _upsert_csv(path: Path, new: pd.DataFrame, replace_on: list[str], order: list[str],
+                sort: list[str]) -> pd.DataFrame:
+    """Rows of the CSV at ``path`` whose ``replace_on`` values appear in ``new`` swapped for ``new``'s rows.
+
+    Running twice on the same input leaves the file unchanged. Columns follow
+    ``order`` (extra columns of an older file are kept at the end); rows are
+    sorted by ``sort`` (numerically where the values are numbers).
+    """
+    fresh = _as_csv_text(new)
+    if path.exists():
+        old = pd.read_csv(path, dtype=str, keep_default_na=False)
+        keys = set(map(tuple, fresh[replace_on].to_numpy().tolist())) if len(fresh) else set()
+        kept = old[[tuple(r) not in keys for r in old[replace_on].to_numpy().tolist()]] if len(old) else old
+        merged = pd.concat([kept, fresh], ignore_index=True).fillna("")
+    else:
+        merged = fresh
+    cols = [c for c in order if c in merged] + [c for c in merged if c not in order]
+    merged = merged.loc[:, cols]
+    if len(merged):
+        sort_keys = {c: pd.to_numeric(merged[c], errors="coerce").fillna(-1) if c in ("release_id", "line")
+                     else merged[c] for c in sort}
+        merged = merged.iloc[pd.DataFrame(sort_keys).sort_values(sort, kind="stable").index].reset_index(drop=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    merged.to_csv(path, index=False)
+    print(f"wrote {len(merged):>7} rows  {path}")
+    return merged
+
+
+def _rbi_releases(args: argparse.Namespace) -> int:
+    out = Path(args.out_dir)
+    known = out / "gsec_announcement.csv"
+    announcements = pd.read_csv(known, dtype=str, keep_default_na=False) if known.exists() else None
+    if announcements is not None:
+        announcements = announcements.replace({"": None})
+    batch = parse_releases(args.files, announcements=announcements)
+    for kind, table in batch.tables.items():
+        path = out / f"{kind}.csv"
+        if len(table) or path.exists():
+            _upsert_csv(path, table, ["release_id"], list(RELEASE_COLUMNS[kind]),
+                        ["release_date", "release_id", "line"])
+    _upsert_csv(out / "releases.csv", batch.releases, ["release_id", "source_file"], list(INDEX_COLUMNS),
+                ["release_date", "release_id", "source_file"])
+    for s in batch.skipped:
+        print(f"skipped {s.release_id or '-'} ({s.kind}, {s.source_file}): {s.reason}")
+    return 0
+
+
+def _sovereign_master(args: argparse.Namespace) -> int:
+    lists = [load_goi_outstanding(f) for f in args.goi_list]
+    if args.snapshots:
+        path = Path(args.snapshots)
+        fresh = pd.concat(lists, ignore_index=True) if lists else pd.DataFrame(columns=list(GOI_LIST_COLUMNS))
+        stacked = _upsert_csv(path, fresh, ["as_of"], list(GOI_LIST_COLUMNS), ["as_of", "sl_no"])
+        stacked = stacked.replace({"": None})
+        for col in ("as_of", "issue_date", "maturity_date"):
+            stacked[col] = pd.to_datetime(stacked[col])
+        stacked["outstanding_cr"] = pd.to_numeric(stacked["outstanding_cr"])
+        lists = [stacked]
+    far = load_far_list(args.far) if args.far else None
+    extra = []
+    for f in args.extra or ():
+        frame = pd.read_csv(f, dtype=str, keep_default_na=False).replace({"": None})
+        frame.index = frame.index + 2  # a row's label is its line in the file (line 1 is the header)
+        frame.attrs["source_file"] = Path(f).name
+        extra.append(frame)
+    try:
+        master = build_master(lists, far, extra, as_of=args.as_of)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    _write(master, Path(args.out))
+    return 0
+
+
+def _validation(build, evidence: pd.DataFrame, reconciliation: pd.DataFrame | None) -> pd.DataFrame:
+    """The build's report plus the holiday discrepancies and the reconciliation's large gaps, as one table."""
+    rows = list(build.report.to_dict("records"))
+    for _, d in holiday_discrepancies(evidence).iterrows():
+        rows.append({"check": "holiday_evidence", "severity": "warning", "auction_date": d["auction_date"],
+                     "security": d["securities"],
+                     "detail": f"{d['verdict']}: calendar T+1 {d['calendar_t1']:%Y-%m-%d}, evidence "
+                               f"({d['methods']}) points to {d['implied_dates']}",
+                     "source_file": "", "source_row": ""})
+    if reconciliation is not None:
+        for _, r in reconciliation.iterrows():
+            if pd.isna(r["difference_cr"]) or abs(r["difference_cr"]) > 1:
+                if pd.notna(r["rbi_cr"]):
+                    detail = f"ledger {r['ledger_cr']:.3f} against RBI {r['rbi_cr']:.3f} crore"
+                else:
+                    detail = f"ledger {r['ledger_cr']:.3f}, not in RBI's list"
+                rows.append({"check": "reconciliation", "severity": "info", "auction_date": r["as_of"],
+                             "security": f"{r['security']} {r['key']}",
+                             "detail": detail + (f": {r['reasons']}" if r["reasons"] else ""),
+                             "source_file": "", "source_row": ""})
+    order = {"error": 0, "warning": 1, "info": 2}
+    out = pd.DataFrame(rows, columns=list(REPORT_COLUMNS))
+    out["_o"] = out["severity"].map(order).fillna(3)
+    out = out.sort_values(["_o", "check", "auction_date", "security"], kind="stable").drop(columns="_o")
+    return out.reset_index(drop=True)
+
+
+def _auctions(args: argparse.Namespace) -> int:
+    out = Path(args.out_dir)
+    calendar = mumbai_settlement_calendar()
+    gsec = load_fimmda_gsec(args.fimmda_gsec) if args.fimmda_gsec else None
+    sdl = load_fimmda_sdl(args.fimmda_sdl) if args.fimmda_sdl else None
+    handbook = load_handbook_auctions(args.handbook) if args.handbook else None
+    releases = read_release_tables(args.releases) if args.releases else {}
+    master = read_master(args.master) if args.master else None
+    snapshots = read_snapshots(args.snapshots) if args.snapshots else None
+    operations_from = _date_arg(args.operations_from, "--operations-from")
+    build = build_auctions(fimmda_gsec=gsec, fimmda_sdl=sdl, handbook=handbook, releases=releases, master=master,
+                           calendar=calendar, infer_maturities=not args.no_infer_maturities)
+    switches = normalise_switches(releases, build.master, calendar)
+    ledger = build_ledger(build.auctions, switches, snapshots=snapshots, master=build.master, calendar=calendar,
+                          shortfall=args.shortfall, competitive_only=args.competitive_only,
+                          operations_from=operations_from)
+    evidence = settlement_evidence(build, calendar, fimmda_sdl=sdl)
+    reconciliation = reconcile(ledger, snapshots) if snapshots is not None and len(snapshots) else None
+    _write(build.auctions, out / "auctions.csv")
+    _write(switches, out / "switches.csv")
+    _write(ledger, out / "ledger.csv")
+    _write(coverage(ledger), coverage_path(out / "ledger.csv"))
+    _write(supply_summary(ledger, freq="M"), out / "supply_monthly.csv")
+    _write(evidence, out / "settlement_evidence.csv")
+    if reconciliation is not None:
+        _write(reconciliation, out / "reconciliation.csv")
+    report = _validation(build, evidence, reconciliation)
+    _write(report, out / "validation.csv")
+    a = build.auctions
+    priced = a[a["repricing"] != "not_checked"]
+    print(f"{len(a)} auction rows: ISIN {(a['isin'].notna()).sum()}, repricing "
+          + ", ".join(f"{k} {v}" for k, v in priced["repricing"].value_counts().items()))
+    counts = report["severity"].value_counts()
+    print(f"validation: {counts.get('error', 0)} errors, {counts.get('warning', 0)} warnings, "
+          f"{counts.get('info', 0)} notes")
+    return 0
+
+
+def _outstanding(args: argparse.Namespace) -> int:
+    ledger = read_ledger(args.ledger)
+    snapshot = read_snapshots(args.snapshot) if args.snapshot else None
+    try:
+        day = _date_arg(args.date, "--date")
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    result = outstanding_on(ledger, day, snapshot, include_zero=args.include_zero)
+    out = Path(args.out)
+    _write(result, out)
+    if args.by_bucket:
+        _write(outstanding_by_bucket(result), out.with_name(out.stem + "_by_bucket.csv"))
+    complete = result["issuance_complete"] & result["operations_complete"]
+    print(f"{day}: {result['outstanding_cr'].sum():,.3f} crore in {len(result)} securities; "
+          f"{result.loc[complete, 'outstanding_cr'].sum():,.3f} crore with a complete history")
     return 0
 
 
@@ -373,6 +568,48 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--first-coupon-date", help="first coupon date, for an irregular first period")
     p.add_argument("--cash-flows", action="store_true", help="also list the remaining cash flows")
     p.set_defaults(func=_bond_price)
+
+    p = sub.add_parser("rbi-releases", help="auction results and announcements from saved RBI pages and RSS feeds")
+    p.add_argument("files", nargs="+", help="saved BS_PressReleaseDisplay pages and pressreleases_rss.xml copies")
+    p.add_argument("--out-dir", required=True,
+                   help="one CSV per release kind plus releases.csv; re-running replaces a release's rows")
+    p.set_defaults(func=_rbi_releases)
+
+    p = sub.add_parser("sovereign-master", help="one row per G-sec ISIN from saved RBI security lists")
+    p.add_argument("--goi-list", nargs="*", default=[], help="saved 'GoI securities outstanding' pages (Id=1956)")
+    p.add_argument("--far", help="saved FAR specified-securities page (Id=3876)")
+    p.add_argument("--snapshots", help="CSV of dated GoI list snapshots: the pages' rows are added (one per date)")
+    p.add_argument("--extra", nargs="*", help="CSVs with isin, name [, issue_date, maturity_date, source]")
+    p.add_argument("--as-of", help="date to judge maturity against (default: the latest list's date)")
+    p.add_argument("--out", required=True)
+    p.set_defaults(func=_sovereign_master)
+
+    p = sub.add_parser("auctions", help="auction table, issuance ledger and validation report (G-secs, SDLs, T-bills)")
+    p.add_argument("--fimmda-gsec", nargs="*", default=[], help="FIMMDA yearly G-sec auction workbooks (.xlsx)")
+    p.add_argument("--fimmda-sdl", nargs="*", default=[], help="FIMMDA SDL auction workbooks (.xlsx)")
+    p.add_argument("--handbook", nargs="*", default=[], help="saved RBI Handbook Table 221 pages (.html)")
+    p.add_argument("--releases", help="directory of CSVs written by rbi-releases")
+    p.add_argument("--master", help="security master CSV written by sovereign-master")
+    p.add_argument("--snapshots", help="GoI-outstanding snapshots (CSV from sovereign-master, or a saved list page)")
+    p.add_argument("--shortfall", choices=["devolved", "accepted"], default="devolved",
+                   help="what an auction that accepted far less than notified adds to the ledger")
+    p.add_argument("--competitive-only", choices=["notified", "accepted"], default="notified",
+                   help="what a GoI auction known only by its competitive amount adds (notified: 95-100%% of it "
+                        "is taken as fully allotted)")
+    p.add_argument("--operations-from", help="date from which every switch and buyback release is in --releases")
+    p.add_argument("--no-infer-maturities", action="store_true",
+                   help="do not infer maturity dates of securities missing from the master")
+    p.add_argument("--out-dir", required=True)
+    p.set_defaults(func=_auctions)
+
+    p = sub.add_parser("outstanding", help="outstanding stock of every security on a date, from the ledger")
+    p.add_argument("--ledger", required=True, help="ledger.csv written by the auctions command")
+    p.add_argument("--date", required=True, help="date, YYYY-MM-DD (stock at the end of that day)")
+    p.add_argument("--snapshot", help="RBI GoI-outstanding snapshot(s) to reconstruct from (CSV or saved page)")
+    p.add_argument("--include-zero", action="store_true", help="also list securities with no stock that day")
+    p.add_argument("--by-bucket", action="store_true", help="also write totals by kind and tenor bucket")
+    p.add_argument("--out", required=True)
+    p.set_defaults(func=_outstanding)
 
     p = sub.add_parser("parse-ratings", help="split and parse rating strings in a CSV column, for auditing a source")
     p.add_argument("input")
