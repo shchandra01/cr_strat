@@ -7,7 +7,8 @@ corporate bonds annualised, G-secs semi-annual), which is worth 10-20 bps at
 typical yields, so the curve is converted to the bond basis before
 subtracting. Check the convention of each source. Money-market quotes (T-bill
 yields, OIS up to 1Y) are simple Act/365 rates; ``money_market_to_annual``
-turns them into annual-compounding equivalents.
+turns them into annual-compounding equivalents. Both conversion functions
+live in ``conventions`` and are re-exported here.
 
 A curve frame may carry a ``basis`` column (the FBIL loaders write one); if it
 does, it must agree with ``compounding``, so a curve normalised to annual
@@ -31,28 +32,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-COMPOUNDING = ("annual", "semiannual")
+# Moved to conventions; re-exported so existing imports from curves keep working.
+from cr_strat.conventions import COMPOUNDING, convert_yield, money_market_to_annual  # noqa: F401
+
 TENOR_EDGES = (0.0, 1.0, 3.0, 5.0, 10.0, np.inf)
 TENOR_LABELS = ("0-1y", "1-3y", "3-5y", "5-10y", "10y+")
-
-
-def convert_yield(yield_pct, from_basis: str, to_basis: str):
-    """Convert yields in percent between annual and semi-annual compounding."""
-    if from_basis not in COMPOUNDING or to_basis not in COMPOUNDING:
-        raise ValueError(f"compounding must be one of {COMPOUNDING}")
-    if from_basis == to_basis:
-        return yield_pct
-    y = np.asarray(yield_pct, dtype=float) / 100
-    if from_basis == "semiannual":
-        return ((1 + y / 2) ** 2 - 1) * 100
-    return 2 * (np.sqrt(1 + y) - 1) * 100
-
-
-def money_market_to_annual(rate_pct, days):
-    """Annual-compounding equivalent (percent) of a simple Act/365 rate for a term of ``days``."""
-    r = np.asarray(rate_pct, dtype=float) / 100
-    d = np.asarray(days, dtype=float)
-    return ((1 + r * d / 365) ** (365 / d) - 1) * 100
 
 
 def _check_basis(basis: pd.Series, compounding: str) -> None:

@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict
+import sys
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import pandas as pd
 
 from cr_strat.amfi_debt_trades import build_mf_trades, mapping_report, to_price_trades
+from cr_strat.bonds import FixedRateBond, ZeroCouponBond
+from cr_strat.conventions import CONVENTIONS, FINAL_PERIOD_RULES, as_date
 from cr_strat.cra_disclosures import disclosure_summary, load_cra_disclosures, unmapped_issuers
 from cr_strat.curves import BenchmarkCurve, SpreadBenchmark
 from cr_strat.event_prices import DEFAULT_ANCHORS, event_price_paths
@@ -187,6 +190,62 @@ def _parse_ratings(args: argparse.Namespace) -> int:
     return 0
 
 
+def _date_arg(value: str | None, flag: str):
+    """``value`` as a date, with errors naming the command-line flag it came from."""
+    if value is None:
+        return None
+    try:
+        return as_date(value)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"{flag}: {exc}") from None
+
+
+def _bond_price(args: argparse.Namespace) -> int:
+    conv = CONVENTIONS[args.conventions]
+    if args.final_period:
+        conv = replace(conv, final_period=args.final_period)
+    try:
+        maturity = _date_arg(args.maturity, "--maturity")
+        settlement = _date_arg(args.settlement, "--settlement")
+        issue_date = _date_arg(args.issue_date, "--issue-date")
+        first_coupon_date = _date_arg(args.first_coupon_date, "--first-coupon-date")
+        if args.conventions == "strips":
+            if args.coupon != 0:
+                raise ValueError(f"STRIPS have no coupon; pass --coupon 0, not {args.coupon:g}")
+            if first_coupon_date is not None:
+                raise ValueError("--first-coupon-date does not apply to a STRIP")
+            bond = ZeroCouponBond(maturity, conv, issue_date=issue_date)
+        else:
+            bond = FixedRateBond(args.coupon, maturity, conv, issue_date=issue_date,
+                                 first_coupon_date=first_coupon_date)
+        a = bond.analytics(settlement, yield_pct=args.yield_pct, clean_price=args.clean_price)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    rows = [
+        ("bond", (f"{args.coupon:g}% maturing {bond.maturity}, {conv.name} conventions "
+                  f"({conv.day_count}, {conv.compounding}, last period {conv.final_period})")),
+        ("settlement", a.settlement),
+        ("previous coupon", a.previous_coupon_date),
+        ("next coupon", a.next_coupon_date),
+        ("clean price", f"{a.clean_price:.6f}"),
+        ("accrued interest", f"{a.accrued_interest:.6f}"),
+        ("dirty price", f"{a.dirty_price:.6f}"),
+        ("yield (%)", f"{a.yield_pct:.6f}"),
+        ("macaulay duration", f"{a.macaulay_duration:.4f}"),
+        ("modified duration", f"{a.modified_duration:.4f}"),
+        ("dv01 (per 100)", f"{a.dv01:.6f}"),
+        ("convexity", f"{a.convexity:.4f}"),
+    ]
+    for label, value in rows:
+        print(f"{label:<19}{value}")
+    if args.cash_flows:
+        print(f"\n{'date':<12}{'kind':<12}{'amount':>12}{'periods':>12}")
+        for f in bond.cash_flows(a.settlement):
+            print(f"{f.date.isoformat():<12}{f.kind:<12}{f.amount:>12.6f}{f.periods:>12.6f}")
+    return 0
+
+
 def _add_peer_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--match-on", default="instrument_class,rating_bucket,tenor_bucket",
                    help="peer-group columns; add 'sector' if the security master has it")
@@ -298,6 +357,22 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--kind", choices=MM_KINDS, required=True)
     p.add_argument("--out", required=True)
     p.set_defaults(func=_fbil_mm)
+
+    p = sub.add_parser("bond-price", help="price, yield, accrued interest and risk of a G-sec, SDL or STRIP")
+    p.add_argument("--coupon", type=float, required=True,
+                   help="coupon, percent a year (0 with --conventions strips)")
+    p.add_argument("--maturity", required=True, help="maturity date, YYYY-MM-DD")
+    p.add_argument("--settlement", required=True, help="settlement date, YYYY-MM-DD")
+    given = p.add_mutually_exclusive_group(required=True)
+    given.add_argument("--yield", dest="yield_pct", type=float, help="yield, percent (semi-annual for G-secs)")
+    given.add_argument("--price", dest="clean_price", type=float, help="clean price per 100 face")
+    p.add_argument("--conventions", choices=["gsec", "sdl", "strips"], default="gsec")
+    p.add_argument("--final-period", choices=FINAL_PERIOD_RULES,
+                   help="interest in the last coupon period (default: the conventions')")
+    p.add_argument("--issue-date", help="issue date, for a bond still in its first coupon period")
+    p.add_argument("--first-coupon-date", help="first coupon date, for an irregular first period")
+    p.add_argument("--cash-flows", action="store_true", help="also list the remaining cash flows")
+    p.set_defaults(func=_bond_price)
 
     p = sub.add_parser("parse-ratings", help="split and parse rating strings in a CSV column, for auditing a source")
     p.add_argument("input")

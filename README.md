@@ -47,7 +47,9 @@ G-sec / OIS curve ──► price-panel ──► price_panel.csv ──► even
 Input formats and where to get each file: [`data/README.md`](data/README.md).
 Sources and their terms: [`docs/data_sources.md`](docs/data_sources.md) for this
 pipeline, [`docs/rates_data_sources.md`](docs/rates_data_sources.md) for the rates
-and credit strategies.
+and credit strategies. Day counts, calendars and price-yield rules for G-secs,
+SDLs, STRIPS, T-bills, CP and CD, with their sources:
+[`docs/conventions.md`](docs/conventions.md).
 
 ## Quickstart
 
@@ -69,6 +71,8 @@ cr-strat price-panel --trades data/out/trades_*.csv --securities data/raw/securi
     --out-dir data/out
 cr-strat event-prices --events data/out/rating_events.csv --panel data/out/price_panel.csv \
     --out-dir data/out
+
+cr-strat bond-price --coupon 6.94 --maturity 2036-05-11 --settlement 2026-11-16 --price 97.43
 ```
 
 `event_prices.csv` and `event_ownership.csv` share `event_id`; joining them gives
@@ -87,6 +91,9 @@ the pressure variable and the price response for each event.
 | `ownership` | Constrained ownership at each event and holder selling after it |
 | `trades` | Loads NSE/BSE reported-trade files (trade-level or ISIN-day summaries), flags yield outliers, aggregates to value-weighted ISIN-day yields |
 | `curves` | Benchmark curve interpolation with compounding conversion; matched-peer spread benchmark |
+| `conventions` | Day counts (30E/360 for G-secs and SDLs, 30/360 US, Act/365F, Act/Act ICMA), yield-basis conversions, and each instrument type's conventions with their sources |
+| `calendars` | Mumbai settlement calendar from the holiday list shipped in the package (`src/cr_strat/data/`): business days, date rolls, T+n settlement dates from an instrument's conventions; refuses years not declared complete |
+| `bonds` | G-sec, SDL, STRIPS, T-bill, CMB, CP and CD pricing: coupon schedules, accrued interest, price and yield, duration, DV01, convexity |
 | `price_panel` | ISIN-day yields, spreads, tenor and as-of rating buckets |
 | `event_prices` | Spread paths around each event: pre-event level, first trade after, and anchors at t-60/+10/+60/+120/+250 |
 
@@ -116,3 +123,13 @@ the pressure variable and the price response for each event.
   compounding and the benchmark to semi-annual. Set both to match your sources.
 - **Price paths are in spread terms, not total return.** There is no carry or
   duration-hedged P&L yet.
+- **Some pricing rules have no primary source yet.** Interest in a G-sec's last
+  coupon period, the STRIPS formula and the shut periods are named parameters
+  set to the market-standard reading ([`docs/conventions.md`](docs/conventions.md)).
+  Accrued interest is not capped in the 181-182 day half-years FIMMDA's
+  30E/360 gives bonds paying on 29-31 August, so it can exceed the coupon.
+  Whether CCIL caps it is an open question. No priced SDL pair has been
+  tested; the SDL tests are smoke tests. The holiday list covers 2025 and 2026,
+  declared complete in `holidays_mumbai_years.csv`; the calendar refuses other
+  years unless told to treat their weekdays as business days. Corporate bonds
+  and floating-rate bonds are not priced yet.

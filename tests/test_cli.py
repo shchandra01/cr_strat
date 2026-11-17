@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 import openpyxl
@@ -80,3 +81,79 @@ def test_price_pipeline(tmp_path, isin):
     assert cbf["first_post_abn_bps"] == pytest.approx(100, abs=1)
     assert pd.isna(cbf["p60_gap_cur_bps"])  # no AA-rated peers, so no current-rating benchmark
     assert (out / "peer_spreads_weekly.csv").exists()
+
+
+def _fields(text: str) -> dict:
+    rows = [re.split(r"\s{2,}", line.strip(), maxsplit=1) for line in text.splitlines() if line.strip()]
+    return {r[0]: r[1] for r in rows if len(r) == 2}
+
+
+def test_bond_price(capsys):
+    # 6.94% GS 2036, RBI auction of 13 Nov 2026: cut-off price 97.43, yield 7.3203%, settled 16 Nov.
+    args = ["bond-price", "--coupon", "6.94", "--maturity", "2036-05-11", "--settlement", "2026-11-16"]
+    assert main([*args, "--price", "97.43"]) == 0
+    out = _fields(capsys.readouterr().out)
+    assert float(out["yield (%)"]) == pytest.approx(7.320279, abs=1e-6)
+    assert float(out["accrued interest"]) == pytest.approx(6.94 * 5 / 360, abs=1e-6)
+    assert out["previous coupon"] == "2026-11-11" and out["next coupon"] == "2027-05-11"
+    for key in ("clean price", "dirty price", "modified duration", "dv01 (per 100)", "convexity"):
+        assert float(out[key]) > 0
+
+    assert main([*args, "--yield", "7.3203", "--cash-flows"]) == 0
+    text = capsys.readouterr().out
+    assert f"{float(_fields(text)['clean price']):.4f}" == "97.4299"
+    assert "2036-05-11  redemption" in text
+
+    assert main(["bond-price", "--coupon", "6.94", "--maturity", "2036-05-11", "--settlement", "2036-05-11",
+                 "--yield", "7"]) == 2
+    assert "on or after maturity" in capsys.readouterr().err
+    with pytest.raises(SystemExit):
+        main([*args])  # neither a yield nor a price
+
+
+@pytest.mark.parametrize("extra, message", [
+    (["--coupon", "7", "--maturity", "2036-05-11", "--yield", "7", "--conventions", "strips"],
+     "STRIPS have no coupon; pass --coupon 0"),
+    (["--coupon", "0", "--maturity", "2036-05-11", "--yield", "7", "--conventions", "strips",
+      "--issue-date", "2025-09-01", "--first-coupon-date", "2026-05-11"], "does not apply to a STRIP"),
+    (["--coupon", "6.94", "--maturity", "2036-13-01", "--yield", "7"], "--maturity: month must be in 1..12"),
+    (["--coupon", "6.94", "--maturity", "2036-05-11", "--yield", "7", "--issue-date", "2026-02-30"],
+     "--issue-date: day is out of range for month"),
+    (["--coupon", "6.94", "--maturity", "2036-05-11", "--price", "0"], "clean price must be a positive number"),
+    (["--coupon", "6.94", "--maturity", "2036-05-11", "--price", "inf"], "clean price must be a positive number"),
+    (["--coupon", "6.94", "--maturity", "2036-05-11", "--yield", "nan"], "yield must be a finite number"),
+    (["--coupon", "6.94", "--maturity", "2036-05-11", "--yield", "-250"], "yield must be above -200%"),
+])
+def test_bond_price_rejects_bad_input(capsys, extra, message):
+    assert main(["bond-price", "--settlement", "2026-11-16", *extra]) == 2
+    assert message in capsys.readouterr().err
+
+
+def test_bond_price_settlement_flag_is_named(capsys):
+    assert main(["bond-price", "--coupon", "6.94", "--maturity", "2036-05-11", "--settlement", "16-11-2026",
+                 "--yield", "7"]) == 2
+    assert "--settlement: Invalid isoformat string" in capsys.readouterr().err
+
+
+def test_bond_price_options(capsys):
+    # A STRIP is priced as a zero-coupon bond.
+    assert main(["bond-price", "--coupon", "0", "--maturity", "2036-05-11", "--settlement", "2026-11-16",
+                 "--yield", "7", "--conventions", "strips"]) == 0
+    out = _fields(capsys.readouterr().out)
+    assert float(out["dirty price"]) == pytest.approx(100 / 1.035 ** (18 + 175 / 180), abs=1e-6)
+    assert "STRIPS conventions" in out["bond"] and float(out["accrued interest"]) == 0
+    # A long first coupon, from the issue date to the first coupon date.
+    assert main(["bond-price", "--coupon", "6.94", "--maturity", "2036-05-11", "--settlement", "2025-10-01",
+                 "--yield", "7.1", "--issue-date", "2025-09-01", "--first-coupon-date", "2026-05-11"]) == 0
+    out = _fields(capsys.readouterr().out)
+    assert out["previous coupon"] == "2025-09-01" and out["next coupon"] == "2026-05-11"
+    assert float(out["accrued interest"]) == pytest.approx(6.94 * 30 / 360, abs=1e-6)
+    assert main(["bond-price", "--coupon", "5.91", "--maturity", "2028-06-30", "--settlement", "2028-02-15",
+                 "--yield", "6", "--final-period", "compound"]) == 0
+    assert "last period compound" in capsys.readouterr().out
+    # 31 Aug maturity two days out: was exit 2 ("no yield prices these cash flows").
+    assert main(["bond-price", "--coupon", "7", "--maturity", "2035-08-31", "--settlement", "2035-08-29",
+                 "--price", "100"]) == 0
+    out = _fields(capsys.readouterr().out)
+    assert float(out["yield (%)"]) == pytest.approx(-6.762015, abs=1e-6)
+    assert float(out["modified duration"]) > 0 and float(out["dv01 (per 100)"]) > 0

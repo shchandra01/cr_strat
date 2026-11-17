@@ -463,7 +463,9 @@ What can be built now, with no licence:
    settlement, MIBOR fixing and the exchanges; day counts (30/360,
    actual/365, actual/actual); settlement lags, shut periods and holiday rules
    for coupons and redemptions. Sources: FIMMDA's handbook and holiday lists,
-   RBI's Master Directions.
+   RBI's Master Directions. Built for Mumbai settlement
+   ([`conventions.md`](conventions.md)); MIBOR fixing and exchange calendars
+   remain.
 2. **Sovereign security master and issuance ledger.** One row per ISIN per
    issue, reissue, switch, buyback and maturity, so outstanding stock is known
    on any past date. Sources: RBI's lists kept as daily snapshots from now;
@@ -471,7 +473,8 @@ What can be built now, with no licence:
    files for back history.
 3. **Bond pricing engine.** Cash flows, price and yield, accrued interest,
    DV01 and convexity for G-secs, SDLs and T-bills, tested against RBI's
-   auction price and yield pairs.
+   auction price and yield pairs. Built in
+   [`bonds.py`](../src/cr_strat/bonds.py), with STRIPS, CMBs, CP and CD.
 4. **Daily store of RBI operations and money-market rates** from the RSS
    feed.
 5. **Macro and global store** from MoSPI's API, the US publishers and BIS.
@@ -492,13 +495,16 @@ fundamentals for S8 and S10.
   semi-annual beyond; corporate bonds mostly annualised. Mixing bases costs
   10 to 20 basis points, the whole signal in S1, S2 and S8. Compute spreads
   from cash flows on one basis.
-- **Day counts and holidays.** G-secs and SDLs accrue 30/360; corporate bonds
-  actual/actual under SEBI's 2016 rule, older issues often actual/365. Coupons
-  and redemptions falling on holidays move by rule (to verify per
-  instrument).
-- **Shut periods and record dates.** G-secs cannot settle in the shut period
-  before a coupon; corporate bonds have record dates about 15 days ahead, and
-  tax deducted at source falls on the record-date holder. Reported yields in
+- **Day counts and holidays.** G-secs and SDLs accrue on FIMMDA's European
+  30/360 (30E/360); corporate bonds actual/actual under SEBI's 2016 rule,
+  older issues often actual/365. A G-sec coupon falling on a holiday is paid
+  the next working day and a redemption the previous one, amounts unchanged
+  ([`conventions.md`](conventions.md)).
+- **Shut periods and record dates.** G-secs no longer have a shut period
+  before a coupon (an auction settling the day before one priced
+  cum-coupon); a one-day shut period before redemption is reported but not
+  verified. Corporate bonds have record dates about 15 days ahead, and tax
+  deducted at source falls on the record-date holder. Reported yields in
   those windows are unreliable.
 - **Valuation prices are not trades.** FBIL prices for untraded bonds, and
   agency prices and matrices for corporate bonds, are model outputs. A curve
