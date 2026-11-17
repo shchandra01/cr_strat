@@ -22,7 +22,11 @@ Nothing here downloads. Inputs are files saved by hand (``data/README.md``):
   8.30% GS 2042 on 22 Mar 2018) look like conversions or switches priced at
   market, not auctions: they are flagged ``non_round_notified``, and on such
   a day a security maturing within a year (8.24% GS 2018, 15,091 at 100.13)
-  is flagged ``probable_switch_source``; neither counts as issuance.
+  is flagged ``probable_switch_source``; neither counts as issuance. A day
+  whose lines price only for settlement on or before the auction date (the
+  four lines of 29 Sep 2016, 100 to 425 crore each) was a special operation
+  settled on the day, not an auction: each of its G-sec lines is flagged
+  ``auction_day_pricing`` and does not count as issuance either.
 * **FIMMDA's SDL auction workbook** (``SDL_Auction_Data_<date>.xlsx``), read by
   ``load_fimmda_sdl``: monthly sheets of ISIN, description, maturity date,
   weighted average yield, NEW/REISSUE and the amount accepted. There are no
@@ -110,7 +114,12 @@ anniversary of its first issue (the settlement of a new issue in the table,
 or the issue date an SDL reissue cell prints): accepted as
 ``issue_anniversary`` if it reproduces every priced reissue of the key. Else
 every day of the maturity year is tried; a single fit is
-``yield_search``, several or none are refused and reported. A floating-rate
+``yield_search``, several or none are refused and reported. Lines of special
+operations (``SPECIAL_OPERATION_FLAGS``) are left out of both: under 30E/360
+a price fixed for settlement on the auction day fits a maturity one day late
+exactly as T+1 settlement fits the true one, so a line whose settlement basis
+is not T+1 cannot date a maturity (the conversion legs of 8.24% GS 2018 put
+it on 23 Apr 2018; RBI's notifications give 22 Apr). A floating-rate
 bond has no fixed coupon to search with and is refused too. The table
 ``AuctionBuild.maturities`` lists each attempt; the ledger redeems a key left
 undated by the end of the year in its name (``issuance``).
@@ -167,6 +176,8 @@ from cr_strat.sovereign import (
 )
 
 FIXED_COUPON_KINDS = frozenset({GSEC, GREEN, SDL})
+# Lines that are not auctions settling at T+1: they do not count as issuance and do not date maturities.
+SPECIAL_OPERATION_FLAGS = ("non_round_notified", "probable_switch_source", "auction_day_pricing")
 # FIMMDA's "Amount Accepted" is the competitive amount from FY2025-26 (it equals the Handbook's competitive column
 # on every auction both hold); before, it is the total accepted (it sums to RBI's outstanding stock exactly for
 # securities issued and reissued entirely within FY2022-24).
@@ -1153,10 +1164,11 @@ def reprice(kind: str, coupon: float, maturity, price: float, yield_text: str, a
     the auction (22 Jan 2024, 7 Feb 2022) or the holiday moved (5 to 8 Sep
     2025): the security settled the next business day (source
     ``yield_rolled``). No date is inferred for a settlement printed by a
-    source in ``authoritative``, for a row flagged ``non_round_notified``, or
-    in an odd first coupon period (the engine's broken-period rule does not
-    match RBI's, so a fit there is chance). ``diagnose`` looks for the likely
-    cause when nothing fits.
+    source in ``authoritative``, for a row with one of the
+    ``SPECIAL_OPERATION_FLAGS`` (priced on another basis), or in an odd first
+    coupon period (the engine's broken-period rule does not match RBI's, so a
+    fit there is chance). ``diagnose`` looks for the likely cause when
+    nothing fits.
     """
     auction, maturity, settle, issue = (_as_day(x) for x in (auction_date, maturity, settlement, issue_date))
     window = weekdays_after(auction, weekdays)
@@ -1168,7 +1180,7 @@ def reprice(kind: str, coupon: float, maturity, price: float, yield_text: str, a
     if settle is not None and reproduces(computed, yield_text):
         return Repricing("reproduced", settle, settlement_source, fits, computed)
     flags = set(flags)
-    blocked = ("non_round_notified" in flags or settlement_source in set(authoritative)
+    blocked = (bool(flags & set(SPECIAL_OPERATION_FLAGS)) or settlement_source in set(authoritative)
                or (settle is not None and odd_first_period(coupon, maturity, issue, settle)))
     if fits and not blocked:
         inferred, source = fits[0], "yield"
@@ -1203,6 +1215,13 @@ def _diagnosis(kind, coupon, maturity, price, yield_text, auction, settle, issue
     causes = []
     if "non_round_notified" in flags:
         causes.append("special operation (non-round amount): probably a conversion or switch, priced otherwise")
+    elif "probable_switch_source" in flags:
+        causes.append("special operation (converted out on a conversion day): priced otherwise")
+    elif "auction_day_pricing" in flags:
+        early = [d for d in (auction, auction - dt.timedelta(days=1))
+                 if reproduces(yield_at(kind, coupon, maturity, price, d, issue), yield_text)]
+        causes.append("special operation: the day's lines price for settlement on or before the auction date"
+                      + (f" (this one fits {_dates(early)})" if early else ""))
     if odd_first_period(coupon, maturity, issue, target):
         causes.append("odd first coupon period: the engine's broken-period rule does not match RBI's")
     if fits and settlement_source in AUTHORITATIVE_SETTLEMENT:
@@ -1424,9 +1443,10 @@ def build_auctions(*, fimmda_gsec: FimmdaLoad | pd.DataFrame | None = None,
         if rec["kind"] == TBILL and _missing(rec["maturity_date"]) and not _missing(rec["tenor_days"]):
             rec["maturity_date"] = pd.Timestamp(rec["settlement_date"]) + pd.Timedelta(days=int(rec["tenor_days"]))
             rec["maturity_source"] = "tenor"
+    _flag_operations(records)  # before inference: special-operation lines do not date maturities
+    _flag_auction_day_pricing(records, weekdays, report)
     maturities = _infer_maturities(records, report, weekdays) if infer_maturities else []
     _late_issue_types(records)
-    _flag_operations(records)
     for rec in records:
         _reprice_record(rec, calendar, weekdays, report)
     for rec in records:
@@ -1598,7 +1618,8 @@ def _infer_maturities(records: list[dict], report: list[dict], weekdays: int) ->
     for key, recs in sorted(groups.items()):
         year, kind, coupon = int(recs[0]["maturity_year"]), recs[0]["kind"], float(recs[0]["coupon_pct"])
         first_issue = next((_as_day(r["first_issue_date"]) for r in recs if not _missing(r["first_issue_date"])), None)
-        priced = [r for r in recs if _priced(r) and "non_round_notified" not in r["flags"]
+        special = [r for r in recs if _priced(r) and any(f in r["flags"] for f in SPECIAL_OPERATION_FLAGS)]
+        priced = [r for r in recs if _priced(r) and not any(f in r["flags"] for f in SPECIAL_OPERATION_FLAGS)
                   and not is_par_issue(r["cutoff_price"], r["cutoff_yield_text"], coupon)]
         window = {id(r): tuple(weekdays_after(_as_day(r["auction_date"]), weekdays)) for r in priced}
         flexible = [(r["cutoff_price"], r["cutoff_yield_text"], _as_day(r["settlement_date"]), first_issue,
@@ -1627,6 +1648,9 @@ def _infer_maturities(records: list[dict], report: list[dict], weekdays: int) ->
             fits = len(days)
             if not strict:
                 detail = "no priced reissue to search with: refused"
+                if special:
+                    detail = (f"no priced reissue to search with ({len(special)} special-operation line(s) left "
+                              "out: priced on another settlement basis): refused")
             elif fits == 1:
                 found, source = days[0], "yield_search"
                 detail = f"the only day of {year} that reproduces all {len(strict)} priced auctions{how}"
@@ -1696,6 +1720,52 @@ def _flag_operations(records: list[dict]) -> None:
             rec["flags"].append("shortfall")
 
 
+def _flag_auction_day_pricing(records: list[dict], weekdays: int, report: list[dict]) -> None:
+    """Flag the G-sec lines of a day whose dated lines price only for settlement on or before the auction date.
+
+    An auction's cut-off prices reproduce its printed yields at T+1 or a
+    later weekday of the window. On 29 Sep 2016 FIMMDA lists four small
+    lines (100 to 425 crore) that fit only settlement on the auction day or
+    the day before: a special operation settled on the day, not an auction.
+    A day is flagged when a line with a known maturity fits only that early
+    and no such line of the day reproduces in the window; every G-sec, green
+    and floating-rate line of the day then gets ``auction_day_pricing``. Lines
+    with no maturity, at par, in an odd first coupon period or already
+    flagged as special operations are not evidence either way. Runs before
+    maturity inference, so only the master's (or a source's) maturities count.
+    """
+    early: dict[dt.date, list[str]] = defaultdict(list)
+    normal: set[dt.date] = set()
+    for rec in records:
+        if (rec["kind"] not in (GSEC, GREEN) or not _priced(rec) or _missing(rec["maturity_date"])
+                or any(f in rec["flags"] for f in SPECIAL_OPERATION_FLAGS)
+                or is_par_issue(rec["cutoff_price"], rec["cutoff_yield_text"], rec["coupon_pct"])):
+            continue
+        auction, maturity = _as_day(rec["auction_date"]), _as_day(rec["maturity_date"])
+        issue, settle = _as_day(rec["first_issue_date"]), _as_day(rec["settlement_date"])
+        window = weekdays_after(auction, weekdays)
+        if odd_first_period(rec["coupon_pct"], maturity, issue, settle or window[0]):
+            continue
+
+        def fits(day, rec=rec, maturity=maturity, issue=issue):
+            return reproduces(yield_at(rec["kind"], rec["coupon_pct"], maturity, rec["cutoff_price"], day, issue),
+                              rec["cutoff_yield_text"])
+
+        if any(fits(d) for d in ([settle] if settle is not None else []) + list(window)):
+            normal.add(auction)
+        elif any(fits(d) for d in (auction, auction - dt.timedelta(days=1))):
+            early[auction].append(str(rec["security"]))
+    for day in sorted(set(early) - normal):
+        flagged = [rec for rec in records if _as_day(rec["auction_date"]) == day and rec["kind"] in (GSEC, GREEN, FRB)]
+        for rec in flagged:
+            rec["flags"].append("auction_day_pricing")
+        report.append(_report(
+            "special_operation", "warning",
+            f"{'; '.join(early[day])} price only for settlement on or before the auction date and no line of the "
+            f"day prices at T+1: a special operation settled on the day; its {len(flagged)} G-sec line(s) are "
+            "flagged auction_day_pricing, not counted as issuance and not used to infer maturities", day))
+
+
 def _reprice_record(rec: dict, calendar: BusinessCalendar | None, weekdays: int, report: list[dict]) -> None:
     rec["settlement_candidates"], rec["repriced_yield"], rec["repricing_note"] = "", None, ""
     if not _priced(rec):
@@ -1756,15 +1826,20 @@ def _finish(rec: dict, report: list[dict]) -> None:
     if (not _missing(rec["notified_cr"]) and rec["accepted_cr"] and rec["kind"] != TBILL
             and rec["accepted_cr"] > float(rec["notified_cr"]) + 0.001 and "greenshoe" not in rec["flags"]):
         rec["flags"].append("greenshoe")
-    special = "non_round_notified" in rec["flags"] or "probable_switch_source" in rec["flags"]
+    special = [f for f in SPECIAL_OPERATION_FLAGS if f in rec["flags"]]
     rec["counts_as_issue"] = bool(rec["status"] == "accepted" and rec["accepted_cr"] and not special)
     if special and rec["status"] == "accepted":
-        why = (f"notified {rec['notified_cr']:g} crore is not a round amount" if "non_round_notified" in rec["flags"]
-               else "a security maturing within a year, on a day of non-round (conversion) lines")
+        if special[0] == "non_round_notified":
+            why = f"notified {rec['notified_cr']:g} crore is not a round amount: probably a conversion or switch leg"
+        elif special[0] == "probable_switch_source":
+            why = ("a security maturing within a year, on a day of non-round (conversion) lines: probably the "
+                   "security converted out")
+        else:
+            why = ("a line of a day whose lines price for settlement on or before the auction date: a special "
+                   "operation settled on the day, not an auction")
         report.append(_report("special_operation", "warning",
-                              f"{why}: probably a conversion or switch leg; not counted as issuance until RBI "
-                              "confirms it", rec["auction_date"], rec["security"], rec["source_file"],
-                              rec["source_row"]))
+                              f"{why}; not counted as issuance until RBI confirms it", rec["auction_date"],
+                              rec["security"], rec["source_file"], rec["source_row"]))
     rec["flags"] = ";".join(dict.fromkeys(rec["flags"]))
 
 

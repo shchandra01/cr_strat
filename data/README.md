@@ -204,7 +204,10 @@ the files saved on 17 Nov 2026 no file holds FY2024-25.
 accepted before; neither includes devolvement on primary dealers. Rows with
 a non-integer notified amount are conversions or switches listed as auction
 lines; they and the short security converted out that day do not count as
-issuance (`non_round_notified`, `probable_switch_source`).
+issuance (`non_round_notified`, `probable_switch_source`). Nor do the lines
+of a day whose prices fit only settlement on or before the auction date (29
+Sep 2016: `auction_day_pricing`). None of these lines is used to infer a
+maturity, since their settlement basis is not T+1.
 
 The SDL workbook holds one sheet per month (ISIN, description, maturity
 date, weighted average yield, NEW/REISSUE, amount accepted; no prices).
@@ -256,7 +259,7 @@ Main columns of `auctions.csv`:
 | `cutoff_price_text`, `cutoff_yield_text` | As printed, so their decimals are known |
 | `issue_type`, `issue_type_source` | `new` or `reissue`, and how that was decided |
 | `repricing`, `repriced_yield`, `repricing_note`, `settlement_candidates` | The yield from the cut-off price at the settlement date against the printed yield: `reproduced`, `settlement_inferred`, `par_issue`, `not_reproduced` (with the likely cause), `not_checked` |
-| `counts_as_issue`, `flags` | `greenshoe`, `shortfall`, `non_round_notified`, `probable_switch_source`, `bad_price_yield`, `state_conflict`... |
+| `counts_as_issue`, `flags` | `greenshoe`, `shortfall`, `non_round_notified`, `probable_switch_source`, `auction_day_pricing`, `bad_price_yield`, `state_conflict`... |
 
 `--shortfall devolved` (the default) books the notified amount for an
 auction that accepted far less, as devolved on the underwriters;

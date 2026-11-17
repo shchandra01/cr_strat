@@ -106,12 +106,21 @@ Published pairs reproduced, all in [`tests/test_bonds.py`](../tests/test_bonds.p
 - **The whole auction table** (`auctions.build_auctions` on FIMMDA's
   2015-2027 files, Handbook Table 221 and the Nov 2026 releases, saved on
   16-17 Nov 2026): the yield from the cut-off price at T+1 on the calendar
-  reproduces the printed yield on 1,341 of 1,452 priced G-sec, green-bond
+  reproduces the printed yield on 1,337 of 1,448 priced G-sec, green-bond
   and SDL reissues (three after rolling over a holiday declared after the
   auction). Of the rest, 95 settle in an odd first coupon period
   ([open questions](#open-questions)), 11 are conversion lines, 2 fit only on
-  or before their auction date (29 Sep 2016) and 3 look mistyped in FIMMDA's
-  file. Reproduced in FY2022-23 and FY2025-27 without exception.
+  or before their auction date and 3 look mistyped in FIMMDA's file.
+  Reproduced in FY2022-23 and FY2025-27 without exception. The 2 are lines
+  of 29 Sep 2016, four small lines (100 to 425 crore) that all fit settlement
+  on the auction day and none at T+1: a special operation settled that day,
+  not an auction, so all four are flagged `auction_day_pricing` and do not
+  count as issuance. Lines priced on another settlement basis cannot date a
+  maturity either: under 30E/360 a price fixed for the auction day fits a
+  maturity one day late exactly as T+1 fits the true one. Searched at T+1,
+  the conversion legs of 8.24% GS 2018 put its maturity on 23 Apr 2018, where
+  RBI's notifications (seen through search excerpts) give 22 Apr. Such lines
+  are therefore left out of maturity inference.
 - **12 SDL reissues** of RBI's 9 Nov 2026 result (7.83% Assam SGS 2046 at
   97.55 for 8.0814% and eleven more), settling on 11 Nov after the Diwali
   holiday, with each maturity on the anniversary of the first issue date the
@@ -234,7 +243,7 @@ circulars were not opened), NSE traded but did not settle debt on 19 Feb,
 
 | Rule | Engine default | Parameter |
 |---|---|---|
-| Interest in the last coupon period of a G-sec | Simple, as Excel's PRICE does | `BondConventions.final_period` (`"compound"`) |
+| Interest in the last coupon period of a G-sec | Simple, as Excel's PRICE does. Evidence, not a rule: RBI's yields for the three conversion legs in their last period (7.83% GS 2018 on 22 Nov 2017, 8.24% GS 2018 on 8 and 22 Mar 2018) reproduce to 4 decimals with simple interest and miss by 2 to 8 bp compounded, if they settled on the auction day at the true maturities (22 Apr 2018 per RBI's notifications; 11 Apr 2018 recalled, not checked) | `BondConventions.final_period` (`"compound"`) |
 | 30E/360 or 30/360 US for G-secs | 30E/360 (the handbook's table) | `day_count` (`"30/360 US"`) |
 | First-period fraction when a coupon falls on the 29th to 31st or at February's end | Excel's `(E - A) / E`; the last period on the days to redemption (Excel YIELD's `DSR`) | `fraction_rule` (`"days_to_next"`) |
 | Days to a payment when 30E/360 gives none: the 30th before a payment on the 31st, or the last days of a 181-182 day half-year | One day (the actual count from the 30th to the 31st) | None |

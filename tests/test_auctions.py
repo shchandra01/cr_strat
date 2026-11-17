@@ -400,6 +400,45 @@ def test_build_flags_special_operations_and_shortfalls(build):
     assert {"special_operation", "settlement_inferred", "maturity_inference"} <= checks
 
 
+def test_conversion_legs_do_not_date_a_maturity(build):
+    # 8.24% GS 2018's only line is the security converted out on 22 Mar 2018. Its price was fixed for another
+    # settlement basis: searched at T+1 it puts the maturity on 23 Apr 2018, a day after the true one.
+    mats = build.maturities.set_index("key")
+    assert mats.loc["8.24% GS 2018", "status"] == "refused"
+    assert "special-operation" in mats.loc["8.24% GS 2018", "detail"]
+    leg = _row(build, "2018-03-22", "8.24% GS 2018")
+    assert pd.isna(leg["maturity_date"]) and leg["repricing"] == "not_checked"
+
+
+def test_a_day_priced_for_the_auction_date_is_a_special_operation(tmp_path, master, cal):
+    from cr_strat.auctions import yield_at
+    day, t0 = D(2023, 3, 16), "2023-03-16"  # a Thursday; its T+1 is Friday 17 Mar
+    lines = [("7.38% GS 2027", 7.38, "2027-06-20", 96.00), ("7.26% GS 2029", 7.26, "2029-01-14", 94.00),
+             ("7.16% GS 2023", 7.16, "2023-05-20", 100.20)]  # the last is not in the master
+    priced = [(name, c, mat, px, fx.priced_yield(c, mat, px, t0)) for name, c, mat, px in lines]
+    for name, c, mat, px, y in priced[:2]:  # the yields fit the auction day and no weekday after it
+        assert not any(reproduces(yield_at("gsec", c, mat, px, d), y) for d in weekdays_after(day.date(), 4)), name
+    normal = fx.priced_yield(7.41, "2036-12-19", 99.00, "2023-03-13")
+    sheets = {"2022-2023": [(day, name, 300, 300, f"{px:.2f}", y) for name, _, _, px, y in priced]
+              + [(D(2023, 3, 10), "7.41% GS 2036", 13000, 13000, "99.00", normal)]}
+    b = build_auctions(fimmda_gsec=load_fimmda_gsec([fx.gsec_workbook(tmp_path / "g.xlsx", sheets)]),
+                       master=master, calendar=cal)
+    for name, *_ in priced:
+        r = _row(b, "2023-03-16", name)
+        assert "auction_day_pricing" in r["flags"] and not r["counts_as_issue"], name
+    listed = _row(b, "2023-03-16", "7.38% GS 2027")
+    assert listed["repricing"] == "not_reproduced" and "fits 2023-03-16" in listed["repricing_note"]
+    # the line with no maturity cannot date one: searched at T+1 it would give 21 May 2023
+    unlisted = _row(b, "2023-03-16", "7.16% GS 2023")
+    assert pd.isna(unlisted["maturity_date"]) and unlisted["repricing"] == "not_checked"
+    assert b.maturities.set_index("key").loc["7.16% GS 2023", "status"] == "refused"
+    ok = _row(b, "2023-03-10", "7.41% GS 2036")
+    assert ok["flags"] == "" and ok["counts_as_issue"] and ok["repricing"] == "reproduced"
+    warn = b.report[(b.report["check"] == "special_operation") & (b.report["auction_date"] == T(t0))]
+    assert len(warn) == 1 + 3  # the day, then each line
+    assert "7.38% GS 2027" in warn.iloc[0]["detail"] and "7.26% GS 2029" in warn.iloc[0]["detail"]
+
+
 def test_build_from_rbi_release_tables(master, cal):
     import rbi_fixtures as rf
     from cr_strat.rbi_releases import parse_releases
