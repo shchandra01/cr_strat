@@ -45,6 +45,9 @@ G-sec / OIS curve ──► price-panel ──► price_panel.csv ──► even
 ```
 
 Input formats and where to get each file: [`data/README.md`](data/README.md).
+Sources and their terms: [`docs/data_sources.md`](docs/data_sources.md) for this
+pipeline, [`docs/rates_data_sources.md`](docs/rates_data_sources.md) for the rates
+and credit strategies.
 
 ## Quickstart
 

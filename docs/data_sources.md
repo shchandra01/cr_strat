@@ -6,6 +6,11 @@ observed with real requests. Terms are quoted from each site. Re-check terms
 before any bulk download: several sites changed theirs recently (FBIL posted
 new terms on 13 Oct 2026).
 
+The rates and credit strategies need more than this file covers: RBI auction
+and money-market data, CCIL and FBIL prices and curves, OIS, funding terms and
+corporate bond feeds. Those sources, probed on 16 Nov 2026, are in
+[`rates_data_sources.md`](rates_data_sources.md).
+
 **Bottom line for a commercial fund.** Almost every free source can be read
 by a script, but almost none allows a commercial user to build a database
 from it without permission or a licence:
@@ -160,8 +165,9 @@ terminal data). Subscriptions:
   interbank OIS trades, NDS-OM). Archives need membership or CCIL Data
   Services. Terms forbid "any systematic or automated data collection". Not
   used.
-- **RBI DBIE:** the anonymous scripted session was rejected; the API needs
-  registration.
+- **RBI DBIE:** the anonymous scripted session was rejected. No documented
+  public API was found on 16 Nov 2026 (see
+  [`rates_data_sources.md`](rates_data_sources.md)).
 - **RBI Handbook of Statistics:** month-end SGL yield tables (xlsx) as a
   coarse fallback.
 
@@ -169,7 +175,12 @@ terminal data). Subscriptions:
 
 These need their domains allowed:
 
-- NSE and BSE trade repositories.
-- IRDAI, PFRDA and EPFO rules for the insurer, NPS and EPFO mandates.
+- NSE and BSE trade repositories. Probed on 16 Nov 2026: NSE's pages load data
+  by JavaScript and its terms forbid automated collection and storage; BSE
+  returned only a JavaScript shell. Details and licence prices are in
+  [`rates_data_sources.md`](rates_data_sources.md).
+- IRDAI, PFRDA and EPFO rules for the insurer, NPS and EPFO mandates. On
+  16 Nov 2026 IRDAI's and PFRDA's robots.txt barred all crawlers, and EPFO
+  returned HTTP 403.
 - Insurer and NPS pension-fund holdings.
 - AMC websites for portfolio files.
