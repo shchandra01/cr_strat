@@ -209,12 +209,21 @@ circulars were not opened), NSE traded but did not settle debt on 19 Feb,
   is not known. A cap would change the clean price and the yield on those few
   days a year for every bond paying on 29-31 August (common among SDLs, which
   settle on Wednesdays: 31 Aug 2022 and 30 Aug 2023 were Wednesdays).
-- **Excel's one-period YIELD.** The last-period rule follows the `DSR` in
-  Excel's documented YIELD formula for one period or less. Excel's PRICE takes
-  `DSC` from COUPDAYSNC, which on its 30/360 bases is `E - A`. Both are
-  recalled (Microsoft's help, LibreOffice's emulation), not re-read for this
-  change. If both are right, Excel's PRICE and YIELD disagree in a 181-182 day
-  last period. The engine keeps price and yield consistent.
+- **Excel's PRICE and YIELD disagree in a 181-182 day last period.** For one
+  period or less, Microsoft's help (read 17 Nov 2026) gives
+  [PRICE](https://support.microsoft.com/en-us/office/price-function-3ea9deac-8dfa-436f-a7c8-17ea02c21b0a)
+  with `DSR = E - A` and
+  [YIELD](https://support.microsoft.com/en-us/office/yield-function-f5f5ca43-c4bd-434f-8bd2-ed3c9727a4fe)
+  with `DSR` the days from settlement to redemption. They agree in a 180-day
+  period. In a longer one PRICE's `E - A` falls to 0 or below in the last
+  days, with the faults described [above](#price-and-yield), so the engine
+  uses YIELD's reading. Both are simple interest in the last period, the
+  engine's default. COUPDAYSNC, Excel's days to the next coupon, is `E - A`
+  on its 30/360 bases in LibreOffice's Excel-compatible
+  [code](https://github.com/LibreOffice/core/blob/master/scaddins/source/analysis/analysishelper.cxx);
+  Microsoft's help says only "days to the next coupon". LibreOffice's PRICE
+  compounds through the last period (`final_period="compound"`). Which
+  reading CCIL and NDS-OM use is not known.
 
 ## Not built yet
 
