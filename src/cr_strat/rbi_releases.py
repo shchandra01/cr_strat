@@ -188,7 +188,12 @@ COLUMNS: dict[str, tuple[str, ...]] = {
                          "first_issue_date", "name_key", "notified_cr", "auction_type", *COMMON_TAIL),
 }
 DATE_COLUMNS = ("release_date", "auction_date", "settlement_date", "repayment_date", "maturity_date",
-                "first_issue_date")
+                "first_issue_date", "as_on_date", "ref_date", "reversal_date", "period_start", "period_end",
+                "week_start", "week_end", "quarter_start", "quarter_end", "programme_date")
+INTEGER_COLUMNS = ("release_id", "line", "tenor_days", "tenor_years", "maturity_year", "seq", "week_no",
+                   "allocation_no")
+FLOAT_COLUMNS = ("cutoff_price", "cutoff_yield", "wap", "way", "nc_price", "dest_cutoff_price",
+                 "dest_cutoff_yield", "acu_commission_paise")
 INDEX_COLUMNS = ("release_id", "release_date", "published", "title", "kind", "classified_by", "status", "rows",
                  "reason", "notes", "press_release_no", "source_file")
 SKIPPED_COLUMNS = ("release_id", "release_date", "title", "kind", "source_file", "reason")
@@ -406,6 +411,9 @@ class SanityLimits:
     price_range: tuple[float, float] = (50.0, 150.0)
     unknown_greenshoe_ratio: float = 1.0
     amount_tolerance_cr: float = 0.002
+    laf_excess_ratio: float = 0.001  # accepted over notified in a variable rate auction (pro-rata rounding)
+    omo_excess_ratio: float = 0.01  # total accepted over the aggregate amount notified for an OMO
+    mmo_sum_tolerance_cr: float = 0.05  # sums of the two-decimal amounts of Money Market Operations
 
 
 DEFAULT_LIMITS = SanityLimits()
@@ -430,6 +438,8 @@ class ReleaseType:
     ``detect(release)`` says whether a release's tables look like this kind;
     ``classify`` uses it when no title pattern matches. ``order`` sets the
     parsing order (announcements first, so results can use their greenshoe).
+    ``no_parser`` says why a kind is registered without a parser; it becomes
+    the reason such a release is skipped with.
     """
 
     kind: str
@@ -438,6 +448,7 @@ class ReleaseType:
     detect: Callable[[Release], bool] | None = None
     description: str = ""
     order: int = 1
+    no_parser: str = ""
 
 
 RELEASE_TYPES: dict[str, ReleaseType] = {}
@@ -1284,8 +1295,11 @@ def _t(pattern: str) -> re.Pattern:
     return re.compile(pattern, re.I)
 
 
+_NOT_SAMPLED = "no page or feed item of this kind has been sampled"
+_FULL_RESULT_FOLLOWS = "the full result follows the same day and has a parser; this entry records the time"
+
 for _rt in (
-    ReleaseType("gsec_announcement", _t(r"^auction of government of india dated securities$"),
+    ReleaseType("gsec_announcement", _t(r"^auction of government of india dated securit(?:y|ies)$"),
                 parse_gsec_announcement, _detect_header(_GSEC_ANN_HEADER), "GoI dated securities auction", 0),
     ReleaseType("tbill_announcement", _t(r"^auction of .*\btreasury bills?$"), parse_tbill_announcement,
                 _detect_header(_TBILL_ANN_HEADER), "T-bill auction", 0),
@@ -1301,19 +1315,24 @@ for _rt in (
                 _detect_header(_UW_HEADER), "Underwriting auction result"),
     ReleaseType("switch_result", _t(r"^result\s*:?\s*(?:conversion\s*/\s*)?switch auction\b"),
                 parse_switch_result, _detect_switch, "Conversion/switch auction result"),
-    # Recognised, not parsed yet: each can get a parser without other changes.
-    ReleaseType("money_market_operations", _t(r"^money market operations as on\b"),
-                description="Daily money market operations"),
-    ReleaseType("vrrr_result", _t(r"^result of the .*variable rate reverse repo\b"),
-                description="Variable rate reverse repo auction result"),
-    ReleaseType("vrrr_announcement", _t(r"\bto conduct .*variable rate reverse repo\b"),
-                description="Variable rate reverse repo auction announcement"),
-    ReleaseType("omo_result", _t(r"\bresult\b.*\bomo\b|\bomo\b.*\bresult\b"),
-                description="Open market operation result"),
-    ReleaseType("gsec_calendar", _t(r"^issuance calendar for marketable dated securities\b"),
-                description="Half-yearly GoI dated securities issuance calendar"),
-    ReleaseType("sdl_calendar", _t(r"^indicative calendar of market borrowings? by state governments?\b"),
-                description="Quarterly SDL indicative calendar"),
+    # Recognised, not parsed: the release index then records each event's kind and, for feed copies, its time.
+    ReleaseType("gsec_cutoff", _t(r"^government stock\s*[-:–]\s*auction results?\s*:\s*cut-?off$"),
+                description="GoI dated securities quick result (cut-offs)",
+                no_parser=f"not sampled; {_FULL_RESULT_FOLLOWS}"),
+    ReleaseType("tbill_cutoff", _t(r"\bt-bill auction results?\s*:\s*cut-?off$"),
+                description="T-bill quick result (cut-offs)", no_parser=f"not sampled; {_FULL_RESULT_FOLLOWS}"),
+    ReleaseType("sdl_cutoff", _t(r"^result of yield\s*/\s*price based auction of state government securities$"),
+                description="SDL quick result (cut-offs)", no_parser=_FULL_RESULT_FOLLOWS),
+    ReleaseType("underwriting_announcement", _t(r"^underwriting auction for sale of government securit(?:y|ies)\b"),
+                description="Underwriting auction announcement",
+                no_parser=f"{_NOT_SAMPLED}; the title carries the amount and the auction date, and the result "
+                          "has a parser"),
+    ReleaseType("switch_announcement", _t(r"^conversion\s*/\s*switch of government of india securities$"),
+                description="Conversion/switch auction announcement", no_parser=_NOT_SAMPLED),
+    ReleaseType("buyback_result", _t(r"^result of buyback (?:auction )?of government of india (?:dated )?securities$"),
+                description="Buyback auction result", no_parser=_NOT_SAMPLED),
+    ReleaseType("buyback_announcement", _t(r"^buyback of government of india (?:dated )?securities$"),
+                description="Buyback auction announcement", no_parser=_NOT_SAMPLED),
 ):
     register(_rt)
 
@@ -1344,19 +1363,38 @@ class ReleaseBatch:
         return pd.DataFrame([asdict(s) for s in self.skipped], columns=list(SKIPPED_COLUMNS))
 
 
+def column_type(name: str) -> str:
+    """How a table column is typed: ``'date'``, ``'time'`` (``published``), ``'int'``, ``'float'`` or ``'text'``.
+
+    ``parse_releases`` types every table by this rule, so a reader of the CSVs
+    that ``cr-strat rbi-releases`` writes can give them back the same types.
+    """
+    if name in DATE_COLUMNS:
+        return "date"
+    if name == "published":
+        return "time"
+    if name.endswith("_count") or name in INTEGER_COLUMNS:
+        return "int"
+    if name.endswith(("_cr", "_pct")) or name in FLOAT_COLUMNS:
+        return "float"
+    return "text"
+
+
+def _no_parser_reason(kind: str) -> str:
+    why = RELEASE_TYPES[kind].no_parser
+    return f"no parser for {kind}: {why}" if why else f"no parser for {kind} yet"
+
+
 def _frame(kind: str, records: list[dict]) -> pd.DataFrame:
     cols = list(COLUMNS[kind])
     df = pd.DataFrame(records, columns=cols)
     for c in cols:
-        if c in DATE_COLUMNS:
+        how = column_type(c)
+        if how in ("date", "time"):
             df[c] = pd.to_datetime(df[c])
-        elif c == "published":
-            df[c] = pd.to_datetime(df[c])
-        elif c.endswith("_count") or c in ("release_id", "line", "tenor_days", "tenor_years", "maturity_year"):
+        elif how == "int":
             df[c] = df[c].astype("Int64")
-        elif c.endswith("_cr") or c.endswith("_pct") or c in ("cutoff_price", "cutoff_yield", "wap", "way",
-                                                                "nc_price", "dest_cutoff_price",
-                                                                "dest_cutoff_yield", "acu_commission_paise"):
+        elif how == "float":
             df[c] = pd.to_numeric(df[c]).astype(float)
     if len(df):
         df = df.sort_values(["release_date", "release_id", "line"], kind="stable").reset_index(drop=True)
@@ -1464,7 +1502,7 @@ def parse_releases(sources: Iterable[str | Path | bytes], *, limits: SanityLimit
             if kind == "other" or RELEASE_TYPES[kind].parser is None:
                 unparsable[kind] = release.source_file
                 skip(release, kind, entry, f"title not recognised: {release.title!r}" if kind == "other"
-                     else f"no parser for {kind} yet")
+                     else _no_parser_reason(kind))
                 continue
             ctx = ParseContext(limits, greenshoe)
             if how == "tables":
@@ -1491,3 +1529,9 @@ def parse_releases(sources: Iterable[str | Path | bytes], *, limits: SanityLimit
     idx["release_date"] = pd.to_datetime(idx["release_date"])
     idx["published"] = pd.to_datetime(idx["published"])
     return ReleaseBatch(tables, skipped, idx)
+
+
+# Money market operations, liquidity and open market operations and the issuance calendars are parsed in
+# rbi_operations, which registers its kinds here. Importing it last, when everything it needs from this module
+# exists, makes ``import cr_strat.rbi_releases`` enough to have them, whichever of the two is imported first.
+from cr_strat import rbi_operations as _rbi_operations  # noqa: E402, F401
