@@ -365,6 +365,32 @@ def sdl_index_page(as_of: str = "November 11, 2026") -> str:
                               "https://rbidocs.example/OUTSTANDINGSGS.PDF"))
 
 
+LISTING_DAYS = [  # (date heading, [(prid, title)]) as the press-release listing groups them, newest first
+    ("Nov 16, 2026", [(63984, "RBI to conduct 2-day Variable Rate Reverse Repo (VRRR) auction under LAF on "
+                              "November 17, 2026"),
+                      (63983, "Auction of Government of India Dated Securities"),
+                      (63982, "Some unrelated release"),
+                      (63981, "Money Market Operations as on November 15, 2026")]),
+    ("Nov 13, 2026", [(63976, "Auction of State Government Securities"),
+                      (63975, "A licence cancelled")]),
+]
+
+
+def listing_page(days=LISTING_DAYS) -> str:
+    """The press-release listing (``BS_PressReleaseDisplay.aspx`` without a prid): a date row above each day's rows,
+    each a link to the release and one to its PDF. Made-up rows; the structure as seen in Nov 2026."""
+    rows = []
+    for day, items in days:
+        rows.append(f'<tr><td class="tableheader" colspan="4" align="left"><b>{day}<b></td></tr>')
+        rows += [f"<tr><td><a class='link2' href=BS_PressReleaseDisplay.aspx?prid={prid}>{escape(title)}</a></td>"
+                 f"<td nowrap colspan=3><a target='_blank' href='https://rbidocs.example/PR{prid}.PDF'>"
+                 f"<img alt='PDF - {escape(title)}'></a> <span>280 kb</span></td></tr>" for prid, title in items]
+    return ("<html><head><title>Press Releases | Test</title></head><body><form method='post' "
+            "action='./BS_PressReleaseDisplay.aspx' id='form1'><h1>Press Releases</h1>"
+            '<table width="100%" role="presentation"><tr><td>'
+            f'<table class="tablebg" width="100%">{"".join(rows)}</table></td></tr></table></form></body></html>')
+
+
 # --- Money Market Operations ------------------------------------------------------------------------
 #
 # A release is described by a dict (``mmo_friday()`` and the other days below) that the tests change before

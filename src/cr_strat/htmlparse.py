@@ -372,14 +372,32 @@ _BLOCK_TEXT = re.compile(
     r"not authori[sz]ed to view this page|the requested url was rejected|support id", re.I)
 
 
+_CHALLENGE_TEXT = re.compile(
+    r"enable javascript|javascript (?:is )?(?:required|disabled|must be enabled)|checking your browser|"
+    r"verify(?:ing)? (?:that )?you are (?:a )?human|are you a robot|captcha", re.I)
+_CHALLENGE_MAX_TEXT = 300  # a challenge page shows next to no text; a release page shows menus and footers
+
+
 def check_not_blocked(page: HtmlPage, name: str = "page") -> None:
-    """Raise ``BlockedPageError`` if ``page`` is a firewall refusal page rather than content."""
+    """Raise ``BlockedPageError`` if ``page`` is a refusal rather than content.
+
+    Two kinds are recognised: a firewall page ("Unauthorised Access ...
+    Support ID", "Request Rejected"), and a bot challenge: a page with a
+    script, no table and at most a line of text that is empty or asks for
+    JavaScript (as rbidocs.rbi.org.in serves with HTTP 200).
+    """
     if _BLOCK_TITLE.search(page.title) or (not page.tables and _BLOCK_TEXT.search(page.text)):
         m = re.search(r"support id\s*(?:is)?\s*:?\s*(\d+)", page.text, re.I)
         support = m.group(1) if m else None
         detail = f" (Support ID {support})" if support else ""
         raise BlockedPageError(f"{name}: the site refused the request{detail}: "
                                f"{page.title or page.text[:80]!r}; no data in it", support)
+    if not page.tables and len(page.text) <= _CHALLENGE_MAX_TEXT and next(page.root.iter("script"), None):
+        hidden = clean_text(" ".join(e.text() for e in page.root.iter("noscript")))
+        if not page.text or _CHALLENGE_TEXT.search(f"{page.title} {page.text} {hidden}"):
+            shown = page.text or hidden or page.title
+            raise BlockedPageError(f"{name}: a script-only page in place of content (a bot challenge): "
+                                   f"{shown[:80]!r}; no data in it")
 
 
 # A whole part: plain digits, or grouped in thousands (12,891,490) or the Indian way (1,01,908 and 12,34,567).

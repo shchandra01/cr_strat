@@ -494,14 +494,44 @@ What can be built now, with no licence:
    auction price and yield pairs. Built in
    [`bonds.py`](../src/cr_strat/bonds.py), with STRIPS, CMBs, CP and CD.
 4. **Daily store of RBI operations and money-market rates** from the RSS
-   feed. The parsers are built, in
-   [`rbi_operations.py`](../src/cr_strat/rbi_operations.py): Money Market
+   feed. Built: the parsers, in
+   [`rbi_operations.py`](../src/cr_strat/rbi_operations.py) (Money Market
    Operations, variable rate repo and reverse repo auctions, open market
    operations, the GoI issuance calendar and the total of the state
-   calendar, each release with the publication time its feed copy gives
-   ([`data/README.md`](../data/README.md)). The store itself and the feed
-   poller remain, as do parsers for the T-bill calendar, switch and buyback
-   announcements and buyback results, none of which was sampled.
+   calendar), and the store with its poller, in
+   [`rbi_store.py`](../src/cr_strat/rbi_store.py) (`cr-strat
+   rbi-store-poll`, `rbi-store-ingest`, `rbi-store-status`; layout, tables,
+   a crontab and a daily routine in [`data/README.md`](../data/README.md)).
+   A poll makes one conditional request at most, never within its minimum
+   interval, and logs it; after a block it asks nothing more that India
+   day, and a second block in a row stops it until a person resumes it.
+   Every release is kept once with the time it became public, corrections
+   are logged, failed releases are repaired by a later copy or by reading
+   the raw copies again after a parser fix, and possible gaps (ids never
+   seen, listed releases never read, days without Money Market Operations)
+   are listed; a saved press-release listing closes the gaps of releases
+   that do not matter. Five derived tables are rebuilt on every ingest:
+   daily money-market rates and liquidity with quarter-end flags, changed
+   footnote marks, a check of outstanding operations across days and the
+   policy rates kept by hand (S1, S7); liquidity auctions joined across
+   announcement, result and Money Market Operations, open market
+   operations and switches with ISINs (S4); and a supply calendar of
+   planned and announced auctions (S4). Each row says from when all its
+   values were public, and a joined row when its first part was. It is
+   meant to run from cron every 30 minutes from 08:30 to 21:00 India time
+   and once at 23:30; nothing is scheduled yet. Not built: any history
+   before the first poll (the feed holds 10 releases, a backfill page by
+   page would be blocked, and gaps are filled by hand); a history of policy
+   rates beyond what is typed in (MPC resolutions are prose; a BIS policy
+   rate series could come with item 5); parsers for the T-bill calendar,
+   switch and buyback announcements, buyback results, MPC resolutions and
+   USD/INR swap auction results (S7's durable liquidity), none of which was
+   sampled; MPC minutes and votes and FRB coupon resets (S1's floating-rate
+   coupons), whose titles are not even registered; the check that each OMO
+   cut-off and average price reproduces its yield (spec 3.1; the pricing
+   engine can do it once the announcement's maturity dates are joined);
+   the per-state amounts of the state calendar (PDFs on rbidocs). RBI's
+   permission to keep this history has not been asked.
 5. **Macro and global store** from MoSPI's API, the US publishers and BIS.
 
 Then, as licences arrive: the sovereign price panel (extend
@@ -578,3 +608,9 @@ fundamentals for S8 and S10.
 - BSE's terms and debt data; AMC Repo Clearing's haircuts; F-TRAC's fields;
   Clearcorp's charges; DTCC's terms for US repository data.
 - MoSPI's licence. The FRED terms were read only through a summarising tool.
+- Whether RBI's feed answers a conditional request with 304 (it sends an
+  ETag and a Last-Modified), whether its throttle counts feed requests, and
+  how many releases a policy day brings: the store's poller relies on none
+  of these, and its log of requests (`polls.csv`: each request's time,
+  HTTP status, ids received and ids possibly missed) will show them once it
+  runs.

@@ -33,8 +33,12 @@ Kind                          Title                                             
 
 Registered without a parser, with the reason as the skip reason
 (``ReleaseType.no_parser``): the OMO cut-off release, the Treasury bill
-calendar, MPC resolutions and USD/INR swap results. None was sampled, and a
-layout that was not seen is not guessed.
+calendar, MPC resolutions and USD/INR swap results. None was sampled, so
+none is parsed. Four layouts are read without a sample, from descriptions
+of such releases: repo (injection) auction results and announcements, and
+OMO sale results and announcements. Each is read only when its labels fit
+those descriptions, is refused otherwise, and always carries a note saying
+so; every other layout must match a sample.
 
 **Units and signs.** Amounts are ₹ crore (``_cr``): cash in the money-market
 and liquidity tables, face value for OMOs and calendars. Rates and yields are
@@ -88,8 +92,10 @@ line, so that no printed number is lost; ``item`` names the line:
   ``laf.today.msf``'s ``rate_pct``.
 * ``reserve_position`` block: ``reserves.cash_balances``,
   ``reserves.crr_requirement``, ``government.surplus_cash_balance``,
-  ``liquidity.net_durable``, each with its own ``ref_date`` (only the cash
-  balances are as on the release's day).
+  ``liquidity.net_durable``, each with its own ``ref_date``, as printed. Only
+  the cash balances are always dated the as-on day (a note says when they
+  are not); the others may be (the government surplus on 13 and 16 Nov 2026,
+  the reserve requirement on 15 Nov 2026) or not.
 
 ``as_on_date`` comes from the title and nowhere else; ``release_date`` and
 ``published`` are the publication. Refused: a title without the date; no unit
@@ -1519,8 +1525,9 @@ OPERATION_TYPES: tuple[ReleaseType, ...] = (
                 no_parser=f"{_NOT_SAMPLED} (RBI's site refused the one request made for it)"),
     ReleaseType("mpc_resolution", _t(r"\bresolution of the monetary policy committee\b"),
                 description="Monetary Policy Committee resolution",
-                no_parser="prose, six a year, not sampled: keep the policy rates by hand and check them against "
-                          "the SDF and MSF rates of money_market_operations"),
+                no_parser="prose, six a year, not sampled: enter the rates in a policy-rates table "
+                          "(cr-strat rbi-store-ingest --policy-rates), which the store checks against the SDF and MSF "
+                          "rates of money_market_operations"),
     ReleaseType("fx_swap_result", _t(r"^result of the usd/inr (?:buy/sell|sell/buy) swap auction\b"),
                 description="USD/INR swap auction result", no_parser=_NOT_SAMPLED),
 )

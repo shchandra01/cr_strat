@@ -7,7 +7,7 @@ import pytest
 import rbi_fixtures as fx
 
 from cr_strat import rbi_releases as rr
-from cr_strat.htmlparse import BlockedPageError, parse_count, parse_date, parse_html, parse_number
+from cr_strat.htmlparse import BlockedPageError, check_not_blocked, parse_count, parse_date, parse_html, parse_number
 
 D = dt.date
 T = pd.Timestamp
@@ -136,6 +136,98 @@ def test_blocked_and_frameless_pages():
     assert info.value.support_id == "123456789"
     with pytest.raises(rr.ReleaseParseError, match="no press-release frame"):
         rr.read_release_page("<html><body><table><tr><td>x</td></tr></table></body></html>")
+
+
+def test_a_script_only_page_is_refused_as_a_bot_challenge():
+    challenge = ("<html><head><script>document.cookie='t=1';location.reload();</script></head><body><noscript>"
+                 "Please enable JavaScript to view this page.</noscript></body></html>")
+    with pytest.raises(BlockedPageError, match="a script-only page in place of content"):
+        check_not_blocked(parse_html(challenge), "p")
+    with pytest.raises(BlockedPageError, match="bot challenge"):  # nothing at all but a script
+        check_not_blocked(parse_html("<html><head><script>x()</script></head><body></body></html>"))
+    check_not_blocked(parse_html("<html><script>x()</script><body><p>Resolution of the Monetary Policy Committee"
+                                 "</p></body></html>"))  # prose without a table is content
+    check_not_blocked(parse_html(fx.release_page("Some unrelated release", "Nov 16, 2026", fx.body("Text."))))
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("Mon, 16 Nov 2026 19:25:00", dt.datetime(2026, 11, 16, 19, 25)),  # RBI's form: India time, no zone
+    ("Mon, 16 Nov 2026 19:25", dt.datetime(2026, 11, 16, 19, 25)),
+    ("16 Nov 2026 19:25:00", dt.datetime(2026, 11, 16, 19, 25)),
+    ("Mon, 16 Nov 2026 13:55:00 GMT", dt.datetime(2026, 11, 16, 19, 25)),
+    ("Mon, 16 Nov 2026 13:55:00 +0000", dt.datetime(2026, 11, 16, 19, 25)),
+    ("Mon, 16 Nov 2026 19:25:00 +0530", dt.datetime(2026, 11, 16, 19, 25)),
+    ("Mon, 16 Nov 2026 19:25:00 IST", dt.datetime(2026, 11, 16, 19, 25)),
+    ("Mon, 16 Nov 2026 08:55:00 -0500", dt.datetime(2026, 11, 16, 19, 25)),
+    ("Mon, 16 Nov 2026 19:25:00 +1400", dt.datetime(2026, 11, 16, 10, 55)),  # the zones at the ends of the world
+    ("Mon, 16 Nov 2026 19:25:00 -1200", dt.datetime(2026, 11, 17, 12, 55)),
+    ("Mon, 16 Nov 2026 19:25:00 +0545", dt.datetime(2026, 11, 16, 19, 10)),
+])
+def test_read_pubdate_takes_rbis_form_and_explicit_zones(text, expected):
+    assert rr.read_pubdate(text) == (expected, "")
+
+
+@pytest.mark.parametrize("text, reason", [
+    ("Mon, 16 Nov 2026 13:55:00 -0000", "zone -0000 means the zone is not known"),
+    ("Mon, 16 Nov 2026 7:25 PM", "is not in the form 'Mon, 16 Nov 2026 19:25:00'"),
+    ("16/11/2026 19:25", "is not in the form 'Mon, 16 Nov 2026 19:25:00'"),
+    ("Tue, 16 Nov 2026 19:25:00", "16 Nov 2026 is a Mon, not a Tue"),
+    ("Mon, 16 Nov 2026 19:25:00 EST", "zone 'EST' is not known here"),
+    ("Tue, 31 Nov 2026 19:25:00", "is not a date and time"),
+    ("", "no pubDate: the publication time is not known"),
+    ("Mon, 16 Nov 2026 19:25:00 +0560", "zone +0560 is not a time zone"),  # 60 minutes, not 06:00
+    ("Mon, 16 Nov 2026 19:25:00 +2400", "zone +2400 is not a time zone"),
+    ("Mon, 16 Nov 2026 19:25:00 -1300", "zone -1300 is not a time zone"),
+    ("Fri, 31 Dec 9999 23:00:00 -0100", "in India time it falls outside the years 1 to 9999"),
+])
+def test_a_pubdate_that_cannot_be_placed_gives_no_time_and_a_note(text, reason):
+    published, problem = rr.read_pubdate(text)
+    assert published is None and reason in problem
+    batch = _parse(fx.feed([dict(title="Some unrelated release", prid=63979, pub=text, html=fx.body("Text."))]))
+    entry = batch.releases.iloc[0]
+    assert pd.isna(entry["published"]) and pd.isna(entry["release_date"]) and reason in entry["notes"]
+
+
+def test_every_numeric_zone_is_converted_exactly_or_refused_and_none_raises():
+    india = dt.timezone(dt.timedelta(hours=5, minutes=30))
+    converted = 0
+    for sign in "+-":
+        for value in range(10000):
+            hours, minutes = divmod(value, 100)
+            zone = f"{sign}{value:04d}"
+            published, problem = rr.read_pubdate(f"Mon, 16 Nov 2026 19:25:00 {zone}")
+            if minutes < 60 and hours * 60 + minutes <= (14 if sign == "+" else 12) * 60 and zone != "-0000":
+                offset = dt.timedelta(hours=hours, minutes=minutes) * (1 if sign == "+" else -1)
+                expected = dt.datetime(2026, 11, 16, 19, 25, tzinfo=dt.timezone(offset)).astimezone(india)
+                assert (published, problem) == (expected.replace(tzinfo=None), ""), zone
+                converted += 1
+            else:
+                assert published is None and problem, zone
+    assert converted == 841 + 720  # +0000 to +1400 and -0001 to -1200, minutes 00 to 59
+
+
+def test_one_item_s_impossible_zone_costs_its_own_time_and_not_the_feed():
+    items = [dict(title="Some unrelated release", prid=63979, pub="Mon, 16 Nov 2026 11:00:00 +2400",
+                  html=fx.body("Text.")), fx.mmo_item(fx.mmo_friday())]
+    feed = rr.read_rss_feed(fx.feed(items))
+    assert [i.release_id for i in feed.items] == [63979, 63977]
+    assert feed.items[0].published is None and "zone +2400 is not a time zone" in feed.items[0].pubdate_problem
+    assert feed.items[1].published is not None and feed.items[1].pubdate_problem == ""
+    batch = _parse(fx.feed(items))
+    assert batch.releases.set_index("release_id").loc[63977, "status"] == "parsed"
+
+
+def test_read_release_listing_gives_ids_dates_and_titles():
+    listed = rr.read_release_listing(fx.listing_page().encode(), name="pr_list.html")
+    assert [(x.release_id, x.release_date, x.title) for x in listed][:2] == [
+        (63984, D(2026, 11, 16), "RBI to conduct 2-day Variable Rate Reverse Repo (VRRR) auction under LAF on "
+                                 "November 17, 2026"),
+        (63983, D(2026, 11, 16), "Auction of Government of India Dated Securities")]
+    assert [(x.release_id, x.release_date) for x in listed][4:] == [(63976, D(2026, 11, 13)),
+                                                                   (63975, D(2026, 11, 13))]
+    assert {x.source_file for x in listed} == {"pr_list.html"}
+    with pytest.raises(rr.ReleaseParseError, match="not a press-release listing"):
+        rr.read_release_listing(_goi_page().encode(), name="goi.html")
 
 
 def _switch_item(prid=63982, pub="Mon, 16 Nov 2026 14:55:00"):

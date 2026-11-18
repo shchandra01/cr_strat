@@ -600,7 +600,9 @@ def test_mmo_feed_item_without_a_publication_time():
     batch = _parse(fx.feed([dict(fx.mmo_item(fx.mmo_friday()), pub="")]))
     df = batch.tables[ro.MMO]
     assert len(df) == 25 and df["release_date"].isna().all() and df["published"].isna().all()
-    assert df["as_on_date"].eq(T("2026-11-13")).all() and _notes(batch) == ""  # nothing to check the day against
+    # nothing to check the publication day against; the missing pubDate is the one note
+    assert df["as_on_date"].eq(T("2026-11-13")).all()
+    assert _notes(batch) == "no pubDate: the publication time is not known"
 
 
 def test_mmo_headings_of_the_two_blocks_are_required_once():

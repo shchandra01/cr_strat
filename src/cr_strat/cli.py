@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
+import math
 import sys
 from dataclasses import asdict, replace
 from pathlib import Path
 
 import pandas as pd
 
+from cr_strat import rbi_store
 from cr_strat.amfi_debt_trades import build_mf_trades, mapping_report, to_price_trades
 from cr_strat.auctions import (
     REPORT_COLUMNS,
@@ -271,6 +274,102 @@ def _rbi_releases(args: argparse.Namespace) -> int:
     for s in batch.skipped:
         print(f"skipped {s.release_id or '-'} ({s.kind}, {s.source_file}): {s.reason}")
     return 0
+
+
+def _clock() -> dt.datetime:
+    """The wall clock, read once per command: library code takes the time as an argument."""
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def _store_failed(command: str, exc: Exception) -> int:
+    """One line on stderr, the cron-friendly way, and the store's exit code for errors."""
+    message = " ".join(str(exc).split()) or type(exc).__name__
+    if not isinstance(exc, (rbi_store.StoreError, ValueError, OSError)):
+        message = f"{type(exc).__name__}: {message}"
+    print(f"{command}: error: {message}", file=sys.stderr)
+    return rbi_store.EXIT_ERROR
+
+
+def _rbi_store_poll(args: argparse.Namespace) -> int:
+    try:
+        result = rbi_store.poll(args.store, now=_clock(), url=args.url,
+                                min_interval=dt.timedelta(minutes=args.min_interval), user_agent=args.user_agent,
+                                timeout=args.timeout, keep_raw=not args.no_raw, resume=args.resume)
+    except Exception as exc:  # cron wants one line and an exit code, not a traceback
+        return _store_failed("rbi-store-poll", exc)
+    stream = sys.stdout if result.exit_code == rbi_store.EXIT_OK else sys.stderr
+    # every exit 1 says "error:", as _store_failed does: the daily grep of the log (data/README.md) relies on it
+    tag = "error: " if result.exit_code == rbi_store.EXIT_ERROR else ""
+    print(f"rbi-store-poll: {tag}{result.message}", file=stream)
+    for line in result.attention:  # on stderr, so that a cron job that mails its errors mails these too
+        print(f"rbi-store-poll: needs a look: {line}", file=stream)
+    return result.exit_code
+
+
+def _rbi_store_ingest(args: argparse.Namespace) -> int:
+    try:
+        report = rbi_store.ingest(args.store, args.files, now=_clock(), keep_raw=not args.no_raw, master=args.master,
+                                  policy_rates=args.policy_rates)
+    except Exception as exc:
+        return _store_failed("rbi-store-ingest", exc)
+    print(f"rbi-store-ingest: {report.summary()}")
+    for name, reason in report.unreadable:
+        print(f"unreadable {name}: {reason}")
+    for release_id, kind, reason in report.failed:
+        print(f"failed {release_id} ({kind}): {reason}")
+    if report.derive_error:
+        print(f"rbi-store-ingest: error: derived tables not rebuilt: {report.derive_error} (the previous ones are "
+              "kept; the parsed rows and raw copies were saved)", file=sys.stderr)
+        return rbi_store.EXIT_ERROR
+    return rbi_store.EXIT_OK
+
+
+def _rbi_store_status(args: argparse.Namespace) -> int:
+    try:
+        report = rbi_store.status(args.store, now=_clock())
+    except Exception as exc:
+        return _store_failed("rbi-store-status", exc)
+    for line in report.lines():
+        print(line)
+    return rbi_store.EXIT_OK
+
+
+def _minutes_arg(text: str) -> float:
+    """``--min-interval``: every value the poll would refuse, or overflow on, is a usage error here (exit 2)."""
+    most = rbi_store.MAX_MIN_INTERVAL.total_seconds() / 60
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number of minutes: {text!r}") from None
+    if not math.isfinite(value) or not 1 <= value <= most:
+        raise argparse.ArgumentTypeError(f"at least 1 minute and at most {most:g} (a day), and finite, not {text}")
+    return value
+
+
+def _seconds_arg(text: str) -> float:
+    """``--timeout``: positive, finite and at most ``rbi_store.MAX_TIMEOUT``; checked before anything is recorded."""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number of seconds: {text!r}") from None
+    if not math.isfinite(value) or not 0 < value <= rbi_store.MAX_TIMEOUT:
+        raise argparse.ArgumentTypeError(f"a positive, finite number of seconds, at most {rbi_store.MAX_TIMEOUT:g}, "
+                                         f"not {text}")
+    return value
+
+
+def _user_agent_arg(text: str) -> str:
+    try:
+        return rbi_store.check_user_agent(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+
+
+def _feed_url_arg(text: str) -> str:
+    try:
+        return rbi_store.check_url(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
 
 
 def _sovereign_master(args: argparse.Namespace) -> int:
@@ -591,6 +690,43 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--out-dir", required=True,
                    help="one CSV per release kind plus releases.csv; re-running replaces a release's rows")
     p.set_defaults(func=_rbi_releases)
+
+    p = sub.add_parser("rbi-store-poll", help="fetch RBI's press-release feed once, if due, into a store (for cron); "
+                                              "exit 0 ok, 4 ok but needs a look, 3 blocked, cooling down or "
+                                              "stopped, 1 other errors, 2 bad arguments")
+    p.add_argument("--store", required=True, help="store directory, created on first use")
+    p.add_argument("--url", type=_feed_url_arg, default=rbi_store.FEED_URL,
+                   help="feed address (default: RBI's press-release feed)")
+    p.add_argument("--min-interval", type=_minutes_arg, default=25,
+                   help="minutes: no request if the last one, answered or not, was more recent (default 25; set it a "
+                        "little below the cron period; at most 1440)")
+    p.add_argument("--user-agent", type=_user_agent_arg, default=rbi_store.DEFAULT_USER_AGENT,
+                   help="client name sent with the request, one line of visible ASCII: keep it generic, nothing that "
+                        "names you or the firm")
+    p.add_argument("--timeout", type=_seconds_arg, default=60.0,
+                   help=f"seconds to wait for the answer (default 60, at most {rbi_store.MAX_TIMEOUT:g})")
+    p.add_argument("--no-raw", action="store_true", help="keep no raw copy of a new feed")
+    p.add_argument("--resume", action="store_true",
+                   help="end a stop or a cool-down after a block: the operator's decision, once the site has been "
+                        "checked in a browser (never in cron)")
+    p.set_defaults(func=_rbi_store_poll)
+
+    p = sub.add_parser("rbi-store-ingest", help="add saved RBI pages, feed copies and press-release listings to a "
+                                                "store; rebuild its gaps and derived tables")
+    p.add_argument("files", nargs="*", help="saved BS_PressReleaseDisplay pages (a release, or the listing) and "
+                                            "pressreleases_rss.xml copies")
+    p.add_argument("--store", required=True, help="store directory, created on first use")
+    p.add_argument("--master", help="security master CSV (sovereign-master), kept in the store for the OMO and switch "
+                                    "ISINs")
+    p.add_argument("--policy-rates", help="policy rates entered by hand (CSV: effective_date, repo_pct, sdf_pct, "
+                                          "msf_pct, source), kept in the store and checked against each day's corridor")
+    p.add_argument("--no-raw", action="store_true", help="keep no raw copy of the feeds and pages read")
+    p.set_defaults(func=_rbi_store_ingest)
+
+    p = sub.add_parser("rbi-store-status", help="what a store holds: rows and dates per kind, possible gaps, failed "
+                                                "releases, the poller's state")
+    p.add_argument("--store", required=True, help="store directory")
+    p.set_defaults(func=_rbi_store_status)
 
     p = sub.add_parser("sovereign-master", help="one row per G-sec ISIN from saved RBI security lists")
     p.add_argument("--goi-list", nargs="*", default=[], help="saved 'GoI securities outstanding' pages (Id=1956)")

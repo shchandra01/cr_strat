@@ -395,3 +395,236 @@ def test_auctions_command_reads_competitive_only_rows(tmp_path):
         assert main(["auctions", "--fimmda-gsec", str(gsec), "--competitive-only", choice, "--out-dir", str(out)]) == 0
         issue = read_ledger(out / "ledger.csv").iloc[0]
         assert (issue["amount_cr"], issue["amount_basis"]) == (amount, basis)
+
+
+def _fixed_clock(monkeypatch, start):
+    """Make the commands read ``start`` from the clock; the returned list's first item moves it."""
+    import cr_strat.cli as cli
+
+    clock = [start]
+    monkeypatch.setattr(cli, "_clock", lambda: clock[0])
+    return clock
+
+
+def test_rbi_store_poll_exit_codes_and_one_line_messages(tmp_path, capsys, monkeypatch):
+    import datetime as dt
+
+    import rbi_fixtures as fx
+
+    from cr_strat import rbi_store
+
+    feed = fx.feed([fx.mmo_item(fx.mmo_saturday()), fx.mmo_item(fx.mmo_friday())])
+    answers = [rbi_store.FeedResponse(200, {"etag": 'W/"a:0"'}, feed), rbi_store.FeedResponse(418, {}, b""),
+               rbi_store.FeedResponse(503, {}, b"")]
+    sent = []
+
+    def transport(url, headers, timeout):  # stands in for the network
+        sent.append((url, headers))
+        return answers.pop(0)
+
+    monkeypatch.setattr(rbi_store, "urllib_transport", transport)
+    clock = _fixed_clock(monkeypatch, dt.datetime(2026, 11, 16, 4, 0, tzinfo=dt.timezone.utc))
+    store = str(tmp_path / "store")
+    expected = [  # (minutes later, extra arguments, exit code, stream, message)
+        (0, [], 0, "out", "new: 2 new releases (63977, 63980), 0 revised, 0 repaired, 0 failed; 2 items in the feed"),
+        (10, [], 0, "out", "too soon: the last request was at 2026-11-16T04:00:00Z (10 min ago); the minimum interval "
+                           "is 25 min"),
+        (30, [], 3, "err", "blocked: HTTP 418; no request before 2026-11-17T02:30:00Z (08:00 India time the next day); "
+                           "a block of the next request stops the poller"),
+        (60, [], 3, "err", "cooling down after HTTP 418 at 2026-11-16T04:30:00Z: no request before "
+                           "2026-11-17T02:30:00Z"),
+        (400, ["--resume"], 1, "err",  # the operator's decision
+         "error: server error: HTTP 503; the next poll tries again"),
+    ]
+    start = clock[0]
+    for minutes, extra, code, stream, message in expected:
+        clock[0] = start + dt.timedelta(minutes=minutes)
+        assert main(["rbi-store-poll", "--store", store, *extra]) == code
+        captured = capsys.readouterr()
+        assert getattr(captured, stream) == f"rbi-store-poll: {message}\n"
+        assert getattr(captured, "err" if stream == "out" else "out") == ""
+    assert len(sent) == 3 and all(url == rbi_store.FEED_URL for url, _ in sent)
+    assert sent[1][1]["If-None-Match"] == 'W/"a:0"'
+
+    page = tmp_path / "mmo_63981.html"
+    page.write_text(fx.mmo_page(fx.mmo_sunday()), encoding="utf-8")
+    assert main(["rbi-store-ingest", str(page), "--store", store]) == 0
+    assert capsys.readouterr().out == ("rbi-store-ingest: 1 release in 1 copy from 1 input, 1 new, 0 revised, "
+                                       "0 repaired, 0 failed; 4 files written\n")  # with the page's raw copy
+    assert main(["rbi-store-status", "--store", store]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert "releases: 3 (3 parsed); ids 63977 to 63981; last change 2026-11-16T16:10:00" in lines
+    assert "possible gaps, days without Money Market Operations: none" in lines
+    assert any(line.startswith("poller: last request 2026-11-16T10:40:00Z: server_error (HTTP 503)") for line in lines)
+    daily = pd.read_csv(tmp_path / "store" / "derived" / "money_market_daily.csv")
+    assert daily["as_on_date"].tolist() == ["2026-11-13", "2026-11-14", "2026-11-15"]
+    assert daily["public_from_source"].tolist() == ["feed", "feed", "release_date"]
+
+
+def test_the_documented_daily_grep_flags_every_poll_that_exits_non_zero_and_no_other(tmp_path, capsys, monkeypatch):
+    import datetime as dt
+    import json
+
+    import rbi_fixtures as fx
+
+    from cr_strat import rbi_store
+
+    readme = (Path(__file__).resolve().parents[1] / "data" / "README.md").read_text(encoding="utf-8")
+    patterns = re.findall(r"grep -E\s+'([^']+)'", readme)
+    assert len(patterns) == 1
+    documented = re.compile(patterns[0])
+    feed = fx.feed([fx.mmo_item(fx.mmo_saturday()), fx.mmo_item(fx.mmo_friday())])
+    broken = fx.mmo_friday()
+    broken["net_total"] = "-1,70,000.00"
+    good = rbi_store.FeedResponse(200, {"etag": 'W/"a:0"'}, feed)
+    page = b"<html><head><title>Maintenance</title></head><body><p>Back soon</p></body></html>"
+    start = dt.datetime(2026, 11, 16, 4, 0, tzinfo=dt.timezone.utc)
+    clock = _fixed_clock(monkeypatch, start)
+    seen = {}
+
+    def poll(name, answer, hours=0.0, *extra):
+        monkeypatch.setattr(rbi_store, "urllib_transport", lambda url, headers, timeout: answer)
+        clock[0] = start + dt.timedelta(hours=hours)
+        code = main(["rbi-store-poll", "--store", str(tmp_path / name), *extra])
+        captured = capsys.readouterr()
+        lines = (captured.out + captured.err).splitlines()
+        seen.setdefault(code, []).append(lines[0])
+        assert bool(documented.search("\n".join(lines))) == (code != 0), (code, lines)
+
+    poll("ok", good)  # new
+    poll("ok", good, 0.2)  # too soon
+    poll("ok", good, 1)  # unchanged
+    poll("ok", rbi_store.FeedResponse(304, {}, b""), 2)  # not modified
+    poll("look", rbi_store.FeedResponse(200, {}, fx.feed([fx.mmo_item(broken)])))  # a release that did not parse
+    poll("block", rbi_store.FeedResponse(418, {}, b""))
+    poll("block", good, 1)  # cooling down
+    poll("block", rbi_store.FeedResponse(418, {}, b""), 24)  # the second block in a row: stopped
+    poll("block", good, 25)
+    for n, answer in enumerate([rbi_store.FeedResponse(503, {}, b""), rbi_store.FeedResponse(None, error="URLError"),
+                                rbi_store.FeedResponse(301, {"location": "https://www.rbi.org.in/new/feed.xml"}, b""),
+                                rbi_store.FeedResponse(404, {}, b""), rbi_store.FeedResponse(200, {}, page),
+                                rbi_store.FeedResponse(200, {}, feed[:500]),
+                                rbi_store.FeedResponse(200, {}, b"<rss><channel><title>x</title></channel></rss>"),
+                                rbi_store.FeedResponse(200, {"content-encoding": "gzip"}, b"not gzip")]):
+        poll(f"error{n}", answer)
+    poll("ok", good, -3)  # the clock moved back
+    (tmp_path / "ok" / "store.lock").write_text("{}", encoding="utf-8")
+    poll("ok", good, 3)  # locked
+    (tmp_path / "ok" / "store.lock").unlink()
+    state = json.loads((tmp_path / "ok" / "state.json").read_text(encoding="utf-8"))
+    state["poller"]["blocks"] = "two"
+    (tmp_path / "ok" / "state.json").write_text(json.dumps(state), encoding="utf-8")
+    poll("ok", good, 4)  # a damaged state
+    assert {code: len(lines) for code, lines in seen.items()} == {0: 4, 1: 11, 3: 4, 4: 1}
+    assert all(line.startswith("rbi-store-poll: error: ") for line in seen[1])
+    assert ("rbi-store-poll: error: HTTP 301 to https://www.rbi.org.in/new/feed.xml, not followed; the next poll "
+            "tries again") in seen[1]
+
+
+def test_rbi_store_ingest_reruns_without_change_and_its_tables_feed_the_auctions_command(tmp_path, capsys, monkeypatch):
+    import datetime as dt
+
+    src = _release_files(tmp_path)
+    files = [str(p) for p in sorted(src.iterdir())]
+    store = tmp_path / "store"
+    clock = _fixed_clock(monkeypatch, dt.datetime(2026, 11, 17, 4, 0, tzinfo=dt.timezone.utc))
+    assert main(["rbi-store-ingest", *files, "--store", str(store)]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == ("rbi-store-ingest: 3 releases in 3 copies from 3 inputs, 3 new, 0 revised, 0 repaired, "
+                        "0 failed, 1 unreadable; 12 files written")  # the page's raw copy and switch_operations too
+    assert lines[1].startswith("unreadable strips_3973.html: strips_3973.html: the site refused the request")
+    first = {str(p.relative_to(store)): p.read_bytes() for p in store.rglob("*") if p.is_file()}
+    clock[0] += dt.timedelta(days=1)
+    assert main(["rbi-store-ingest", *reversed(files), "--store", str(store)]) == 0
+    assert capsys.readouterr().out.splitlines()[0].endswith("; no file changed")
+    assert {str(p.relative_to(store)): p.read_bytes() for p in store.rglob("*") if p.is_file()} == first
+    index = pd.read_csv(store / "releases.csv").set_index("release_id")
+    assert index.loc[63969, "status"] == "no_parser" and index.loc[63982, "published"] == "2026-11-16T14:55:00"
+
+    assert main(["auctions", "--releases", str(store / "tables"), "--out-dir", str(tmp_path / "ledger")]) == 0
+    auctions = pd.read_csv(tmp_path / "ledger" / "auctions.csv")
+    assert "6.94% GS 2036" in set(auctions["security"])
+
+
+def test_rbi_store_commands_report_errors_in_one_line(tmp_path, capsys):
+    store = tmp_path / "store"
+    store.mkdir()
+    (store / "store.lock").write_text("{}", encoding="utf-8")
+    assert main(["rbi-store-ingest", "--store", str(store)]) == 1
+    err = capsys.readouterr().err
+    assert err == (f"rbi-store-ingest: error: store {store} is locked by a command. Wait for that command to end; if "
+                   f"none is running, delete {store / 'store.lock'}.\n")
+    assert main(["rbi-store-status", "--store", str(tmp_path / "none")]) == 1
+    assert capsys.readouterr().err == f"rbi-store-status: error: {tmp_path / 'none'}: no store here (neither " \
+                                      "releases.csv nor state.json)\n"
+    assert main(["rbi-store-ingest", str(tmp_path / "missing.html"), "--store", str(tmp_path / "s")]) == 1
+    assert capsys.readouterr().err.count("\n") == 1 and not (tmp_path / "s").exists()
+    for argv, message in ((["--url", "https://rbidocs.rbi.org.in/x.xml"], "bot challenge"),
+                          (["--min-interval", "0.5"], "at least 1 minute"), (["--min-interval", "inf"], "finite"),
+                          (["--timeout", "-1"], "positive, finite"), (["--timeout", "inf"], "positive, finite"),
+                          (["--timeout", "nan"], "positive, finite"),
+                          # values the poll would overflow on, or the standard library refuse once under way
+                          (["--min-interval", "1e20"], "at most 1440"), (["--min-interval", "1441"], "at most 1440"),
+                          (["--timeout", "1e10"], "at most 600"), (["--timeout", "601"], "at most 600"),
+                          (["--user-agent", ""], "one non-empty line"), (["--user-agent", "a\tb"], "visible ASCII"),
+                          (["--user-agent", "feed reader ₹"], "visible ASCII"),
+                          (["--url", "https://www.rbi.org.in/a b.xml"], "without spaces"),
+                          (["--url", "https://www.rbi.org.in:99999/x.xml"], "port must be a number"),
+                          (["--url", "https://www.rbi.org.in:abc/x.xml"], "port must be a number")):
+        with pytest.raises(SystemExit) as stop:  # a bad argument is a usage error, before anything is recorded
+            main(["rbi-store-poll", "--store", str(tmp_path / "p"), *argv])
+        assert stop.value.code == 2 and message in capsys.readouterr().err, argv
+    assert not (tmp_path / "p").exists()
+
+
+def test_rbi_store_poll_exits_4_with_what_needs_a_look_on_stderr(tmp_path, capsys, monkeypatch):
+    import datetime as dt
+
+    import rbi_fixtures as fx
+
+    from cr_strat import rbi_store
+
+    broken = fx.mmo_friday()
+    broken["net_total"] = "-1,70,000.00"  # line F no longer adds up: the release is refused
+    feed = fx.feed([fx.mmo_item(fx.mmo_saturday()), fx.mmo_item(broken)])
+    monkeypatch.setattr(rbi_store, "urllib_transport", lambda url, headers, timeout: rbi_store.FeedResponse(
+        200, {}, feed))
+    _fixed_clock(monkeypatch, dt.datetime(2026, 11, 16, 4, 0, tzinfo=dt.timezone.utc))
+    assert main(["rbi-store-poll", "--store", str(tmp_path / "store")]) == 4
+    captured = capsys.readouterr()
+    lines = captured.err.splitlines()
+    assert captured.out == "" and lines[0] == ("rbi-store-poll: new: 2 new releases (63977, 63980), 0 revised, "
+                                               "0 repaired, 1 failed; 2 items in the feed")
+    assert lines[1].startswith("rbi-store-poll: needs a look: release 63977 (money_market_operations) did not parse: "
+                               "failed check: ") and len(lines) == 2
+
+
+def test_rbi_store_ingest_takes_policy_rates_and_listings_and_reports_a_failed_rebuild(tmp_path, capsys,
+                                                                                         monkeypatch):
+    import datetime as dt
+
+    import rbi_fixtures as fx
+
+    from cr_strat import rbi_store
+
+    _fixed_clock(monkeypatch, dt.datetime(2026, 11, 17, 4, 0, tzinfo=dt.timezone.utc))
+    store, table, listing = tmp_path / "store", tmp_path / "policy.csv", tmp_path / "pr_list.html"
+    table.write_text("effective_date,repo_pct,sdf_pct,msf_pct,source\n2026-10-07,5.50,5.25,5.75,MPC\n",
+                     encoding="utf-8")
+    listing.write_text(fx.listing_page(), encoding="utf-8")
+    page = tmp_path / "mmo_63977.html"
+    page.write_text(fx.mmo_page(fx.mmo_friday()), encoding="utf-8")
+    assert main(["rbi-store-ingest", str(page), str(listing), "--store", str(store), "--policy-rates",
+                 str(table)]) == 0
+    assert capsys.readouterr().out.startswith("rbi-store-ingest: 1 release in 1 copy from 2 inputs, 1 new, 0 revised, "
+                                              "0 repaired, 0 failed, 6 listed (title and date only); ")
+    daily = pd.read_csv(store / "derived" / "money_market_daily.csv", dtype=str, keep_default_na=False)
+    assert daily[["repo_rate_pct", "policy_check"]].values.tolist() == [["5.5", "agrees"]]
+
+    def broken(*args, **kwargs):
+        raise ValueError("a bug")
+
+    monkeypatch.setattr(rbi_store, "derive", broken)
+    assert main(["rbi-store-ingest", "--store", str(store)]) == 1
+    assert capsys.readouterr().err == ("rbi-store-ingest: error: derived tables not rebuilt: ValueError: a bug (the "
+                                       "previous ones are kept; the parsed rows and raw copies were saved)\n")

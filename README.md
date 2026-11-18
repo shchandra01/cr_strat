@@ -75,6 +75,9 @@ cr-strat event-prices --events data/out/rating_events.csv --panel data/out/price
 cr-strat bond-price --coupon 6.94 --maturity 2036-05-11 --settlement 2026-11-16 --price 97.43
 
 cr-strat rbi-releases data/raw/rbi/releases/*.html data/raw/rbi/feeds/*.xml --out-dir data/out/rbi
+cr-strat rbi-store-poll --store data/rbi_store            # one request at most; run it from cron (data/README.md)
+cr-strat rbi-store-ingest --store data/rbi_store data/raw/rbi/releases/*.html --master data/out/sovereign_master.csv
+cr-strat rbi-store-status --store data/rbi_store
 cr-strat sovereign-master --goi-list data/raw/rbi/goi_outstanding_*.html --far data/raw/rbi/far.html \
     --snapshots data/out/goi_outstanding.csv --out data/out/sovereign_master.csv
 cr-strat auctions --fimmda-gsec data/raw/fimmda/Gsec_Auction_data_*.xlsx --fimmda-sdl data/raw/fimmda/SDL_*.xlsx \
@@ -106,6 +109,7 @@ the pressure variable and the price response for each event.
 | `htmlparse` | Tables, text and links from saved HTML pages with the standard library: nested tables kept apart, colspan and rowspan expanded; strict number and date cells; firewall-page detection |
 | `rbi_releases` | RBI press releases from saved pages and the RSS feed: GoI, T-bill and SDL auction results, underwriting and switch results, auction announcements. A registry of release types; checks that refuse a release rather than misread it |
 | `rbi_operations` | The other RBI releases of that registry: the daily Money Market Operations (one row per printed line: call, triparty and market repo rates and volumes, the SDF-MSF corridor, every liquidity operation, net liquidity, reserves), variable rate repo and reverse repo auctions, open market operations, the GoI and state issuance calendars |
+| `rbi_store` | A daily store fed by RBI's press-release feed: a poller that makes one conditional request at most, never within its minimum interval, logs every request, asks nothing more that India day after a block and stops after a second block in a row until resumed by hand; ingest that keeps each release and every copy read once, logs corrected rows, repairs failed releases (also from its raw copies after a parser fix, which bring every entry up to date), reads RBI's press-release listing and lists possible gaps (ids never seen, listed releases never read, days without Money Market Operations); derived tables of daily money-market rates and liquidity (with quarter-end flags, changed footnote marks, a check of outstanding operations across days and policy rates kept by hand), liquidity auctions joined across announcement, result and Money Market Operations, open market operations and switches with ISINs, and a supply calendar, each row with the time from which all its values were public. Atomic, locked writes |
 | `sovereign` | Sovereign security names (G-sec, SDL, T-bill, FRB, green bond) parsed to a join key; state codes; RBI's GoI-outstanding and FAR lists; a master with one row per ISIN; name-to-ISIN matching |
 | `auctions` | One table of G-sec, SDL and T-bill auctions from FIMMDA's yearly and SDL workbooks, RBI's Handbook Table 221 and RBI's releases: ISINs, settlement dates, and a check that the cut-off price reproduces the printed yield, which infers settlement and missing maturity dates |
 | `issuance` | Ledger of issues, reissues, switches, buybacks and maturities per ISIN; outstanding stock on any date, backward from RBI's lists or forward, with completeness flags; reconciliation with RBI's list; supply by month and tenor bucket |
@@ -160,14 +164,38 @@ the pressure variable and the price response for each event.
   security with no known maturity date (FRB 2024) is redeemed on a
   placeholder date, the last business day of the year in its name.
 - **The RBI parsers have seen one or two saved releases per type** (Nov
-  2026; Money Market Operations on four consecutive days, Friday to Monday).
+  2026, but the OMO releases are of Mar 2026, the GoI calendar of Sep 2026
+  and the state calendar of Oct 2026; Money Market Operations on four
+  consecutive days, Friday to Monday).
   A GoI result with several securities or for a new issue, an FRB result and
   the feed titles of full results were not sampled; a page whose labels
   differ is refused, not guessed. Not sampled either: Money Market
   Operations for a weekday holiday, with a repo auction, with a filled
   fixed-rate line or from before 30 Sep 2025; any repo (injection) auction
   or OMO sale (read only if the labels fit descriptions of such releases,
-  and noted); the T-bill calendar, switch and buyback announcements and
-  buyback results, which have no parser. RBI's SDL and STRIPS lists sit
+  and noted); the T-bill calendar, switch and buyback announcements,
+  buyback results, MPC resolutions and USD/INR swap auction results, which
+  are recognised but have no parser; MPC minutes and FRB coupon resets,
+  which are not even recognised. RBI's SDL and STRIPS lists sit
   behind rbidocs' bot challenge and have no loader, so the master holds
   G-secs unless SDL ISINs are added with `--extra`.
+- **The RBI store's history starts at its first poll.** The feed holds 10
+  releases; earlier ones come only from pages saved by hand, a few a day.
+  Possible gaps are listed, not filled: nothing fetches a release page, and
+  a saved listing only closes the gaps of releases that do not matter. A
+  newer version of a release replaces the stored one (old values are in
+  `revisions.csv`, the first 8 cells, and in the raw copies); one the store
+  held before is never taken back, and a revised row keeps the first
+  publication time, flagged by `revised`. After a block the poller asks
+  nothing more that India day and stops after a second block in a row, so
+  collection depends on someone reading `rbi-store-status` every morning;
+  with `--no-raw` a release the parser refuses is lost once the feed moves
+  on. The poller was tried only against saved feeds through a fake
+  transport: whether RBI answers its conditional request with 304, and
+  whether its throttle counts feed requests, are not known (`polls.csv`
+  will show both). Policy rates have a history only as far as someone types
+  it in (`--policy-rates`; the MPC resolution is prose, not parsed); the
+  corridor is the SDF and MSF rates of Money Market Operations, from the
+  first day stored. Not built: the check that each OMO price reproduces its
+  yield, and parsers for the kinds above that have none. RBI's permission
+  to keep the history has not been asked.

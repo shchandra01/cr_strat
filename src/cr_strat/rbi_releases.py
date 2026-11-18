@@ -21,8 +21,16 @@ and takes the release id from the page's form action (``prid=63970``), or
 else from a single 4-7 digit number in the file name. ``read_rss_feed`` reads
 ``rss/channel/item`` (``title``, ``link``, ``pubDate``, ``description``; no
 guid): the release id comes from ``prid=`` in the link, the date from
-``pubDate`` (no zone is given; India time is assumed), the body from the
-description's HTML. Both give a ``Release``; one code path parses either.
+``pubDate``, the body from the description's HTML. RBI writes ``pubDate`` as
+``Mon, 16 Nov 2026 19:25:00`` with no zone: India time is assumed.
+``read_pubdate`` takes that form only, or the same with an explicit zone
+(``GMT``, ``UT``, ``UTC``, ``Z``, ``IST``, ``+hhmm``), which is converted to
+India time; anything else (``-0000``, the zone left unknown; a 12-hour
+clock; a weekday that does not fit the date; another order) gives no time,
+and the release carries a note saying so rather than a time that may be
+hours off. Both give a ``Release``; one code path parses either.
+``read_release_listing`` reads the press-release listing page (ids, dates
+and titles of about twelve days; no data).
 The press-release number (``2026-2027/1492``) is read from the signature
 (digits only: the GoI announcement's runs into ``ANNEX``). Data tables are
 the body's innermost tables with more than one cell, picked by their labels,
@@ -103,7 +111,10 @@ and an index of every release read. Every row carries ``release_id``,
 ``release_date``, ``published`` (feed items only), ``line`` (position in the
 release, so ``(release_id, line)`` is a row's key), the security name as
 printed, ``press_release_no`` and ``source_file`` (a file name, ``#n`` for the
-n-th feed item). Units: amounts in ₹ crore of face value (``_cr``), prices per
+n-th feed item). ``parse_copy`` parses one copy on its own, which is how the
+daily store (``rbi_store``) compares a release's copies, and
+``greenshoe_lookup`` turns GoI announcement rows into the greenshoes the
+result checks use. Units: amounts in ₹ crore of face value (``_cr``), prices per
 ₹100 face value, yields in percent, counts of bids (``_count``), dates as
 pandas Timestamps. ``column_type(name)`` is the one rule by which every
 table column is typed (date, time, int, float or text), for a reader of the
@@ -168,7 +179,6 @@ note, a date in a year its holiday list does not cover.
 from __future__ import annotations
 
 import datetime as dt
-import email.utils
 import re
 import xml.etree.ElementTree as ET
 from collections.abc import Callable, Iterable
@@ -284,6 +294,7 @@ class Release:
     body_tables: tuple[Table, ...] = field(repr=False, default=())
     pdf_url: str | None = None
     from_feed: bool = False
+    notes: tuple[str, ...] = ()  # what reading the copy found (a pubDate that could not be read): notes of its parse
 
     @property
     def data_tables(self) -> list[Table]:
@@ -304,6 +315,7 @@ class Release:
 _DATE_LINE = re.compile(r"^Date\s*:\s*([A-Z][a-z]{2,8}\.? \d{1,2},? \d{4})$")
 _PR_NO = re.compile(r"Press Release\s*:\s*(\d{4}-\d{4}/\d+)")
 _PRID = re.compile(r"prid=(\d+)", re.I)
+_LISTED = re.compile(r"BS_PressReleaseDisplay\.aspx\?prid=(\d+)", re.I)
 _RELEASE_DATE_FORMATS = ("%b %d, %Y", "%B %d, %Y", "%b %d %Y")
 
 
@@ -384,7 +396,11 @@ def read_release_page(source: str | Path | bytes, *, release_id: int | None = No
 
 @dataclass(frozen=True)
 class FeedItem:
-    """One ``<item>`` of the RSS feed: position (from 1), title, link, release id, publication time, body."""
+    """One ``<item>`` of the RSS feed: position (from 1), title, link, release id, publication time, body.
+
+    ``pubdate`` is the ``pubDate`` text as printed; ``pubdate_problem`` says
+    why it gave no time (empty when it was read).
+    """
 
     index: int
     title: str
@@ -392,6 +408,8 @@ class FeedItem:
     release_id: int | None
     published: dt.datetime | None
     description_html: str
+    pubdate: str = ""
+    pubdate_problem: str = ""
 
 
 @dataclass(frozen=True)
@@ -402,16 +420,73 @@ class Feed:
     source_file: str
 
 
-def _published(text: str | None) -> dt.datetime | None:
-    if not text or not text.strip():
-        return None
+_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+_WEEKDAY_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+_PUBDATE = re.compile(r"^(?:(?P<weekday>[A-Za-z]{3}),\s*)?(?P<day>\d{1,2})\s+(?P<month>[A-Za-z]{3})\s+"
+                      r"(?P<year>\d{4})\s+(?P<hour>\d{2}):(?P<minute>\d{2})(?::(?P<second>\d{2}))?"
+                      r"(?:\s+(?P<zone>[A-Za-z]{1,3}|[+-]\d{4}))?$")
+_ZONES = {"GMT": 0, "UT": 0, "UTC": 0, "Z": 0, "IST": 330}  # minutes east of UTC; IST is India Standard Time here
+_ZONE_EAST, _ZONE_WEST = 14 * 60, 12 * 60  # the zones in use run from 12 hours west of UTC to 14 hours east
+
+
+def read_pubdate(text: str | None) -> tuple[dt.datetime | None, str]:
+    """A feed item's ``pubDate`` as India time without a zone, and why it gave none (``""`` when it was read).
+
+    RBI's form is ``Mon, 16 Nov 2026 19:25:00`` with no zone, India time
+    (seconds may be left out). An explicit zone (``GMT``, ``UT``, ``UTC``,
+    ``Z``, ``IST``, ``+hhmm`` or ``-hhmm``) is converted to India time.
+    Refused, with the reason: ``-0000`` (RFC 5322: the zone is not known), any
+    other zone name, a numeric zone no place uses (minutes above 59, more than
+    14 hours east or 12 hours west of UTC: ``+0560``, ``+2400``), a 12-hour
+    clock or any other layout, an impossible date or time, a weekday that does
+    not fit the date, and a time India time would put outside the years 1 to
+    9999. A time taken on a guess could be hours off, and the store dates what
+    was known when by it. Nothing here raises: one item's ``pubDate`` must
+    never cost the other items of its feed.
+    """
+    if text is None or not text.strip():
+        return None, "no pubDate: the publication time is not known"
+    shown = " ".join(text.split())
+    m = _PUBDATE.match(shown)
+    if not m:
+        return None, f"pubDate {shown!r} is not in the form 'Mon, 16 Nov 2026 19:25:00': publication time not read"
+    month = m["month"].title()
+    if month not in _MONTHS:
+        return None, f"pubDate {shown!r}: no month {m['month']!r}; publication time not read"
     try:
-        stamp = email.utils.parsedate_to_datetime(text.strip())
-    except (TypeError, ValueError):
-        return None
-    if stamp.tzinfo is not None:
-        stamp = stamp.astimezone(IST).replace(tzinfo=None)
-    return stamp
+        stamp = dt.datetime(int(m["year"]), _MONTHS.index(month) + 1, int(m["day"]), int(m["hour"]),
+                            int(m["minute"]), int(m["second"] or 0))
+    except ValueError as exc:
+        return None, f"pubDate {shown!r} is not a date and time ({exc}): publication time not read"
+    if m["weekday"] is not None and m["weekday"].title() != _WEEKDAY_NAMES[stamp.weekday()]:
+        return None, (f"pubDate {shown!r}: {stamp:%d %b %Y} is a {_WEEKDAY_NAMES[stamp.weekday()]}, not a "
+                      f"{m['weekday']}: publication time not read")
+    zone = m["zone"]
+    if zone is None:
+        return stamp, ""
+    if zone == "-0000":
+        return None, f"pubDate {shown!r}: zone -0000 means the zone is not known; publication time not read"
+    if zone[0] in "+-":
+        hours, minutes = int(zone[1:3]), int(zone[3:5])
+        if minutes > 59 or hours * 60 + minutes > (_ZONE_EAST if zone[0] == "+" else _ZONE_WEST):
+            return None, (f"pubDate {shown!r}: zone {zone} is not a time zone (minutes 00 to 59, from -1200 to "
+                          "+1400); publication time not read")
+        minutes = (hours * 60 + minutes) * (1 if zone[0] == "+" else -1)
+    elif zone.upper() in _ZONES:
+        minutes = _ZONES[zone.upper()]
+    else:
+        return None, f"pubDate {shown!r}: zone {zone!r} is not known here; publication time not read"
+    aware = stamp.replace(tzinfo=dt.timezone(dt.timedelta(minutes=minutes)))
+    try:
+        india = aware.astimezone(IST)
+    except OverflowError:
+        return None, f"pubDate {shown!r}: in India time it falls outside the years 1 to 9999; publication time not read"
+    return india.replace(tzinfo=None), ""
+
+
+def _published(text: str | None) -> dt.datetime | None:
+    """``read_pubdate`` without the reason."""
+    return read_pubdate(text)[0]
 
 
 def is_feed(text: str | bytes) -> bool:
@@ -443,21 +518,75 @@ def read_rss_feed(source: str | Path | bytes, *, name: str | None = None) -> Fee
     for i, item in enumerate(channel.findall("item"), start=1):
         link = clean_text(item.findtext("link") or "")
         m = _PRID.search(link)
+        pubdate = item.findtext("pubDate") or ""
+        published, problem = read_pubdate(pubdate)
         items.append(FeedItem(i, clean_text(item.findtext("title") or ""), link, int(m.group(1)) if m else None,
-                              _published(item.findtext("pubDate")), item.findtext("description") or ""))
+                              published, item.findtext("description") or "", " ".join(pubdate.split()), problem))
     return Feed(clean_text(channel.findtext("title") or ""), clean_text(channel.findtext("link") or ""),
                 tuple(items), name)
 
 
 def feed_releases(feed: Feed) -> list[Release]:
-    """Each feed item as a ``Release`` (body: the description's HTML)."""
+    """Each feed item as a ``Release`` (body: the description's HTML); a ``pubDate`` not read is a note."""
     out = []
     for item in feed.items:
         page = parse_html(item.description_html)
         out.append(Release(item.release_id, item.published.date() if item.published else None, item.title,
                            _press_release_no(page.root.text()), item.published, item.link,
-                           f"{feed.source_file}#{item.index}", page, page.root, page.tables, from_feed=True))
+                           f"{feed.source_file}#{item.index}", page, page.root, page.tables, from_feed=True,
+                           notes=(item.pubdate_problem,) if item.pubdate_problem else ()))
     return out
+
+
+@dataclass(frozen=True)
+class ListedRelease:
+    """One line of RBI's press-release listing: release id, the date heading above it, the title, the file."""
+
+    release_id: int
+    release_date: dt.date
+    title: str
+    source_file: str
+
+
+def read_release_listing(source: str | Path | bytes, *, name: str | None = None) -> list[ListedRelease]:
+    """The releases a saved press-release listing shows (``BS_PressReleaseDisplay.aspx`` without a ``prid``).
+
+    The listing covers about twelve days: a row holding only a date
+    (``Nov 16, 2026``) heads the rows of that day, each a link
+    ``BS_PressReleaseDisplay.aspx?prid=<id>`` whose text is the title (and a
+    link to the PDF). It carries no data: titles, dates and ids only. Taken
+    from the table with the most such rows; ``ReleaseParseError`` if there is
+    none, ``BlockedPageError`` for a refusal page.
+    """
+    if isinstance(source, bytes):
+        raw, read_name = source, "<bytes>"
+    else:
+        path = Path(source)
+        raw, read_name = path.read_bytes(), path.name
+    name = name or read_name
+    page = parse_html(raw.decode("utf-8-sig", errors="replace"))
+    check_not_blocked(page, name)
+    best: list[ListedRelease] = []
+    for table in page.tables:
+        found, day = [], None
+        for row in table.rows:
+            if len(row) == 1 and not row[0].links:
+                try:
+                    day = parse_date(row[0].text, _RELEASE_DATE_FORMATS) or day
+                except ValueError:
+                    pass
+                continue
+            first = row[0] if row else None
+            link = next((href for _, href in first.links if _LISTED.search(href)), None) if first else None
+            if link is None or day is None or not first.text:
+                continue
+            found.append(ListedRelease(int(_LISTED.search(link).group(1)), day, first.text, name))
+        if len(found) > len(best):
+            best = found
+    if not best:
+        raise ReleaseParseError(f"{name}: not a press-release listing (no date row above rows linking "
+                                "BS_PressReleaseDisplay.aspx?prid=<id>)")
+    return best
 
 
 # --- Registry ---------------------------------------------------------------------------------------
@@ -1500,8 +1629,12 @@ def _frame(kind: str, records: list[dict]) -> pd.DataFrame:
     return df
 
 
-def _greenshoe_lookup(frame: pd.DataFrame | None) -> dict[tuple[dt.date, str], float]:
-    """Greenshoe by (auction date, name key), and by (auction date, printed name) for 'New GS' lines."""
+def greenshoe_lookup(frame: pd.DataFrame | None) -> dict[tuple[dt.date, str], float]:
+    """Greenshoe by (auction date, name key), and by (auction date, printed name) for 'New GS' lines.
+
+    ``frame`` holds GoI announcement rows (``COLUMNS['gsec_announcement']``);
+    the result is what ``ParseContext.greenshoe`` expects.
+    """
     out: dict[tuple[dt.date, str], float] = {}
     if frame is None or not len(frame):
         return out
@@ -1522,6 +1655,58 @@ def _raw(source: str | Path | bytes, position: int) -> tuple[bytes, str]:
         return source.encode("utf-8"), f"<text {position}>"
     path = Path(source)
     return path.read_bytes(), path.name
+
+
+@dataclass
+class CopyResult:
+    """What ``parse_copy`` made of one copy of a release.
+
+    ``status``: ``parsed`` (``rows`` holds its rows), ``failed`` (refused by
+    its parser), ``no_parser`` (a kind registered without one) or
+    ``not_recognised`` (the title fits no kind and the tables no parser).
+    ``reason`` says why a copy gave no rows; ``notes`` are its parser's notes.
+    """
+
+    kind: str
+    classified_by: str
+    status: str
+    rows: list[dict] = field(default_factory=list)
+    reason: str = ""
+    notes: list[str] = field(default_factory=list)
+
+
+def parse_copy(release: Release, ctx: ParseContext, kind: str | None = None, how: str | None = None) -> CopyResult:
+    """Parse one copy of a release with its kind's parser; ``classify`` gives the kind unless it is passed.
+
+    Every row gets the fields all tables share: ``release_id``,
+    ``release_date``, ``published`` (this copy's own: feed items only),
+    ``line`` (from 1), ``press_release_no`` and ``source_file``. The
+    release's own notes (``Release.notes``) come first in ``notes``. A refusal
+    (``ReleaseParseError``, ``SanityCheckError``) is status ``failed`` with
+    the reason (``cannot parse: ...`` or ``failed check: ...``); any other
+    exception propagates. ``ctx.calendar`` keeps the calendar a parser
+    loaded, for the next copy.
+    """
+    if kind is None:
+        kind, how = classify(release)
+    how = how or ""
+    ctx.notes.extend(n for n in release.notes if n not in ctx.notes)
+    if kind == "other":
+        return CopyResult(kind, how, "not_recognised", reason=f"title not recognised: {release.title!r}",
+                          notes=list(ctx.notes))
+    if RELEASE_TYPES[kind].parser is None:
+        return CopyResult(kind, how, "no_parser", reason=_no_parser_reason(kind), notes=list(ctx.notes))
+    if how == "tables":
+        ctx.notes.append(f"title {release.title!r} not recognised; classified as {kind} from its tables")
+    try:
+        rows = RELEASE_TYPES[kind].parser(release, ctx)
+    except (ReleaseParseError, SanityCheckError) as exc:
+        word = "failed check" if isinstance(exc, SanityCheckError) else "cannot parse"
+        return CopyResult(kind, how, "failed", reason=f"{word}: {exc}", notes=list(ctx.notes))
+    for line, row in enumerate(rows, start=1):
+        row.update(release_id=release.release_id, release_date=release.release_date, published=release.published,
+                   line=line, press_release_no=release.press_release_no, source_file=release.source_file)
+    return CopyResult(kind, how, "parsed", rows, notes=list(ctx.notes))
 
 
 def read_releases(sources: Iterable[str | Path | bytes]) -> tuple[list[Release], list[SkippedRelease]]:
@@ -1590,7 +1775,7 @@ def parse_releases(sources: Iterable[str | Path | bytes], *, limits: SanityLimit
         rank = min((RELEASE_TYPES[c[4]].order for c in copies
                     if c[4] in RELEASE_TYPES and RELEASE_TYPES[c[4]].parser is not None), default=99)
         order.append((rank, release_id, copies))
-    greenshoe = _greenshoe_lookup(announcements)
+    greenshoe = greenshoe_lookup(announcements)
     records: dict[str, list[dict]] = {k: [] for k, t in RELEASE_TYPES.items() if t.parser is not None}
     for _, release_id, copies in sorted(order, key=lambda x: x[:2]):
         parsed_from = None
@@ -1601,31 +1786,27 @@ def parse_releases(sources: Iterable[str | Path | bytes], *, limits: SanityLimit
                 skip(release, kind, entry, f"duplicate of release {release_id} read from "
                                            f"{parsed_from or unparsable[kind]}", "duplicate")
                 continue
-            if kind == "other" or RELEASE_TYPES[kind].parser is None:
-                unparsable[kind] = release.source_file
-                skip(release, kind, entry, f"title not recognised: {release.title!r}" if kind == "other"
-                     else _no_parser_reason(kind))
-                continue
             ctx = ParseContext(limits, greenshoe, calendar=calendar)
-            if how == "tables":
-                ctx.notes.append(f"title {release.title!r} not recognised; classified as {kind} from its tables")
             try:
-                rows = RELEASE_TYPES[kind].parser(release, ctx)
-            except (ReleaseParseError, SanityCheckError) as exc:
-                word = "failed check" if isinstance(exc, SanityCheckError) else "cannot parse"
-                entry["notes"] = "; ".join(ctx.notes)
-                skip(release, kind, entry, f"{word}: {exc}")
-                continue
+                result = parse_copy(release, ctx, kind, how)
             finally:
                 calendar = ctx.calendar  # the shipped calendar is loaded at most once in a batch
-            for line, row in enumerate(rows, start=1):
-                row.update(release_id=release.release_id, release_date=release.release_date,
-                           published=published, line=line, press_release_no=release.press_release_no,
-                           source_file=release.source_file)
+            if result.status in ("not_recognised", "no_parser"):
+                unparsable[kind] = release.source_file
+                entry["notes"] = "; ".join(result.notes)
+                skip(release, kind, entry, result.reason)
+                continue
+            if result.status == "failed":
+                entry["notes"] = "; ".join(result.notes)
+                skip(release, kind, entry, result.reason)
+                continue
+            rows = result.rows
+            for row in rows:
+                row["published"] = published  # a saved page has no time of its own: the feed copy's
             records[kind].extend(rows)
-            entry.update(status="parsed", rows=len(rows), notes="; ".join(ctx.notes))
+            entry.update(status="parsed", rows=len(rows), notes="; ".join(result.notes))
             if kind == "gsec_announcement":
-                greenshoe.update(_greenshoe_lookup(_frame(kind, rows)))
+                greenshoe.update(greenshoe_lookup(_frame(kind, rows)))
             parsed_from = release.source_file
     tables = {kind: _frame(kind, recs) for kind, recs in records.items()}
     idx = pd.DataFrame(index, columns=list(INDEX_COLUMNS))
