@@ -446,6 +446,9 @@ back-testing.
 
 ## Enquiries to send
 
+Draft letters for every row, with placeholders for the firm's details, are in
+[`data_enquiries.md`](data_enquiries.md). None has been sent.
+
 | To | Ask |
 |---|---|
 | CCIL Data Services ([form](https://www.ccilindia.com/web/ccil/data-request-form)) | Price, depth and format of trade history by security, repo by security, TREPS, MTM prices and OIS prints; whether the haircut PDF may be kept |
