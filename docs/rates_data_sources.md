@@ -494,7 +494,14 @@ What can be built now, with no licence:
    auction price and yield pairs. Built in
    [`bonds.py`](../src/cr_strat/bonds.py), with STRIPS, CMBs, CP and CD.
 4. **Daily store of RBI operations and money-market rates** from the RSS
-   feed.
+   feed. The parsers are built, in
+   [`rbi_operations.py`](../src/cr_strat/rbi_operations.py): Money Market
+   Operations, variable rate repo and reverse repo auctions, open market
+   operations, the GoI issuance calendar and the total of the state
+   calendar, each release with the publication time its feed copy gives
+   ([`data/README.md`](../data/README.md)). The store itself and the feed
+   poller remain, as do parsers for the T-bill calendar, switch and buyback
+   announcements and buyback results, none of which was sampled.
 5. **Macro and global store** from MoSPI's API, the US publishers and BIS.
 
 Then, as licences arrive: the sovereign price panel (extend

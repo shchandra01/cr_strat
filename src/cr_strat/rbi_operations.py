@@ -14,9 +14,9 @@ kind (``COLUMNS[kind]``) with rows keyed ``(release_id, line)``.
 Kinds with a parser here (titles as observed in Nov 2026; the layouts were
 taken from the samples named):
 
-============================  ==============================================================  =================
+============================  ==============================================================  ==================
 Kind                          Title                                                           Sampled
-============================  ==============================================================  =================
+============================  ==============================================================  ==================
 ``money_market_operations``   Money Market Operations as on November 13, 2026                 Fri, Sat, Sun, Mon
 ``laf_auction_announcement``  RBI to conduct 2-day Variable Rate Reverse Repo (VRRR) auction  reverse repo only
                               under LAF on November 17, 2026
@@ -29,7 +29,7 @@ Kind                          Title                                             
                               2026 - March 2027
 ``sdl_calendar``              Indicative Calendar of Market borrowings by State Governments/  one quarter
                               Union Territories for the Quarter October – December 2026
-============================  ==============================================================  =================
+============================  ==============================================================  ==================
 
 Registered without a parser, with the reason as the skip reason
 (``ReleaseType.no_parser``): the OMO cut-off release, the Treasury bill
@@ -49,9 +49,10 @@ depth, class or id. A row's key is its label without ONE leading enumerator
 (``A.``, ``II.``, ``5.``, ``(a)``, ``(ii)``), squashed to lower-case letters
 and digits (``label_key``); the footnote marks at the end of the label
 (``label_marks``: ``Δ#`` of ``4. SDFΔ#``) are kept, because a changed mark is
-the only machine-visible sign that RBI changed a definition. A row with a
-label no parser knows is reported as a note with its cells, never dropped
-silently; the identities then decide whether the release stands.
+the only machine-visible sign that RBI changed a definition. Nothing printed
+is dropped silently: a row with a label no parser knows is reported as a note
+with its cells, as is a column or a table that was not read; values with no
+label, and an unknown column of Money Market Operations, refuse the release.
 
 **Money Market Operations** (daily, one release per calendar day, published on
 the next Mumbai business day). One long table, one row per printed data
@@ -66,9 +67,9 @@ line, so that no printed number is lost; ``item`` names the line:
   ``rate_high_pct`` the range (``1.00-7.40``). The same three names occur in
   both segments: the heading above a line decides, not its numeral. A dash
   ("no transaction") is a blank, never zero; a printed ``0.00`` stays 0. Term
-  money prints a volume and a range but no rate. On a weekend or holiday every
-  volume is ``0.00`` and every rate a dash: keep the rows, never fill rates
-  forward from them.
+  money prints a volume and a range but no rate. On a weekend every volume is
+  ``0.00`` and every rate a dash: keep the rows, never fill rates forward
+  from them.
 * ``rbi_operations`` block: ``laf.today.repo``, ``laf.today.reverse_repo``,
   ``laf.today.msf``, ``laf.today.sdf`` and the same four under
   ``laf.outstanding``, one row per operation with ``auction_date``,
@@ -77,8 +78,8 @@ line, so that no printed number is lost; ``item`` names the line:
   rows of an item from 1. A facility line with five blank cells is "no
   operation" and gives no row; an amount of ``0.00`` is a row. Further tenors
   of a facility are rows of five cells under the label's ``rowspan``: they
-  are attached to the label that spans them, and values in a row with no label
-  are refused. ``net.today`` (line 5), ``slf.availed`` (D),
+  are attached to the label that spans them, and values in a row that no
+  label spans are refused. ``net.today`` (line 5), ``slf.availed`` (D),
   ``net.outstanding`` (E) and ``net.total`` (F) carry an amount only; the net
   lines are printed signed and have no ``liquidity_effect_cr`` (they total
   the rows above: never add them to those rows). Lines E and F span two
@@ -93,23 +94,25 @@ line, so that no printed number is lost; ``item`` names the line:
 ``as_on_date`` comes from the title and nowhere else; ``release_date`` and
 ``published`` are the publication. Refused: a title without the date; no unit
 line (``Amount in ₹ crore, Rate in Per cent``); a missing table, column or
-value line; a filled ``1. Fixed Rate`` line (never seen filled: its sign in
-the net lines is unknown); values on a heading; a facility row with some of
-its five cells; the overnight volume not the sum of its four parts; line 5
-not repo + MSF - reverse repo - SDF over today's rows; line E not the
-outstanding rows plus SLF; line F not line 5 plus line E (all within
-``SanityLimits.mmo_sum_tolerance_cr``); a maturity that is not the auction
-date plus the tenor, or a printed weekday that does not fit its date
-(``strptime`` would not notice); a row of today's block not dated the as-on
-date; a rate outside ``yield_range``, a range running downwards, a negative
-amount other than a net line or net durable liquidity. Notes: an unknown row;
-changed footnote marks; a rate outside its range; a volume of 0 with a rate;
-the overnight rate or range against its parts; MSF or SDF rows of one block
-at different rates; an outstanding row not strictly between its auction and
-maturity dates; cash balances dated another day. Releases before 30 Sep 2025
-split the variable-rate block into main, fine-tuning and long-term
-operations: those rows are unknown here, so such a release fails the net
-identities as soon as one of them is filled.
+value line; a column no sample had; a filled ``1. Fixed Rate`` line (never
+seen filled: its sign in the net lines is unknown); values on a heading; a
+facility row with some of its five cells; the overnight volume not the sum
+of its four parts; line 5 not repo + MSF - reverse repo - SDF over today's
+rows; line E not the outstanding rows plus SLF; line F not line 5 plus line
+E (all within ``SanityLimits.mmo_sum_tolerance_cr``); a maturity that is not
+the auction date plus the tenor, or a printed weekday that does not fit its
+date (``strptime`` would not notice); a row of today's block not dated the
+as-on date; a rate outside ``yield_range``, a range running downwards, a
+negative amount other than a net line or net durable liquidity. Notes: an
+unknown row or table; changed footnote marks; a blank volume, amount or
+date; a rate outside its range; a volume of 0 with a rate, or a volume
+without a range; the overnight rate or range against its parts; MSF or SDF
+rows of one block at different rates; an outstanding row not strictly
+between its auction and maturity dates; cash balances dated another day; a
+release not published on the next business day after its as-on date.
+Releases before 30 Sep 2025 split the variable-rate block into main,
+fine-tuning and long-term operations: those rows are unknown here, so such a
+release fails the net identities as soon as one of them is filled.
 
 **Variable rate repo and reverse repo auctions** (``direction``: ``repo``
 injects, ``reverse_repo`` absorbs). The result is a seven-row label and value
@@ -127,7 +130,8 @@ the weighted average rate not above the cut-off in a reverse repo, not below
 it in a repo. The announcement gives one row per auction: notified amount,
 tenor, window (``09:30 AM to 10:00 AM``, the hour with or without a leading
 zero) and the date of reversal, which must be the auction date of the title
-and the text plus the tenor.
+and the text plus the tenor; a reversal on a day that is not a business day
+is noted.
 
 **Open market operations.** The detailed result has a three-row summary
 (``₹50,000 crore``) and a table with one column per security; operation,
@@ -140,8 +144,9 @@ offers), the reverse in a sale. The result prints no ISIN: the announcement
 lists the same securities in the same order with ISIN and maturity date, the
 aggregate amount in one cell spanning all rows, and in its text the auction
 date, the settlement date, the price method and the earlier release that
-announced the programme. Sale releases are known from descriptions only and
-carry a note.
+announced the programme. Sale releases are known from descriptions only: one
+is read if its labels say bids where a purchase says offers, refused
+otherwise, and carries a note.
 
 **Calendars.** The GoI calendar is one row per allocation line (``(i) 3 Year
 for ₹9,000 crore``, ``SGrB`` for a green bond) under its auction week, which
@@ -149,11 +154,18 @@ is printed in three forms (``October 05-09, 2026``, ``September 28-October
 02, 2026``, ``December 28, 2026-January 01, 2027``). Checks: every week runs
 Monday to Friday, weeks are numbered from 1 without a gap and do not overlap,
 the lines of a week add up to its amount and the weeks to the Total row.
-Weeks are not checked against ``cr_strat.calendars`` (its holiday list ends
-in 2026). The state calendar's page carries one number, the quarter's total;
-the per-state amounts are in two PDF annexes whose addresses are kept in
+The state calendar's page carries one number, the quarter's total; the
+per-state amounts are in two PDF annexes whose addresses are kept in
 ``annex_urls`` for a person to open (never to be fetched by a program: see
 the access rules in ``docs/rates_data_sources.md``).
+
+**Holidays.** Two notes ask ``cr_strat.calendars`` (the calendar of
+``ParseContext``, by default the shipped Mumbai settlement calendar): the
+publication day of Money Market Operations and the reversal day of an
+announced auction. Its holiday list ends in 2026. A date in a year it does
+not cover is not checked, and a note says so; no parser raises for it. The
+weeks of the GoI calendar, half of them in 2027, are checked as Monday to
+Friday without asking it.
 """
 
 from __future__ import annotations
@@ -164,6 +176,7 @@ import re
 from collections.abc import Iterable, Sequence
 from dataclasses import replace
 
+from cr_strat.calendars import CalendarCoverageError
 from cr_strat.htmlparse import NULL_MARKERS, Table, clean_text, parse_count, parse_date, parse_number, squash
 from cr_strat.isin import is_valid_isin
 from cr_strat.rbi_releases import (
@@ -262,6 +275,7 @@ _RESERVE_LINES = (
     ("netdurableliquidity", "liquidity.net_durable"),
 )
 _HEADING_MARKS = {"moneymarkets": "@", "rbioperations": "@", "reserveposition": "@", "variablerate": "&"}
+_UNIT_LINE = "amountincrorerateinpercent"  # '(Amount in ₹ crore, Rate in Per cent)', squashed
 OVERNIGHT_RATE_TOLERANCE_PCT = 0.02  # note when the overnight rate is further than this from its parts' average
 
 _WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
@@ -377,7 +391,8 @@ def _one_table(release: Release, found: list, what: str):
 def _headed_table(release: Release, first: str, wanted: dict[str, str], name: str) -> tuple[Table, int, dict]:
     """The one table whose header row starts with the label ``first``: table, header row, column of each field.
 
-    ``wanted`` maps a field to the exact key of its header cell.
+    ``wanted`` maps a field to the exact key of its header cell. A header
+    cell that is not wanted refuses the release: its column would be lost.
     """
     found = []
     for table in release.data_tables:
@@ -386,7 +401,8 @@ def _headed_table(release: Release, first: str, wanted: dict[str, str], name: st
                 found.append((table, h))
                 break
     table, h = _one_table(release, found, f"the header '{name}'")
-    keys = [squash(cell) for cell in table.grid(fill=False)[h]]
+    header = table.grid(fill=False)[h]
+    keys = [squash(cell) for cell in header]
     cols = {}
     for field, key in wanted.items():
         hits = [j for j, k in enumerate(keys) if k == key]
@@ -394,15 +410,20 @@ def _headed_table(release: Release, first: str, wanted: dict[str, str], name: st
             raise ReleaseParseError(f"{release.source_file}: the '{name}' table has {len(hits)} columns headed "
                                     f"{key!r} (header: {table.cell_texts()[h]})")
         cols[field] = hits[0]
+    extra = [header[j] for j, k in enumerate(keys) if j and k and j not in cols.values()]
+    if extra:
+        raise ReleaseParseError(f"{release.source_file}: the '{name}' table has columns that no sample had "
+                                f"({', '.join(repr(e) for e in extra)}); their values would be lost")
     return table, h, cols
 
 
-def _column_table(release: Release, wanted: dict[str, str], optional: Iterable[str], ctx: ParseContext,
-                  name: str) -> tuple[Table, int, dict[str, int]]:
+def _column_table(release: Release, wanted: dict[str, str | tuple[str, ...]], optional: Iterable[str],
+                  ctx: ParseContext, name: str) -> tuple[Table, int, dict[str, int]]:
     """The one table with a header row holding a cell for every field: table, header row, columns.
 
-    ``wanted`` maps a field to the start of its header cell's key. Header cells
-    that are neither wanted nor ``optional`` are noted.
+    ``wanted`` maps a field to the start, or the possible starts, of its
+    header cell's key. Header cells that are neither wanted nor ``optional``
+    are noted with the number of cells under them.
     """
     found = []
     for table in release.data_tables:
@@ -412,12 +433,15 @@ def _column_table(release: Release, wanted: dict[str, str], optional: Iterable[s
             if all(len(hits) == 1 for hits in cols.values()):
                 found.append((table, h, {field: hits[0] for field, hits in cols.items()}))
                 break
-    table, h, cols = _one_table(release, found, f"the columns of {name} ({', '.join(wanted.values())})")
+    starts = ", ".join(p if isinstance(p, str) else p[0] for p in wanted.values())
+    table, h, cols = _one_table(release, found, f"the columns of the {name} table ({starts})")
     known = tuple(optional)
-    for j, cell in enumerate(table.grid(fill=False)[h]):
+    grid = table.grid(fill=False)
+    for j, cell in enumerate(grid[h]):
         key = squash(cell)
         if key and j not in cols.values() and not key.startswith(known):
-            ctx.notes.append(f"column {cell!r} of the {name} table not recognised; ignored")
+            filled = sum(1 for row in grid[h + 1:] if clean_text(row[j]))
+            ctx.notes.append(f"column {cell!r} of the {name} table not recognised; ignored ({filled} cells)")
     return table, h, cols
 
 
@@ -425,16 +449,22 @@ def _labelled_values(pairs: Iterable[tuple[int, str, object]], rows: Sequence[tu
                      where: str, ctx: ParseContext) -> tuple[dict[str, tuple[str, object]], set[str]]:
     """Rows of a label and value table sorted into fields: ``{field: (label, value)}`` and the wordings used.
 
-    ``pairs`` yields ``(row number, label, value)``; ``rows`` lists ``(start of
-    the label key, field, wording)``, where ``wording`` names the variant of
-    the release a label belongs to (None when all variants share it). A field
-    printed twice is refused; a label that is not known is noted.
+    ``pairs`` yields ``(row number, label, value)``, the value a cell's text
+    or a list of them; ``rows`` lists ``(start of the label key, field,
+    wording)``, where ``wording`` names the variant of the release a label
+    belongs to (None when all variants share it). A field printed twice and
+    values without a label are refused; a label that is not known is noted
+    with its values.
     """
     found: dict[str, tuple[str, object]] = {}
     wordings: set[str] = set()
     for number, label, value in pairs:
         key = label_key(label)
         if not key:
+            printed = [value] if isinstance(value, str) else list(value)
+            if any(not _blank(v) for v in printed):
+                raise ReleaseParseError(f"{where}: row {number} has values but no label "
+                                        f"({[clean_text(v) for v in printed]})")
             continue
         hit = next(((field, wording) for prefix, field, wording in rows if key.startswith(prefix)), None)
         if hit is None:
@@ -449,9 +479,10 @@ def _labelled_values(pairs: Iterable[tuple[int, str, object]], rows: Sequence[tu
     return found, wordings
 
 
-def _check_wording(wordings: set[str], expected: str, where: str, what: str) -> None:
+def _check_wording(wordings: set[str], expected: str, where: str, tables: str) -> None:
+    """Refuse labels worded for another variant than the title names (``tables``: 'table uses', 'tables use')."""
     if wordings - {expected}:
-        raise ReleaseParseError(f"{where}: the title says {expected.replace('_', ' ')} but the {what} uses the "
+        raise ReleaseParseError(f"{where}: the title says {expected.replace('_', ' ')} but the {tables} the "
                                 f"words of a {' and a '.join(sorted(w.replace('_', ' ') for w in wordings))}")
 
 
@@ -471,6 +502,39 @@ def _mentions(pattern: re.Pattern, text: str) -> set[str]:
     return {re.sub(r"\s+", "_", m.lower()) for m in pattern.findall(text)}
 
 
+def _note_unread_tables(release: Release, read: Iterable[Table], ctx: ParseContext) -> None:
+    """Note each data table of the release that its parser did not read, so that none is dropped silently."""
+    known = {id(table) for table in read}
+    for number, table in enumerate(release.data_tables, start=1):
+        if id(table) not in known:
+            first = next((cell.text for row in table.rows for cell in row if cell.text), "")
+            ctx.notes.append(f"table {number} of the release ({len(table.rows)} rows, beginning {first[:60]!r}) "
+                             "not recognised; ignored")
+
+
+def _spanning_row(table: Table, h: int, r: int, name: str, ctx: ParseContext) -> bool:
+    """True, with a note, if row ``r`` is one cell as wide as the header row ``h``: a remark, not a data row."""
+    raw = table.rows[r]
+    width = sum(cell.colspan for cell in table.rows[h])
+    if len(raw) != 1 or raw[0].colspan < width or width < 2:
+        return False
+    if raw[0].text:
+        ctx.notes.append(f"row {r + 1} of the {name} table spans it and is not a data row; ignored "
+                         f"({raw[0].text[:120]!r})")
+    return True
+
+
+def _note_not_business_day(ctx: ParseContext, day: dt.date, what: str) -> None:
+    """Note ``day`` if the settlement calendar says it is no business day, or cannot say (a year not covered)."""
+    try:
+        if not ctx.settlement_calendar().is_business_day(day):
+            ctx.notes.append(f"{what} {day} ({_WEEKDAYS[day.weekday()].title()}) is not a business day of the "
+                             "settlement calendar")
+    except CalendarCoverageError:
+        ctx.notes.append(f"{what} {day} is in a year the settlement calendar does not cover; not checked "
+                         "against its holidays")
+
+
 # --- Money Market Operations ------------------------------------------------------------------------
 
 _MMO_TITLE = re.compile(r"^money market operations as on ([a-z]+ \d{1,2}, \d{4})$", re.I)
@@ -478,10 +542,12 @@ _OP_DATE = re.compile(r"^([A-Za-z]{3,9})\.?,?\s*(\d{1,2})/(\d{1,2})/(\d{4})$")
 _RANGE = re.compile(r"^(\d+(?:\.\d+)?)\s*[-–]\s*(\d+(?:\.\d+)?)$")
 _OP_FIELDS = ("auction_date", "tenor_days", "maturity_date", "amount_cr", "rate_pct")
 _OP_NAMES = ("auction date", "tenor", "maturity date", "amount", "rate")
+_FIXED_RATE_REFUSAL = ("a filled '1. Fixed Rate' line was in no sample and its sign in the net lines is not "
+                       "known; the release is not read")
 
 
 def _mmo_row(block: str, item: str, label: str, **fields) -> dict:
-    return {"block": block, "item": item, "label": clean_text(label), "marks": label_marks(label), **fields}
+    return {"block": block, "item": item, "label": clean_text(label), "marks": label_marks(label) or None, **fields}
 
 
 def _note_marks(what: str, label: str, expected: str, ctx: ParseContext) -> None:
@@ -503,7 +569,8 @@ def _no_stray_cells(row: list[str], width: int, where: str) -> None:
         raise ReleaseParseError(f"{where}: cells beyond the table's {width} columns ({row[width:]})")
 
 
-def _mmo_money_markets(release: Release, ctx: ParseContext, unknown: dict[str, list[str]]) -> list[dict]:
+def _mmo_money_markets(release: Release, ctx: ParseContext, unknown: dict[str, list[str]]) -> tuple[list[dict],
+                                                                                                  Table]:
     name = "Money Markets"
     table, h, cols = _headed_table(release, "moneymarkets", {"amount_cr": "volumeoneleg",
                                                              "rate_pct": "weightedaveragerate", "range": "range"},
@@ -547,7 +614,7 @@ def _mmo_money_markets(release: Release, ctx: ParseContext, unknown: dict[str, l
             low, high = float(m.group(1)), float(m.group(2))
         out.append(_mmo_row("money_market", item, label, amount_cr=_num(cells["amount_cr"], where),
                             rate_pct=_num(cells["rate_pct"], where), rate_low_pct=low, rate_high_pct=high))
-    return out
+    return out, table
 
 
 def _op_date(text: str, where: str, name: str) -> dt.date:
@@ -590,7 +657,7 @@ def _operation(item: str, label: str, values: list[str], as_on: dt.date, where: 
 
 
 def _mmo_operations(release: Release, as_on: dt.date, ctx: ParseContext,
-                    unknown: dict[str, list[str]]) -> list[dict]:
+                    unknown: dict[str, list[str]]) -> tuple[list[dict], Table]:
     name = "RBI Operations"
     table, h, cols = _headed_table(release, "rbioperations", {
         "auction_date": "auctiondate", "tenor_days": "tenordays", "maturity_date": "maturitydate",
@@ -673,16 +740,13 @@ def _mmo_operations(release: Release, as_on: dt.date, ctx: ParseContext,
                                 liquidity_effect_cr=_signed(1.0, amount) if item == "slf.availed" else None))
     absent = [s for s in ("today", "outstanding") if s not in sections]
     if absent:
-        raise ReleaseParseError(f"{release.source_file}: the {name} table has no heading for "
-                                f"{' or '.join(absent)}'s operations".replace("outstanding's", "the outstanding"))
-    return out
+        headings = " and ".join("I. Today's Operations" if s == "today" else "II. Outstanding Operations"
+                                for s in absent)
+        raise ReleaseParseError(f"{release.source_file}: the {name} table has no heading {headings}")
+    return out, table
 
 
-_FIXED_RATE_REFUSAL = ("a filled '1. Fixed Rate' line was in no sample and its sign in the net lines is not "
-                       "known; the release is not read")
-
-
-def _mmo_reserves(release: Release, ctx: ParseContext, unknown: dict[str, list[str]]) -> list[dict]:
+def _mmo_reserves(release: Release, ctx: ParseContext, unknown: dict[str, list[str]]) -> tuple[list[dict], Table]:
     name = "Reserve Position"
     table, h, cols = _headed_table(release, "reserveposition", {"ref_date": "date", "amount_cr": "amount"}, name)
     grid = table.grid(fill=False)
@@ -712,7 +776,7 @@ def _mmo_reserves(release: Release, ctx: ParseContext, unknown: dict[str, list[s
         _note_marks(item, label, MMO_ITEMS[item][1], ctx)
         out.append(_mmo_row("reserve_position", item, label, ref_date=_date(cells["ref_date"], _LONG_FORMATS, where),
                             amount_cr=_num(cells["amount_cr"], where)))
-    return out
+    return out, table
 
 
 def _fmt(value: float | None) -> str:
@@ -775,6 +839,8 @@ def _mmo_notes(by: dict[str, list[dict]], as_on: dt.date, ctx: ParseContext) -> 
                                                             "rate_high_pct"))
             if amount is None and item != "slf.availed":
                 ctx.notes.append(f"{item}: no amount printed")
+            if block == "reserve_position" and row.get("ref_date") is None:
+                ctx.notes.append(f"{item}: no date printed")
             if block != "money_market":
                 continue
             if rate is not None and low is not None and not low <= rate <= high:
@@ -804,6 +870,22 @@ def _mmo_notes(by: dict[str, list[dict]], as_on: dt.date, ctx: ParseContext) -> 
         ctx.notes.append(f"reserves.cash_balances is dated {cash}, not the as-on date {as_on}")
 
 
+def _note_publication_day(release: Release, as_on: dt.date, ctx: ParseContext) -> None:
+    """Note a release that did not come out on the next business day after its as-on date."""
+    published = release.release_date
+    if published is None:
+        return
+    try:
+        expected = ctx.settlement_calendar().add_business_days(as_on, 1)
+    except CalendarCoverageError:
+        ctx.notes.append(f"the business day after the as-on date {as_on} is in a year the settlement calendar "
+                         f"does not cover; the publication day {published} was not checked against it")
+        return
+    if published != expected:
+        ctx.notes.append(f"published on {published}, not on {expected}, the next business day after the as-on "
+                         f"date {as_on}")
+
+
 def parse_money_market_operations(release: Release, ctx: ParseContext | None = None) -> list[dict]:
     """Rows of a Money Market Operations release, one per printed data line (``COLUMNS[MMO]`` fields)."""
     ctx = ctx or ParseContext()
@@ -815,8 +897,10 @@ def parse_money_market_operations(release: Release, ctx: ParseContext | None = N
         raise ReleaseParseError(f"{release.source_file}: no '(Amount in ₹ crore, Rate in Per cent)' line; units "
                                 "unknown")
     unknown: dict[str, list[str]] = {}
-    rows = (_mmo_money_markets(release, ctx, unknown) + _mmo_operations(release, as_on, ctx, unknown)
-            + _mmo_reserves(release, ctx, unknown))
+    markets, markets_table = _mmo_money_markets(release, ctx, unknown)
+    operations, operations_table = _mmo_operations(release, as_on, ctx, unknown)
+    reserves, reserves_table = _mmo_reserves(release, ctx, unknown)
+    rows = markets + operations + reserves
     by: dict[str, list[dict]] = {}
     for row in rows:
         by.setdefault(row["item"], []).append(row)
@@ -828,6 +912,9 @@ def parse_money_market_operations(release: Release, ctx: ParseContext | None = N
     _mmo_limits(rows, release, ctx)
     _mmo_identities(by, release, ctx, unknown)
     _mmo_notes(by, as_on, ctx)
+    _note_publication_day(release, as_on, ctx)
+    unit_tables = [t for t in release.data_tables if squash(t.text) == _UNIT_LINE]
+    _note_unread_tables(release, [markets_table, operations_table, reserves_table, *unit_tables], ctx)
     return rows
 
 
@@ -894,7 +981,7 @@ def parse_laf_auction_result(release: Release, ctx: ParseContext | None = None) 
             pairs.append((r, row[0].text, row[-1].text if len(row) == 2 else ""))
     found, wordings = _labelled_values(pairs, _LAF_RESULT_ROWS, src, ctx)
     _missing_rows(found, _LAF_RESULT_FIELDS, src)
-    _check_wording(wordings, direction, src, "table")
+    _check_wording(wordings, direction, src, "table uses")
     _unit_is_crore((found[f][0] for f in ("notified_cr", "received_cr", "accepted_cr")), src)
     rec: dict = {"auction_date": auction_date, "direction": direction,
                  "tenor_days": _tenor_days(found["tenor"][1], f"{src}: {found['tenor'][0]!r}")}
@@ -928,10 +1015,11 @@ def parse_laf_auction_result(release: Release, ctx: ParseContext | None = None) 
                                    f"{'above' if sign < 0 else 'below'} the cut-off {cutoff:g} of a "
                                    f"{direction.replace('_', ' ')}")
     rec["liquidity_effect_cr"] = _signed(-1.0 if direction == "reverse_repo" else 1.0, rec["accepted_cr"])
-    if rec["partial_pct"] is None and rec["accepted_cr"] < rec["received_cr"] - tol:
+    if rec["partial_pct"] is None and 0 < rec["accepted_cr"] < rec["received_cr"] - tol:
         ctx.notes.append("accepted less than received but no partial percentage printed")
     if direction == "repo":
         ctx.notes.append(_UNSAMPLED_NOTE.format(what="variable rate repo (injection) result"))
+    _note_unread_tables(release, [table], ctx)
     return [rec]
 
 
@@ -970,7 +1058,7 @@ def parse_laf_auction_announcement(release: Release, ctx: ParseContext | None = 
     out = []
     for r in range(h + 1, len(grid)):
         cells = {f: grid[r][c] for f, c in cols.items()}
-        if not any(clean_text(v) for v in grid[r]):
+        if not any(clean_text(v) for v in grid[r]) or _spanning_row(table, h, r, "auction", ctx):
             continue
         where = f"{src}: row {r + 1}"
         window = _WINDOW.match(clean_text(cells["window"]))
@@ -995,8 +1083,7 @@ def parse_laf_auction_announcement(release: Release, ctx: ParseContext | None = 
         if weekday and weekday.group(1).lower() != _WEEKDAYS[rec["reversal_date"].weekday()]:
             ctx.notes.append(f"row {r + 1}: the reversal date {rec['reversal_date']} is a "
                              f"{_WEEKDAYS[rec['reversal_date'].weekday()].title()}, not a {weekday.group(1)}")
-        if rec["reversal_date"].weekday() >= 5:
-            ctx.notes.append(f"row {r + 1}: the reversal date {rec['reversal_date']} falls on a weekend")
+        _note_not_business_day(ctx, rec["reversal_date"], f"row {r + 1}: the reversal date")
         out.append(rec)
     if not out:
         raise ReleaseParseError(f"{src}: no rows under the header of the auction table")
@@ -1007,6 +1094,7 @@ def parse_laf_auction_announcement(release: Release, ctx: ParseContext | None = 
                          "auction date of the title")
     if direction == "repo":
         ctx.notes.append(_UNSAMPLED_NOTE.format(what="variable rate repo (injection) announcement"))
+    _note_unread_tables(release, [table], ctx)
     return out
 
 
@@ -1088,23 +1176,31 @@ def parse_omo_result(release: Release, ctx: ParseContext | None = None) -> list[
         len(row) > 1 and label_key(row[0].text).startswith("aggregateamount") for row in t.rows)],
         "an 'Aggregate Amount ... notified' row")
     summary, wordings = _labelled_values(
-        ((r, row[0].text, row[-1].text) for r, row in enumerate(summary_table.rows, start=1) if len(row) > 1),
+        ((r, row[0].text, row[-1].text if len(row) > 1 else "") for r, row in enumerate(summary_table.rows, start=1)
+         if row),
         _OMO_SUMMARY_ROWS, f"{src}: summary", ctx)
     _missing_rows(summary, _OMO_SUMMARY_FIELDS, f"{src}: summary")
     totals = {f: _crore(summary[f][1], f"{src}: {summary[f][0]!r}") for f in _OMO_SUMMARY_FIELDS}
     detail = _one_table(release, [t for t in release.data_tables
                                   if t.rows and len(t.rows[0]) > 1 and label_key(t.rows[0][0].text) == "security"],
                         "a first row headed 'Security'")
+    names = [cell.text for cell in detail.rows[0][1:]]
+    if not all(names):
+        raise ReleaseParseError(f"{src}: empty security name in the header {names}")
+    # One value cell for each security in every row: a row short of a cell would shift its values to the wrong
+    # securities, and the sums would not show it. A single cell across the whole table is a remark, noted below.
+    width = 1 + len(names)
+    for r, raw in enumerate(detail.rows, start=1):
+        remark = len(raw) == 1 and raw[0].colspan >= width
+        if not remark and (len(raw) != width or any(cell.colspan != 1 or cell.rowspan != 1 for cell in raw)):
+            raise ReleaseParseError(f"{src}: details row {r} ({raw[0].text if raw else ''!r}) is not a label and "
+                                    f"one cell for each of the {len(names)} securities "
+                                    f"({[cell.text for cell in raw[1:]]})")
     grid = detail.grid()
-    names = grid[0][1:]
-    while names and not names[-1]:
-        names.pop()
-    if not names or any(not n for n in names):
-        raise ReleaseParseError(f"{src}: empty security name in the header {grid[0][1:]}")
-    found, more = _labelled_values(((r + 1, row[0], row[1:1 + len(names)]) for r, row in enumerate(grid) if r),
+    found, more = _labelled_values(((r + 1, row[0], row[1:width]) for r, row in enumerate(grid) if r),
                                    _OMO_DETAIL_ROWS, f"{src}: details", ctx)
     _missing_rows(found, _OMO_DETAIL_FIELDS, f"{src}: details")
-    _check_wording(wordings | more, operation, src, "tables")
+    _check_wording(wordings | more, operation, src, "tables use")
     _unit_is_crore((found[f][0] for f in ("offered_cr", "accepted_cr")), src)
     sign = 1.0 if operation == "purchase" else -1.0
     tol = ctx.limits.amount_tolerance_cr
@@ -1154,6 +1250,7 @@ def parse_omo_result(release: Release, ctx: ParseContext | None = None) -> list[
         ctx.notes.append(f"total accepted {accepted:g} is above the aggregate amount notified {notified:g}")
     if operation == "sale":
         ctx.notes.append(_UNSAMPLED_NOTE.format(what="OMO sale result"))
+    _note_unread_tables(release, [summary_table, detail], ctx)
     return out
 
 
@@ -1190,7 +1287,7 @@ def parse_omo_announcement(release: Release, ctx: ParseContext | None = None) ->
     out = []
     for r in range(h + 1, len(grid)):
         cells = {f: grid[r][c] for f, c in cols.items()}
-        if not any(clean_text(v) for v in grid[r]):
+        if not any(clean_text(v) for v in grid[r]) or _spanning_row(table, h, r, "securities", ctx):
             continue
         where = f"{src}: row {r + 1} [{cells['security']}]"
         isin = clean_text(cells["isin"]).upper()
@@ -1221,17 +1318,18 @@ def parse_omo_announcement(release: Release, ctx: ParseContext | None = None) ->
         raise ReleaseParseError(f"{src}: no securities under the header of the table")
     if operation == "sale":
         ctx.notes.append(_UNSAMPLED_NOTE.format(what="OMO sale announcement"))
+    _note_unread_tables(release, [table], ctx)
     return out
 
 
 # --- Issuance calendars -----------------------------------------------------------------------------
 
 _PERIOD = re.compile(r"\(" + _LONG_DATE + r" to " + _LONG_DATE + r"\)")
-_TITLE_PERIOD = re.compile(r"\bfor ([a-z]+) (\d{4})\s*[-–]\s*([a-z]+) (\d{4})$", re.I)
-_WEEK = re.compile(r"^([A-Z][a-z]+) (\d{1,2})(?:, (\d{4}))?\s*[-–]\s*(?:([A-Z][a-z]+) )?(\d{1,2}), (\d{4})$")
+_TITLE_PERIOD = re.compile(r"\bfor ([a-z]+) (\d{4})\s*[-–—]\s*([a-z]+) (\d{4})$", re.I)
+_WEEK = re.compile(r"^([A-Z][a-z]+) (\d{1,2})(?:, (\d{4}))?\s*[-–—]\s*(?:([A-Z][a-z]+) )?(\d{1,2}), (\d{4})$")
 _ALLOCATION = re.compile(r"^\(([ivx]+)\)\s*(\d+)\s*Years?\s*(SGrB)?\s*for\s*₹\s*([\d,]+(?:\.\d+)?)\s*crore$", re.I)
 _ROMAN = {"i": 1, "ii": 2, "iii": 3, "iv": 4, "v": 5, "vi": 6, "vii": 7, "viii": 8, "ix": 9, "x": 10}
-_QUARTER = re.compile(r"\bquarter ([a-z]+)\s*[-–]\s*([a-z]+),? (\d{4})$", re.I)
+_QUARTER = re.compile(r"\bquarter ([a-z]+)\s*[-–—]\s*([a-z]+),? (\d{4})$", re.I)
 _QUARTERS = {("april", "june"), ("july", "september"), ("october", "december"), ("january", "march")}
 _SDL_TOTAL = re.compile(r"expected to be ₹\s*([\d,]+(?:\.\d+)?)\s*crore", re.I)
 
@@ -1288,7 +1386,8 @@ def parse_gsec_calendar(release: Release, ctx: ParseContext | None = None) -> li
     """Rows of a GoI dated-securities issuance calendar, one per allocation line (``COLUMNS[GSEC_CALENDAR]``)."""
     ctx = ctx or ParseContext()
     src = release.source_file
-    table, h, cols = _column_table(release, {"week_no": "slno", "week": "auctionweek", "week_amount_cr": "amount",
+    table, h, cols = _column_table(release, {"week_no": ("slno", "srno", "sno"), "week": "auctionweek",
+                                             "week_amount_cr": "amount",
                                              "allocation": "securitywiseallocation"}, (), ctx, "calendar")
     grid = table.grid()
     if "crore" not in grid[h][cols["week_amount_cr"]].lower():
@@ -1299,11 +1398,15 @@ def parse_gsec_calendar(release: Release, ctx: ParseContext | None = None) -> li
     for r in range(h + 1, len(grid)):
         cells = {f: grid[r][c] for f, c in cols.items()}
         where = f"{src}: row {r + 1}"
-        if not any(clean_text(v) for v in grid[r]):
+        if not any(clean_text(v) for v in grid[r]) or _spanning_row(table, h, r, "calendar", ctx):
             continue
         if any(squash(v) == "total" for v in grid[r]):
+            if total is not None:
+                raise ReleaseParseError(f"{where}: a second Total row")
             total = _need(_num(cells["week_amount_cr"], f"{where} (Total)"), f"{where} (Total)", "amount")
             continue
+        if total is not None:
+            raise ReleaseParseError(f"{where}: a row after the Total row ({[c for c in grid[r] if c]})")
         m = _ALLOCATION.match(clean_text(cells["allocation"]))
         if not m or m.group(1).lower() not in _ROMAN:
             raise ReleaseParseError(f"{where}: {cells['allocation']!r} is not an allocation line of the form "
@@ -1354,6 +1457,7 @@ def parse_gsec_calendar(release: Release, ctx: ParseContext | None = None) -> li
             raise SanityCheckError(f"{src}: the weeks add up to {summed:g} but the Total row says {total:g}")
     for rec in out:
         rec["total_cr"] = total
+    _note_unread_tables(release, [table], ctx)
     return out
 
 
@@ -1373,9 +1477,7 @@ def parse_sdl_calendar(release: Release, ctx: ParseContext | None = None) -> lis
                if re.match(r"annex", clean_text(a.text()), re.I) and clean_text(a.attrs.get("href", ""))]
     if not annexes:
         ctx.notes.append("no links named Annex in the text; annex_urls left blank")
-    if release.data_tables:
-        ctx.notes.append(f"{len(release.data_tables)} tables in the release were not read (the sampled page had "
-                         "none)")
+    _note_unread_tables(release, [], ctx)
     total = _need(_num(totals[0], f"{src}: total"), src, "total")
     if total <= 0:
         raise SanityCheckError(f"{src}: the quarter's total {total:g} is not above 0")

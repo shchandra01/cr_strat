@@ -238,6 +238,22 @@ def _upsert_csv(path: Path, new: pd.DataFrame, replace_on: list[str], order: lis
     return merged
 
 
+def _keep_published(path: Path, table: pd.DataFrame) -> pd.DataFrame:
+    """``table`` with each blank ``published`` filled from the CSV at ``path``, by release.
+
+    Only a feed copy has a publication time. A release read again from its
+    saved page alone must not lose the time an earlier run took from the feed.
+    """
+    if not len(table) or not table["published"].isna().any() or not path.exists():
+        return table
+    old = pd.read_csv(path, dtype=str, keep_default_na=False)
+    if "published" not in old or "release_id" not in old:
+        return table
+    stored = old[old["published"] != ""].drop_duplicates("release_id").set_index("release_id")["published"]
+    known = pd.to_datetime(table["release_id"].astype(str).map(stored))
+    return table.assign(published=table["published"].fillna(known))
+
+
 def _rbi_releases(args: argparse.Namespace) -> int:
     out = Path(args.out_dir)
     known = out / "gsec_announcement.csv"
@@ -248,7 +264,7 @@ def _rbi_releases(args: argparse.Namespace) -> int:
     for kind, table in batch.tables.items():
         path = out / f"{kind}.csv"
         if len(table) or path.exists():
-            _upsert_csv(path, table, ["release_id"], list(RELEASE_COLUMNS[kind]),
+            _upsert_csv(path, _keep_published(path, table), ["release_id"], list(RELEASE_COLUMNS[kind]),
                         ["release_date", "release_id", "line"])
     _upsert_csv(out / "releases.csv", batch.releases, ["release_id", "source_file"], list(INDEX_COLUMNS),
                 ["release_date", "release_id", "source_file"])
@@ -569,7 +585,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--cash-flows", action="store_true", help="also list the remaining cash flows")
     p.set_defaults(func=_bond_price)
 
-    p = sub.add_parser("rbi-releases", help="auction results and announcements from saved RBI pages and RSS feeds")
+    p = sub.add_parser("rbi-releases", help="auctions, liquidity operations, money-market rates and calendars from "
+                                            "saved RBI pages and RSS feeds")
     p.add_argument("files", nargs="+", help="saved BS_PressReleaseDisplay pages and pressreleases_rss.xml copies")
     p.add_argument("--out-dir", required=True,
                    help="one CSV per release kind plus releases.csv; re-running replaces a release's rows")

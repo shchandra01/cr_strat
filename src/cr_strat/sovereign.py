@@ -47,7 +47,13 @@ neither Tripura nor Delhi, yet Tripura issues SDLs: ``TR`` and ``DL`` are this
 package's own codes, marked so in ``source``. ``state_code`` maps a printed
 state name (any case and spacing: ``UTTARPRADESH``, ``TAMILNADU``,
 ``CHHATTISGARH`` and FIMMDA's ``Chattisgarh``; old names ``ORISSA``,
-``PONDICHERRY``, ``UTTARANCHAL``) to its code.
+``PONDICHERRY``, ``UTTARANCHAL``; ``KERALAM``, as RBI's state calendar of
+1 Oct 2026 names Kerala) to its code. RBI's SDL results name one state two
+ways in one release: the column heading spells it out (``ANDHRA PRADESH SGS
+2051``) and the reissue cell below shortens it (``Re-issue of 7.68% ANDHRA
+SGS 2051``, seen on 17 Nov 2026). ``ANDHRA`` is the only short form seen and
+the only one in the table: a name that is not listed has no code, and is
+never matched by resemblance. Compare states by code, not by spelling.
 
 **RBI lists** (saved pages; nothing here downloads):
 
@@ -166,7 +172,10 @@ STATES: tuple[State, ...] = tuple(State(c, n, p, FIMMDA_STATE_LIST) for c, n, p 
     ("PY", "Puducherry", "38"), ("JK", "Jammu and Kashmir", "49"),
 )) + (State("TR", "Tripura", None, LOCAL_CODE), State("DL", "Delhi", None, LOCAL_CODE))
 STATE_BY_CODE = {s.code: s for s in STATES}
-_STATE_ALIASES = {"CHHATTISGARH": "CG", "ORISSA": "OD", "PONDICHERRY": "PY", "UTTARANCHAL": "UK"}
+# Other spellings: RBI's CHHATTISGARH (FIMMDA's list has Chattisgarh), three old names, the short ANDHRA of the
+# reissue cells in RBI's SDL result of 17 Nov 2026, and KERALAM, as RBI's state calendar of 1 Oct 2026 names Kerala.
+_STATE_ALIASES = {"CHHATTISGARH": "CG", "ORISSA": "OD", "PONDICHERRY": "PY", "UTTARANCHAL": "UK", "ANDHRA": "AP",
+                  "KERALAM": "KL"}
 _STATE_BY_NAME = {re.sub(r"[^A-Z]", "", s.name.upper()): s.code for s in STATES} | _STATE_ALIASES
 _STATE_BY_PREFIX = {s.isin_prefix: s.code for s in STATES if s.isin_prefix}
 

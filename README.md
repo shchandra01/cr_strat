@@ -105,6 +105,7 @@ the pressure variable and the price response for each event.
 | `bonds` | G-sec, SDL, STRIPS, T-bill, CMB, CP and CD pricing: coupon schedules, accrued interest, price and yield, duration, DV01, convexity |
 | `htmlparse` | Tables, text and links from saved HTML pages with the standard library: nested tables kept apart, colspan and rowspan expanded; strict number and date cells; firewall-page detection |
 | `rbi_releases` | RBI press releases from saved pages and the RSS feed: GoI, T-bill and SDL auction results, underwriting and switch results, auction announcements. A registry of release types; checks that refuse a release rather than misread it |
+| `rbi_operations` | The other RBI releases of that registry: the daily Money Market Operations (one row per printed line: call, triparty and market repo rates and volumes, the SDF-MSF corridor, every liquidity operation, net liquidity, reserves), variable rate repo and reverse repo auctions, open market operations, the GoI and state issuance calendars |
 | `sovereign` | Sovereign security names (G-sec, SDL, T-bill, FRB, green bond) parsed to a join key; state codes; RBI's GoI-outstanding and FAR lists; a master with one row per ISIN; name-to-ISIN matching |
 | `auctions` | One table of G-sec, SDL and T-bill auctions from FIMMDA's yearly and SDL workbooks, RBI's Handbook Table 221 and RBI's releases: ISINs, settlement dates, and a check that the cut-off price reproduces the printed yield, which infers settlement and missing maturity dates |
 | `issuance` | Ledger of issues, reissues, switches, buybacks and maturities per ISIN; outstanding stock on any date, backward from RBI's lists or forward, with completeness flags; reconciliation with RBI's list; supply by month and tenor bucket |
@@ -158,9 +159,15 @@ the pressure variable and the price response for each event.
   RBI's list (18 of 122 G-secs agree to the crore on 16 Nov 2026). A
   security with no known maturity date (FRB 2024) is redeemed on a
   placeholder date, the last business day of the year in its name.
-- **The RBI parsers have seen one saved page per release type** (Nov 2026).
+- **The RBI parsers have seen one or two saved releases per type** (Nov
+  2026; Money Market Operations on four consecutive days, Friday to Monday).
   A GoI result with several securities or for a new issue, an FRB result and
   the feed titles of full results were not sampled; a page whose labels
-  differ is refused, not guessed. RBI's SDL and STRIPS lists sit behind
-  rbidocs' bot challenge and have no loader, so the master holds G-secs
-  unless SDL ISINs are added with `--extra`.
+  differ is refused, not guessed. Not sampled either: Money Market
+  Operations for a weekday holiday, with a repo auction, with a filled
+  fixed-rate line or from before 30 Sep 2025; any repo (injection) auction
+  or OMO sale (read only if the labels fit descriptions of such releases,
+  and noted); the T-bill calendar, switch and buyback announcements and
+  buyback results, which have no parser. RBI's SDL and STRIPS lists sit
+  behind rbidocs' bot challenge and have no loader, so the master holds
+  G-secs unless SDL ISINs are added with `--extra`.

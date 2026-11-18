@@ -1,4 +1,4 @@
-"""RBI press releases on government securities: read saved pages and RSS feeds, parse the auction tables.
+"""RBI press releases: read saved pages and RSS feeds, classify them, parse the auction tables.
 
 Nothing here downloads. Inputs are pages saved from
 ``https://www.rbi.org.in/Scripts/BS_PressReleaseDisplay.aspx?prid=<id>`` and
@@ -6,6 +6,14 @@ copies of the press-release RSS feed (``pressreleases_rss.xml``, the 10
 latest releases with their full tables). RBI grants no reuse licence and its
 disclaimer prohibits caching without permission: ask RBI in writing before
 keeping a history of these releases (``docs/rates_data_sources.md``).
+
+This module holds the reader, the registry of release kinds, the entry point
+``parse_releases`` and the parsers of the auction releases (results and
+announcements of GoI dated securities, T-bills and SDLs, underwriting and
+switch results). The parsers of Money Market Operations, variable rate repo
+and reverse repo auctions, open market operations and the issuance calendars
+are in ``rbi_operations``, which registers its kinds here when this module is
+imported: ``import cr_strat.rbi_releases`` is enough to have them all.
 
 **Reading.** ``read_release_page`` finds the page frame (a table whose direct
 rows are a PDF size, ``Date : Nov 13, 2026``, the title and the content cell)
@@ -25,26 +33,64 @@ two). The HTML table extractor lives in ``htmlparse`` and is re-exported here
 **Types.** ``classify_title`` maps a title to a kind through the registry
 ``RELEASE_TYPES``; ``classify`` falls back to the tables' labels when the
 title is not recognised, and a parser refuses a release whose tables do not
-carry its labels. Kinds with a parser (titles as observed in Nov 2026):
+carry its labels. Kinds with a parser (titles as observed in Nov 2026; the
+last seven are parsed in ``rbi_operations``, whose docstring describes them):
 
-========================  ==============================================================
-Kind                      Title
-========================  ==============================================================
-``gsec_result``           Government Stock - Full Auction Results
-``tbill_result``          Treasury Bills: Full Auction Result
-``sdl_result``            State Government Securities - Full Auction Result
-``underwriting_result``   Result of Underwriting Auction conducted on November 13, 2026
-``switch_result``         Result: Conversion/Switch Auction of Government of India Securities
-``gsec_announcement``     Auction of Government of India Dated Securities
-``tbill_announcement``    Auction of 91-Day, 182-Day and 364-Day Treasury Bills
-``sdl_announcement``      Auction of State Government Securities
-========================  ==============================================================
+============================  ==================================================================
+Kind                          Title
+============================  ==================================================================
+``gsec_result``               Government Stock - Full Auction Results
+``tbill_result``              Treasury Bills: Full Auction Result
+``sdl_result``                State Government Securities - Full Auction Result
+``underwriting_result``       Result of Underwriting Auction conducted on November 13, 2026
+``switch_result``             Result: Conversion/Switch Auction of Government of India Securities
+``gsec_announcement``         Auction of Government of India Dated Securities (or: Dated Security)
+``tbill_announcement``        Auction of 91-Day, 182-Day and 364-Day Treasury Bills
+``sdl_announcement``          Auction of State Government Securities
+``money_market_operations``   Money Market Operations as on November 13, 2026
+``laf_auction_announcement``  RBI to conduct 2-day Variable Rate Reverse Repo (VRRR) auction under
+                              LAF on November 17, 2026 (and: Variable Rate Repo (VRR))
+``laf_auction_result``        Result of the 3-day Variable Rate Reverse Repo (VRRR) auction held
+                              on November 13, 2026 (and: Variable Rate Repo (VRR))
+``omo_announcement``          RBI announces OMO Purchase of Government of India Securities
+``omo_result``                Detailed Result: OMO Purchase Auction held on Mar 13, 2026 and
+                              Settlement on Mar 16, 2026
+``gsec_calendar``             Issuance Calendar for Marketable Dated Securities for October 2026 -
+                              March 2027
+``sdl_calendar``              Indicative Calendar of Market borrowings by State Governments/ Union
+                              Territories for the Quarter October – December 2026
+============================  ==================================================================
 
-Money market operations, VRRR announcements and results, OMO results and the
-issuance calendars are registered without a parser: they are reported as
-skipped with that reason. A parser for any of them is one more
-``register(ReleaseType(...))`` call. Other titles are skipped as not
-recognised.
+Kinds registered without a parser (``ReleaseType.no_parser`` says why, and
+that reason is what such a release is skipped with). The release index still
+records each one's kind and, for a feed copy, the time it was published:
+
+=============================  =================================================================
+Kind                           Title
+=============================  =================================================================
+``gsec_cutoff``                Government Stock - Auction Results: Cut-off
+``tbill_cutoff``               91-Day, 182-Day and 364-Day T-Bill Auction Result: Cut-off
+``sdl_cutoff``                 Result of Yield/Price Based Auction of State Government Securities
+``underwriting_announcement``  Underwriting Auction for sale of Government Security for ₹34,000
+                               crore on November 13, 2026
+``switch_announcement``        Conversion/Switch of Government of India Securities
+``buyback_result``             Result of Buyback Auction of Government of India Dated Securities
+``buyback_announcement``       Buyback of Government of India Dated Securities
+``omo_cutoff``                 Open Market Operation (OMO) - Purchase of Government of India
+                               Securities held on Mar 13, 2026: Cut-Offs
+``tbill_calendar``             Calendar for Auction of Government of India Treasury Bills
+``mpc_resolution``             Resolution of the Monetary Policy Committee (MPC) October 5 to 7,
+                               2026
+``fx_swap_result``             Result of the USD/INR Buy/Sell Swap Auction, February 4, 2026
+=============================  =================================================================
+
+The first five titles were seen in RBI's listing or feed; the last six are
+known from descriptions of such releases (the MPC resolution's from a link
+on RBI's policy page). None of the eleven layouts was sampled, except the
+SDL quick result, whose full result follows the same afternoon. A parser for
+any of them is one more ``register(ReleaseType(...))`` call. Other titles
+are skipped as not recognised. Of the titles seen in November 2026 none is
+taken by two patterns.
 
 **Tables.** ``parse_releases(sources)`` takes saved pages and feeds (paths or
 text), reads each release once (copies of a release id are tried in a fixed
@@ -59,7 +105,9 @@ release, so ``(release_id, line)`` is a row's key), the security name as
 printed, ``press_release_no`` and ``source_file`` (a file name, ``#n`` for the
 n-th feed item). Units: amounts in ₹ crore of face value (``_cr``), prices per
 ₹100 face value, yields in percent, counts of bids (``_count``), dates as
-pandas Timestamps.
+pandas Timestamps. ``column_type(name)`` is the one rule by which every
+table column is typed (date, time, int, float or text), for a reader of the
+CSVs that ``cr-strat rbi-releases`` writes.
 
 * GoI and T-bill results read the "Auction Results" table: one column per
   security, sections I to XI by label. Each spanning label is expanded, so a
@@ -75,7 +123,13 @@ pandas Timestamps.
   date comes from "held on <date>". Footnote marks (``BIHAR SGS 2044*``) are
   kept in ``footnote`` with their text. A reissue's coupon and first issue
   date come from its tenor cell; a new issue's coupon is its cut-off yield.
-  The ``Total`` column is a check, not a row.
+  The tenor cell must name the column's security. The two are compared by
+  state code and maturity year, not as text, because RBI spells a state two
+  ways in one release (``ANDHRA PRADESH SGS 2051`` above ``Re-issue of 7.68%
+  ANDHRA SGS 2051``, ``MADHYA PRADESH`` above ``MADHYAPRADESH``); another
+  state, another year, or a name the state table of ``sovereign`` does not
+  list (unless the heading has the very same name) refuses the release. The
+  ``Total`` column is a check, not a row.
 * Underwriting results give the minimum underwriting commitment, the
   additional competitive underwriting accepted and the commission cut-off in
   paise per ₹100 face value.
@@ -105,7 +159,10 @@ passed as ``announcements``); otherwise accepted amounts may reach
 the largest ratio in FIMMDA's 2015-2027 G-sec auction files is 2.0, ₹2,000
 crore on ₹1,000 crore notified). Softer anomalies (a T-bill yield that does
 not follow from its price on the tenor, a new SDL issue not priced at 100,
-an unrecognised row label) are kept as notes in the release index.
+an unrecognised row label) are kept as notes in the release index. The
+checks of the operation releases are listed in ``rbi_operations``; two of
+their notes ask the settlement calendar of ``ParseContext`` and skip, with a
+note, a date in a year its holiday list does not cover.
 """
 
 from __future__ import annotations
@@ -121,6 +178,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from cr_strat.calendars import BusinessCalendar, mumbai_settlement_calendar
 from cr_strat.htmlparse import (  # noqa: F401  (re-exported: the HTML table extractor)
     BlockedPageError,
     Cell,
@@ -142,6 +200,7 @@ from cr_strat.sovereign import (
     GSEC,
     SDL,
     TBILL,
+    SecurityName,
     normalise_name,
     parse_sdl_tenor,
     parse_security_name,
@@ -421,11 +480,25 @@ DEFAULT_LIMITS = SanityLimits()
 
 @dataclass
 class ParseContext:
-    """What a parser may use besides the release: the limits, announced greenshoes, and a note list."""
+    """What a parser may use besides the release: the limits, announced greenshoes, a note list and a calendar.
+
+    ``calendar`` is the settlement calendar the soft date checks ask (a
+    release published on the next business day, a reversal on a business
+    day); ``None`` means the shipped Mumbai calendar, loaded when first asked.
+    A date in a year the calendar does not cover is not checked, and a note
+    says so: no parser fails for want of a holiday list.
+    """
 
     limits: SanityLimits = DEFAULT_LIMITS
     greenshoe: dict[tuple[dt.date, str], float] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
+    calendar: BusinessCalendar | None = None
+
+    def settlement_calendar(self) -> BusinessCalendar:
+        """``calendar``, or the shipped Mumbai settlement calendar when none was given."""
+        if self.calendar is None:
+            self.calendar = mumbai_settlement_calendar()
+        return self.calendar
 
 
 Parser = Callable[[Release, ParseContext], list[dict]]
@@ -901,11 +974,38 @@ def parse_sdl_result(release: Release, ctx: ParseContext | None = None) -> list[
             stated = _cnt(total[f], "Total") if f.endswith("_count") else _num(total[f], "Total")
             if stated is None:
                 continue
-            summed = sum(r[f] or 0 for r in out)
+            summed = sum(r.get(f) or 0 for r in out)  # a row may be missing from one of the tables
             if abs(summed - stated) > ctx.limits.amount_tolerance_cr * max(1, len(out)):
                 raise SanityCheckError(f"{release.source_file}: {f} sums to {summed:g} over the securities but "
                                        f"the Total column says {stated:g}")
     return out
+
+
+def _check_reissue_of(column: SecurityName, of: SecurityName, label: str, cell: str) -> None:
+    """Refuse an SDL column whose reissue cell names another security than its heading.
+
+    The two are compared by state code and maturity year, never as text: RBI
+    spells one state two ways in one release (``ANDHRA PRADESH SGS 2051`` over
+    ``Re-issue of 7.68% ANDHRA SGS 2051``, ``MADHYA PRADESH`` over
+    ``MADHYAPRADESH``). A state the table in ``sovereign`` does not know has
+    no code to compare: two such names are one state only if they are spelt
+    alike (case and spacing aside), and an unknown name is never taken for a
+    known state.
+    """
+    if of.maturity_year != column.maturity_year:
+        raise ReleaseParseError(f"{label}: tenor cell names another security: it matures in {of.maturity_year}, "
+                                f"the column's in {column.maturity_year} ({cell!r})")
+    if column.state_code is not None and of.state_code is not None:
+        if of.state_code != column.state_code:
+            raise ReleaseParseError(f"{label}: tenor cell names another security: its state is {of.state_code}, "
+                                    f"the column's {column.state_code} ({cell!r})")
+    elif (column.state_code, of.state_code) != (None, None):
+        unknown = of if of.state_code is None else column
+        raise ReleaseParseError(f"{label}: cannot tell whether the tenor cell names the column's security: state "
+                                f"{unknown.state_name!r} has no code ({cell!r})")
+    elif squash(of.state_name or "") != squash(column.state_name or ""):
+        raise ReleaseParseError(f"{label}: tenor cell names another security: its state is {of.state_name!r}, and "
+                                f"neither state has a code ({cell!r})")
 
 
 def _sdl_record(name: str, cells: dict, label: str, auction_date: dt.date | None, notes: dict[str, str],
@@ -931,8 +1031,7 @@ def _sdl_record(name: str, cells: dict, label: str, auction_date: dt.date | None
                    first_issue_date=None)
     else:
         of = tenor.reissue_of
-        if (of.state_code, of.maturity_year) != (parsed.state_code, parsed.maturity_year):
-            raise ReleaseParseError(f"{label}: tenor cell names another security ({cells['tenor']!r})")
+        _check_reissue_of(parsed, of, label, cells["tenor"])
         if auction_date and of.first_issue_date and of.first_issue_date > auction_date:
             raise SanityCheckError(f"{label}: reissue of a security first issued after the auction")
         rec.update(issue_type="reissue", tenor_years=None, coupon_pct=of.coupon_pct,
@@ -1445,7 +1544,8 @@ def read_releases(sources: Iterable[str | Path | bytes]) -> tuple[list[Release],
 
 
 def parse_releases(sources: Iterable[str | Path | bytes], *, limits: SanityLimits = DEFAULT_LIMITS,
-                   announcements: pd.DataFrame | None = None) -> ReleaseBatch:
+                   announcements: pd.DataFrame | None = None,
+                   calendar: BusinessCalendar | None = None) -> ReleaseBatch:
     """Parse saved release pages and RSS feeds (paths or text) into one table per kind.
 
     Copies of one release id (the same release saved as a page and seen in a
@@ -1456,7 +1556,9 @@ def parse_releases(sources: Iterable[str | Path | bytes], *, limits: SanityLimit
     tried; copies after the parsed one are listed as duplicates.
     ``announcements``: GoI announcement rows from earlier runs
     (``COLUMNS['gsec_announcement']``), whose greenshoes bound the results;
-    announcements in the batch are used too.
+    announcements in the batch are used too. ``calendar``: the settlement
+    calendar for the soft date checks (default: the shipped Mumbai calendar,
+    loaded once, when a parser first asks for it).
     """
     releases, skipped = read_releases(sources)
     index: list[dict] = [{"release_id": s.release_id, "release_date": s.release_date, "published": None,
@@ -1504,7 +1606,7 @@ def parse_releases(sources: Iterable[str | Path | bytes], *, limits: SanityLimit
                 skip(release, kind, entry, f"title not recognised: {release.title!r}" if kind == "other"
                      else _no_parser_reason(kind))
                 continue
-            ctx = ParseContext(limits, greenshoe)
+            ctx = ParseContext(limits, greenshoe, calendar=calendar)
             if how == "tables":
                 ctx.notes.append(f"title {release.title!r} not recognised; classified as {kind} from its tables")
             try:
@@ -1514,6 +1616,8 @@ def parse_releases(sources: Iterable[str | Path | bytes], *, limits: SanityLimit
                 entry["notes"] = "; ".join(ctx.notes)
                 skip(release, kind, entry, f"{word}: {exc}")
                 continue
+            finally:
+                calendar = ctx.calendar  # the shipped calendar is loaded at most once in a batch
             for line, row in enumerate(rows, start=1):
                 row.update(release_id=release.release_id, release_date=release.release_date,
                            published=published, line=line, press_release_no=release.press_release_no,

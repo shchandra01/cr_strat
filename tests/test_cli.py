@@ -170,8 +170,8 @@ def _release_files(tmp_path):
     switch = fx.body("", fx.switch_table(fx.SWITCH_PAIRS), pr_no="2026-2027/1504")
     items = [dict(title="Result: Conversion/Switch Auction of Government of India Securities", prid=63982,
                   pub="Mon, 16 Nov 2026 14:55:00", html=switch),
-             dict(title="Money Market Operations as on November 15, 2026", prid=63981,
-                  pub="Mon, 16 Nov 2026 12:05:00", html=fx.body("Tables."))]
+             dict(title="Government Stock - Auction Results: Cut-off", prid=63969,
+                  pub="Fri, 13 Nov 2026 13:35:00", html=fx.body("Tables."))]
     (src / "pr_feed_20261116.xml").write_bytes(fx.feed(items))
     (src / "strips_3973.html").write_text(fx.blocked_page(), encoding="utf-8")
     return src
@@ -183,7 +183,7 @@ def test_rbi_releases_appends_idempotently(tmp_path, capsys):
     files = [str(p) for p in sorted(src.iterdir())]
     assert main(["rbi-releases", *files, "--out-dir", str(out)]) == 0
     printed = capsys.readouterr().out
-    assert "no parser for money_market_operations yet" in printed and "Support ID" in printed
+    assert "no parser for gsec_cutoff: not sampled; the full result follows" in printed and "Support ID" in printed
     first = {p.name: p.read_bytes() for p in out.iterdir()}
     assert set(first) == {"gsec_result.csv", "switch_result.csv", "releases.csv"}
     assert main(["rbi-releases", *files, "--out-dir", str(out)]) == 0
@@ -195,6 +195,27 @@ def test_rbi_releases_appends_idempotently(tmp_path, capsys):
     assert len(switch) == 3 and switch["published"].eq("2026-11-16T14:55:00").all()
     index = pd.read_csv(out / "releases.csv")
     assert sorted(index["status"]) == ["parsed", "parsed", "skipped", "skipped"]
+
+
+def test_rbi_releases_keeps_the_feed_time_when_the_page_is_read_alone(tmp_path):
+    import rbi_fixtures as fx
+
+    src = _release_files(tmp_path)
+    out = tmp_path / "out"
+    assert main(["rbi-releases", str(src / "pr_feed_20261116.xml"), "--out-dir", str(out)]) == 0
+    switch = pd.read_csv(out / "switch_result.csv")
+    assert switch["published"].eq("2026-11-16T14:55:00").all() and switch["source_file"].str.endswith("#1").all()
+    page = src / "switch_63982.html"  # the same release saved as a page: it has no publication time
+    page.write_text(fx.release_page(
+        "Result: Conversion/Switch Auction of Government of India Securities", "Nov 16, 2026",
+        fx.body("", fx.switch_table(fx.SWITCH_PAIRS), pr_no="2026-2027/1504"), prid=63982), encoding="utf-8")
+    assert main(["rbi-releases", str(page), "--out-dir", str(out)]) == 0
+    again = pd.read_csv(out / "switch_result.csv")
+    assert again["source_file"].eq("switch_63982.html").all() and len(again) == 3
+    assert again["published"].eq("2026-11-16T14:55:00").all()  # not blanked by the page
+    index = pd.read_csv(out / "releases.csv").set_index("source_file")
+    assert pd.isna(index.loc["switch_63982.html", "published"])  # the index says what each copy holds
+    assert index.loc["pr_feed_20261116.xml#1", "published"] == "2026-11-16T14:55:00"
 
 
 def test_rbi_releases_uses_stored_greenshoe(tmp_path):

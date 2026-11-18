@@ -103,9 +103,11 @@ to the trade yields' convention. Spreads are computed on the bond's basis.
 
 ## RBI press releases: saved pages and `pressreleases_rss.xml`
 
-RBI publishes every auction as a press release: GoI dated securities, T-bills
-and SDLs (announcement, then full result), underwriting and switch results.
-Save a release from
+RBI publishes every auction and liquidity operation as a press release: GoI
+dated securities, T-bills and SDLs (announcement, then full result),
+underwriting and switch results, the daily Money Market Operations, variable
+rate repo and reverse repo auctions, open market operations and the issuance
+calendars. Save a release from
 `https://www.rbi.org.in/Scripts/BS_PressReleaseDisplay.aspx?prid=<id>`
 (browser "save page", HTML only), or save the
 [press-release RSS feed](https://www.rbi.org.in/pressreleases_rss.xml), which
@@ -116,34 +118,128 @@ each copy's name. The site rate-limits (HTTP 418): a few requests, well apart.
 cr-strat rbi-releases data/raw/rbi/releases/*.html data/raw/rbi/feeds/*.xml --out-dir data/out/rbi
 ```
 
-This writes one CSV per release kind (`gsec_result`, `tbill_result`,
-`sdl_result`, `underwriting_result`, `switch_result`, `gsec_announcement`,
-`tbill_announcement`, `sdl_announcement`) and `releases.csv`, which lists
+This writes one CSV per release kind (below) and `releases.csv`, which lists
 every release read with its kind, status (`parsed`, `skipped`, `duplicate`),
 the reason and any notes. Running again replaces a release's rows, so
 overlapping feed copies add no duplicates. A row's key is
 `(release_id, line)`. Copies of one release (a saved page and a feed item)
 are tried in a fixed order, whatever the order of the files: saved pages
 first, then by file name. A copy that fails is skipped with its reason and
-the next one is tried; the rows keep the feed copy's `published` time.
+the next one is tried; the rows keep the feed copy's `published` time, also
+when a later run reads the saved page alone.
+
+| File | One row per |
+|---|---|
+| `gsec_result.csv`, `tbill_result.csv`, `sdl_result.csv` | Security in a full auction result |
+| `underwriting_result.csv`, `switch_result.csv` | Security underwritten; pair of securities switched |
+| `gsec_announcement.csv`, `tbill_announcement.csv`, `sdl_announcement.csv` | Line of an auction announcement |
+| `money_market_operations.csv` | Printed line of the daily Money Market Operations release |
+| `laf_auction_announcement.csv`, `laf_auction_result.csv` | Variable rate repo or reverse repo auction |
+| `omo_announcement.csv`, `omo_result.csv` | Security in an open market purchase or sale |
+| `gsec_calendar.csv` | Allocation line (week and tenor) of the half-yearly GoI issuance calendar |
+| `sdl_calendar.csv` | Quarter of the indicative calendar of state borrowings |
+
+Columns the tables share:
 
 | Column | Notes |
 |---|---|
 | `release_id` | RBI's `prid`; from the page's form action, else from a 4-7 digit number in the file name |
-| `release_date`, `published` | The page's `Date :` line; `published` (feed only) is `pubDate`, India time |
-| `auction_date`, `settlement_date` | As printed; a result page has no auction date, so it is the release date (SDLs: "held on") |
+| `release_date`, `published` | The page's `Date :` line; `published` (feed only) is `pubDate`, India time: when the market was told |
+| `auction_date`, `settlement_date` | As printed; an auction result page has no auction date, so it is the release date (SDLs: "held on") |
 | `security`, `name_key` | Name as printed, and the key `sovereign.parse_security_name` gives it for joins |
-| `*_cr`, `*_count` | ₹ crore of face value; numbers of bids |
-| `cutoff_price`, `cutoff_yield`, `wap`, `way` | Per ₹100 face value; percent |
+| `*_cr`, `*_count` | ₹ crore; numbers of bids or offers |
+| `cutoff_price`, `cutoff_yield`, `wap`, `way`, `*_pct` | Per ₹100 face value; percent |
 | `total_accepted_cr` | Competitive plus non-competitive (SDL: the printed total allotment) |
 | `greenshoe_cr` | From the GoI announcement for that auction, if read in this or an earlier run |
+| `liquidity_effect_cr` | Liquidity put into the banking system, RBI's sign: plus for a repo, MSF, SLF or OMO purchase, minus for a reverse repo, SDF or OMO sale |
+
+Amounts are face value in the auction, OMO and calendar tables and cash in
+the money-market and liquidity tables. An empty cell is a blank ("-", "NA" or
+nothing printed), never a zero; a printed `0.00` is 0.
+
+**`money_market_operations.csv`.** One release for every calendar day,
+published on the next Mumbai business day; after a weekend three arrive in
+one morning. `as_on_date` is the day the figures refer to (from the title);
+`release_date` and `published` are the publication. `item` names the printed
+line, `block` its table (`money_market`, `rbi_operations`,
+`reserve_position`), `label` and `marks` the label as printed and the
+footnote marks at its end (a changed mark is how RBI signals a changed
+definition).
+
+| `item` | Fields |
+|---|---|
+| `overnight.total`, `overnight.call_money`, `overnight.triparty_repo`, `overnight.market_repo`, `overnight.corporate_bond_repo` | `amount_cr`: volume, one leg; `rate_pct`: weighted average rate; `rate_low_pct`, `rate_high_pct`: the range. The total is the sum of the four parts |
+| `term.notice_money`, `term.term_money`, `term.triparty_repo`, `term.market_repo`, `term.corporate_bond_repo` | The same; term money prints a volume and a range but no rate |
+| `laf.today.repo`, `laf.today.reverse_repo`, `laf.today.msf`, `laf.today.sdf` | One row per operation of the day (`seq` counts them): `auction_date`, `tenor_days`, `maturity_date`, `amount_cr`, `rate_pct` (the facility's rate or the auction's cut-off), `liquidity_effect_cr` |
+| `laf.outstanding.repo`, `laf.outstanding.reverse_repo`, `laf.outstanding.msf`, `laf.outstanding.sdf` | The same for earlier operations that have not matured |
+| `net.today`, `net.outstanding`, `net.total` | Lines 5, E and F, signed as printed. They total the rows above: never add them to those rows |
+| `slf.availed` | Line D: `amount_cr`, `liquidity_effect_cr` |
+| `reserves.cash_balances`, `reserves.crr_requirement`, `government.surplus_cash_balance`, `liquidity.net_durable` | `amount_cr` and `ref_date`, each line's own date (only the cash balances are as on the release's day) |
+
+The policy corridor of the day is `rate_pct` of `laf.today.sdf` and
+`laf.today.msf`; the weighted average call rate is `rate_pct` of
+`overnight.call_money`. On a weekend the money-market lines print `0.00` and
+no rate, and the standing facilities still have rows: keep those days and
+never fill rates forward from them. A facility line with nothing printed
+gives no row. The sum of `liquidity_effect_cr` over a release is its line F.
+
+**Liquidity auctions.** `laf_auction_announcement.csv`: `direction` (`repo`
+injects, `reverse_repo` absorbs), `auction_date`, `tenor_days`,
+`notified_cr`, `window_start` and `window_end` (`HH:MM`, India time),
+`reversal_date`. `laf_auction_result.csv`: `notified_cr`, `received_cr`,
+`accepted_cr`, `cutoff_rate_pct`, `wa_rate_pct`, `partial_pct`,
+`liquidity_effect_cr`. The result's cut-off, amount and tenor reappear in
+that day's `laf.today.*` row.
+
+**Open market operations.** `omo_announcement.csv`: `operation` (`purchase`
+or `sale`), `auction_date`, `settlement_date`, and per security `isin`,
+`security`, `maturity_date`; `aggregate_notified_cr` is one amount for the
+whole auction, repeated on every row; `programme_pr_no` and `programme_date`
+name the earlier release that announced the programme. `omo_result.csv`: per
+security `offers_received_count`, `offered_cr`, `offers_accepted_count`,
+`accepted_cr`, `cutoff_yield`, `cutoff_price`, `way`, `wap`,
+`partial_allotment_pct`, with the auction's `aggregate_notified_cr`,
+`total_offered_cr` and `total_accepted_cr` repeated. The result prints no
+ISIN: the announcement lists the same securities in the same order.
+
+**Calendars.** `gsec_calendar.csv`: `period_start`, `period_end`, and per
+allocation line `week_no`, `week_start`, `week_end` (Monday to Friday),
+`week_amount_cr`, `allocation_no`, `tenor_years`, `security_type` (`GS`, or
+`SGrB` for a green bond), `amount_cr`; `total_cr` is the Total row. It is the
+calendar as first published: revisions come as later releases.
+`sdl_calendar.csv`: `quarter_start`, `quarter_end`, `total_cr` and
+`annex_urls`. The per-state amounts are in two PDFs on rbidocs.rbi.org.in,
+whose addresses are kept for a person to open in a browser; nothing here
+fetches them.
 
 Pages and feed items share one parser. A release whose labels do not match,
-whose numbers fail a check (yields 0-20%, prices 50-150, accepted not above
-received or notified plus greenshoe, totals that add up), or whose title is
-unknown is listed in `releases.csv` with the reason, never half-read. Money
-market operations, VRRR, OMO and calendar releases are recognised but not
-parsed yet.
+whose numbers fail a check, or whose layout was never sampled is listed in
+`releases.csv` with the reason, never half-read: yields 0-20%, prices
+50-150, accepted not above received or notified plus greenshoe, totals that
+add up; for Money Market Operations the overnight total and the three net
+liquidity lines must equal the rows they total, every maturity date must be
+the auction date plus the tenor, and a filled "Fixed Rate" line is refused
+(no sample had one, so its sign is unknown), as is a column no sample had.
+Softer findings are `notes` in `releases.csv` and leave the rows in place: a
+row or table that no parser knows (a row with its cells), an unknown column
+of the other tables, changed footnote marks, a rate outside its range, a
+release not published on the next business day. Read the notes after every
+run. The parsers of repo (injection) auctions and OMO sales were
+written from descriptions, not samples: such a release is read only if its
+labels fit and always carries a note saying so.
+
+Recognised but not parsed (the title is known; the layout was not sampled,
+or the full result follows the same day): cut-off quick results of GoI,
+T-bill, SDL and OMO auctions, underwriting and switch announcements, buyback
+announcements and results, the T-bill auction calendar, MPC resolutions and
+USD/INR swap auctions. `releases.csv` still gives each one's kind and
+publication time. Any other title is skipped as not recognised.
+
+Two notes use the Mumbai holiday list, which ends in 2026 (the publication
+day of Money Market Operations, the reversal day of an announced auction).
+For a date in 2027 or later the check is skipped and the note says so, until
+that year's holidays are added to `src/cr_strat/data/holidays_mumbai.csv`
+and the year is declared complete in `holidays_mumbai_years.csv`.
 
 RBI grants no reuse licence and its disclaimer prohibits caching without
 permission. Ask RBI in writing before keeping a history of its releases

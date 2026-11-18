@@ -363,3 +363,391 @@ def sdl_index_page(as_of: str = "November 11, 2026") -> str:
     return _list_frame(f"List of State Government Securities outstanding as on {as_of}*", "",
                        links=("https://rbidocs.example/OUTSTANDINGSGS.XLS",
                               "https://rbidocs.example/OUTSTANDINGSGS.PDF"))
+
+
+# --- Money Market Operations ------------------------------------------------------------------------
+#
+# A release is described by a dict (``mmo_friday()`` and the other days below) that the tests change before
+# ``mmo_body`` turns it into HTML. All amounts and rates are made up, chosen so that the sums the release prints
+# hold: the overnight total is the sum of its four parts, line 5 is MSF less reverse repo less SDF of the day,
+# line E the outstanding operations plus SLF, line F the two together. The four days form one sequence (a Friday
+# reverse repo for three days, weekend tenors of the standing facilities), so each day's outstanding block holds
+# the earlier days' operations that have not matured.
+
+NBSP5 = "&nbsp;" * 5
+MMO_UNITS = "(Amount in ₹ crore, Rate in Per cent)"
+MMO_MARKETS_HEADER = ("Money Markets<sup>@</sup>", "Volume<br> (One Leg)", "Weighted<br> Average Rate", "Range")
+MMO_OPERATIONS_HEADER = ("RBI Operations<sup>@</sup>", "Auction Date", "Tenor (Days)", "Maturity Date", "Amount",
+                         "Current Rate /<br> Cut off Rate")
+MMO_RESERVES_HEADER = ("Reserve Position<sup>@</sup>", "Date", "Amount")
+MMO_LAF_HEADING = ("C. Liquidity Adjustment Facility (LAF), Marginal Standing Facility (MSF) & Standing Deposit "
+                   "Facility (SDF)")
+MMO_TODAY_HEADING, MMO_OUTSTANDING_HEADING = " I. Today's Operations", " II. Outstanding Operations"
+MMO_FACILITY_LABELS = {  # the lines of one block of the RBI operations table, in printed order
+    "fixed": " 1. Fixed Rate", "variable": " 2. Variable Rate<sup>&</sup> ", "repo": NBSP5 + "(a) Repo Operation",
+    "reverse_repo": NBSP5 + "(b) Reverse Repo Operation", "msf": "3. MSF<sup>#</sup>",
+    "sdf": "4. SDF<sup>Δ#</sup>",
+}
+MMO_NET_TODAY = " 5.&nbsp;Net liquidity injected from today's operations [injection (+)/absorption (-)]*"
+MMO_SLF = " D. Standing Liquidity Facility (SLF) Availed from RBI<sup>$</sup> "
+MMO_NET_OUTSTANDING = " E. Net liquidity injected from outstanding operations [injection (+)/absorption (-)]*"
+MMO_NET_TOTAL = (" F. Net liquidity injected (outstanding including today's<strong> </strong>operations) "
+                 "[injection (+)/absorption (-)]*")
+MMO_RESERVE_LABELS = (
+    NBSP5 + "(i) Cash balances with RBI as on^^",
+    NBSP5 + "(ii) Average daily cash reserve requirement for the fortnight ending^",
+    "H. Government of India Surplus Cash Balance Reckoned for Auction as on<sup>¥</sup> ",
+    "I. Net durable liquidity [surplus (+)/deficit (-)] as on",
+)
+MMO_FOOTNOTES = (  # our own words: the parser reads no footnote, only the marks on the labels
+    "<sup>@</sup> Sources of the figures.", "- Nothing to report.", "** Unsecured deals of two days to two weeks.",
+    "<sup>@@</sup> Unsecured deals of more than two weeks.", "<sup>$</sup> Refinance is counted in.",
+    "* Net line: repo plus MSF plus SLF less reverse repo less SDF.", "^^ A change of definition.",
+)
+
+
+def _mmo_markets(overnight: list[tuple], term: list[tuple]) -> list[list[str]]:
+    """Money-market rows: the overnight total and its four parts, the term heading and its five lines."""
+    names = ("I. Call Money", "II. Triparty Repo", "III. Market Repo", "IV. Repo in Corporate Bond")
+    term_names = ("I. Notice Money<b>**</b> ", "II. Term Money<sup>@@</sup> ", "III. Triparty Repo",
+                  "IV. Market Repo", "V. Repo in Corporate Bond")
+    rows = [[" A. Overnight Segment (I+II+III+IV)", *overnight[0]]]
+    rows += [[NBSP5 + n, *v] for n, v in zip(names, overnight[1:], strict=True)]
+    rows.append([" B. Term Segment", "&nbsp;", "&nbsp;", "&nbsp;"])
+    rows += [[NBSP5 + n, *v] for n, v in zip(term_names, term, strict=True)]
+    return rows
+
+
+def _mmo_reserves(dates: tuple[str, str, str, str], amounts: tuple[str, str, str, str]) -> list[list[str]]:
+    return [[label, d, a] for label, d, a in zip(MMO_RESERVE_LABELS, dates, amounts, strict=True)]
+
+
+_NONE = ("0.00", "-", "-")
+_QUIET_MARKETS = _mmo_markets([_NONE] * 5, [_NONE] * 5)  # a weekend: no trading, the lines are still printed
+
+
+def _block(reverse_repo=(), msf=(), sdf=(), repo=(), fixed=()) -> dict:
+    """Operations of one block, each ``(auction date, tenor, maturity date, amount, rate)`` as printed."""
+    return {"fixed": list(fixed), "variable": [], "repo": list(repo), "reverse_repo": list(reverse_repo),
+            "msf": list(msf), "sdf": list(sdf)}
+
+
+def mmo_friday() -> dict:
+    """Friday 13 Nov 2026: trading, a 3-day reverse repo, MSF and SDF for 1, 2 and 3 days, nothing outstanding."""
+    fri, sat, sun, mon = "Fri, 13/11/2026", "Sat, 14/11/2026", "Sun, 15/11/2026", "Mon, 16/11/2026"
+    return {
+        "as_on": "November 13, 2026", "date_line": "Nov 16, 2026", "pub": "Mon, 16 Nov 2026 09:00:00",
+        "prid": 63977, "pr_no": "2026-2027/1499",
+        "markets": _mmo_markets(
+            [("7,34,151.00", "5.61", "1.00-7.30"), ("12,340.50", "5.60", "4.25-5.90"),
+             ("5,10,220.25", "5.64", "5.40-5.85"), ("2,05,110.00", "5.52", "1.00-5.95"),
+             ("6,480.25", "5.72", "5.60-7.30")],
+            [("120.00", "5.40", "4.90-5.70"), ("1,050.50", "-", "5.75-6.25"), _NONE, _NONE, _NONE]),
+        "today": _block(reverse_repo=[(fri, "3", mon, "40,000.00", "5.49")],
+                        msf=[(fri, "1", sat, "12,500.00", "5.75"), (fri, "2", sun, "0.00", "5.75"),
+                             (fri, "3", mon, "1,000.00", "5.75")],
+                        sdf=[(fri, "1", sat, "1,50,000.00", "5.25"), (fri, "2", sun, "900.00", "5.25"),
+                             (fri, "3", mon, "2,500.00", "5.25")]),
+        "net_today": "-1,79,900.00", "outstanding": _block(), "slf": "9,800.50", "net_outstanding": "9,800.50",
+        "net_total": "-1,70,099.50",
+        "reserves": _mmo_reserves(("November 13, 2026", "November 15, 2026", "November 13, 2026", "October 15, 2026"),
+                                  ("8,40,000.25", "8,10,000.00", "0.00", "7,80,000.00")),
+    }
+
+
+def mmo_saturday() -> dict:
+    """Saturday 14 Nov 2026: no trading; MSF and SDF for 1 and 2 days; Friday's longer operations outstanding."""
+    fri, sat, sun, mon = "Fri, 13/11/2026", "Sat, 14/11/2026", "Sun, 15/11/2026", "Mon, 16/11/2026"
+    return {
+        "as_on": "November 14, 2026", "date_line": "Nov 16, 2026", "pub": "Mon, 16 Nov 2026 12:00:00",
+        "prid": 63980, "pr_no": "2026-2027/1502", "markets": [list(r) for r in _QUIET_MARKETS],
+        "today": _block(msf=[(sat, "1", sun, "20,000.00", "5.75"), (sat, "2", mon, "0.00", "5.75")],
+                        sdf=[(sat, "1", sun, "1,55,000.00", "5.25"), (sat, "2", mon, "10.00", "5.25")]),
+        "net_today": "-1,35,010.00",
+        "outstanding": _block(reverse_repo=[(fri, "3", mon, "40,000.00", "5.49")],
+                              msf=[(fri, "2", sun, "0.00", "5.75"), (fri, "3", mon, "1,000.00", "5.75")],
+                              sdf=[(fri, "2", sun, "900.00", "5.25"), (fri, "3", mon, "2,500.00", "5.25")]),
+        "slf": "9,800.50", "net_outstanding": "-32,599.50", "net_total": "-1,67,609.50",
+        "reserves": _mmo_reserves(("November 14, 2026", "November 15, 2026", "November 13, 2026", "October 15, 2026"),
+                                  ("8,39,500.75", "8,10,000.00", "0.00", "7,80,000.00")),
+    }
+
+
+def mmo_sunday() -> dict:
+    """Sunday 15 Nov 2026: no trading; MSF and SDF for one day; the operations maturing on Monday outstanding."""
+    fri, sat, sun, mon = "Fri, 13/11/2026", "Sat, 14/11/2026", "Sun, 15/11/2026", "Mon, 16/11/2026"
+    return {
+        "as_on": "November 15, 2026", "date_line": "Nov 16, 2026", "pub": "Mon, 16 Nov 2026 12:05:00",
+        "prid": 63981, "pr_no": "2026-2027/1503", "markets": [list(r) for r in _QUIET_MARKETS],
+        "today": _block(msf=[(sun, "1", mon, "25,000.00", "5.75")], sdf=[(sun, "1", mon, "1,60,000.00", "5.25")]),
+        "net_today": "-1,35,000.00",
+        "outstanding": _block(reverse_repo=[(fri, "3", mon, "40,000.00", "5.49")],
+                              msf=[(sat, "2", mon, "0.00", "5.75"), (fri, "3", mon, "1,000.00", "5.75")],
+                              sdf=[(sat, "2", mon, "10.00", "5.25"), (fri, "3", mon, "2,500.00", "5.25")]),
+        "slf": "9,800.50", "net_outstanding": "-31,709.50", "net_total": "-1,66,709.50",
+        "reserves": _mmo_reserves(("November 15, 2026", "November 15, 2026", "November 13, 2026", "October 31, 2026"),
+                                  ("8,39,900.00", "8,10,000.00", "0.00", "7,00,000.00")),
+    }
+
+
+def mmo_monday() -> dict:
+    """Monday 16 Nov 2026: trading, term repo too; one-day MSF and SDF; nothing outstanding."""
+    mon, tue = "Mon, 16/11/2026", "Tue, 17/11/2026"
+    return {
+        "as_on": "November 16, 2026", "date_line": "Nov 17, 2026", "pub": "Tue, 17 Nov 2026 09:00:00",
+        "prid": 63985, "pr_no": "2026-2027/1507",
+        "markets": _mmo_markets(
+            [("8,00,000.00", "5.58", "4.00-7.20"), ("15,000.00", "5.65", "4.30-5.85"),
+             ("5,80,000.00", "5.57", "5.05-5.71"), ("1,98,000.00", "5.60", "4.00-5.80"),
+             ("7,000.00", "5.75", "5.65-7.20")],
+            [("250.00", "5.59", "5.20-5.75"), ("1,500.00", "-", "5.60-6.20"), ("6,800.00", "5.66", "5.50-5.90"),
+             ("7.25", "5.98", "5.98-5.98"), _NONE]),
+        "today": _block(msf=[(mon, "1", tue, "6,000.00", "5.75")], sdf=[(mon, "1", tue, "1,45,000.00", "5.25")]),
+        "net_today": "-1,39,000.00", "outstanding": _block(), "slf": "9,800.50", "net_outstanding": "9,800.50",
+        "net_total": "-1,29,199.50",
+        "reserves": _mmo_reserves(("November 16, 2026", "November 30, 2026", "November 16, 2026", "October 31, 2026"),
+                                  ("8,55,000.50", "8,25,000.00", "0.00", "7,00,000.00")),
+    }
+
+
+def _th(text: str, **attrs) -> str:
+    extra = "".join(f' {k}="{v}"' for k, v in attrs.items())
+    return f"<th{extra}>{text}</th>"
+
+
+def _blank_cells(n: int) -> str:
+    return "<td>&nbsp; </td>" * n
+
+
+def _mmo_block_rows(block: dict) -> list[str]:
+    """The six facility lines of one block: five blank cells, one operation, or a rowspan label over several."""
+    rows = []
+    for name, label in MMO_FACILITY_LABELS.items():
+        operations = block.get(name, [])
+        if not operations:
+            rows.append(f"<tr>{_th(label)}{_blank_cells(5)}</tr>")
+            continue
+        span = {"rowspan": len(operations), "valign": "top"} if len(operations) > 1 else {"valign": "top"}
+        first, *more = operations
+        rows.append(f"<tr>{_th(label, **span)}" + "".join(f"<td>{v}</td>" for v in first) + "</tr>")
+        rows += ["<tr>" + "".join(f"<td>{v}</td>" for v in values) + "</tr>" for values in more]
+    return rows
+
+
+def _amount_row(label: str, amount: str, colspan: int = 1) -> str:
+    """A line that carries an amount only; lines E and F span two columns with their label (``colspan=2``)."""
+    span = {"colspan": colspan} if colspan > 1 else {}
+    return f"<tr>{_th(label, **span)}{_blank_cells(4 - colspan)}<td>{amount}</td><td>&nbsp;</td></tr>"
+
+
+def mmo_markets_table(day: dict) -> str:
+    rows = ["<tr>" + "".join(_th(h, align="center") for h in MMO_MARKETS_HEADER) + "</tr>"]
+    rows += [f'<tr class="tablecontent1">{_th(label)}' + "".join(f'<td align="right">{v}</td>' for v in values)
+             + "</tr>" for label, *values in day["markets"]]
+    return ('<table cellspacing="1" width="100%"><!--<caption>MONEY MARKETS</caption>--><tbody>'
+            + "".join(rows) + "</tbody></table>")
+
+
+def mmo_operations_table(day: dict) -> str:
+    rows = ["<tr>" + "".join(_th(h, align="center") for h in MMO_OPERATIONS_HEADER) + "</tr>",
+            f"<tr>{_th(MMO_LAF_HEADING, colspan=6)}</tr>", f"<tr>{_th(MMO_TODAY_HEADING, colspan=6)}</tr>",
+            *_mmo_block_rows(day["today"]), _amount_row(MMO_NET_TODAY, day["net_today"]),
+            f"<tr>{_th(MMO_OUTSTANDING_HEADING, colspan=6)}</tr>", *_mmo_block_rows(day["outstanding"]),
+            _amount_row(MMO_SLF, day["slf"]), _amount_row(MMO_NET_OUTSTANDING, day["net_outstanding"], colspan=2),
+            _amount_row(MMO_NET_TOTAL, day["net_total"], colspan=2), *day.get("extra_operation_rows", [])]
+    return ('<table cellspacing="1" width="100%"><tbody><!-- <tr><td colspan="6">RBI OPERATIONS</td></tr>-->'
+            + "".join(rows) + "</tbody></table>")
+
+
+def mmo_reserves_table(day: dict) -> str:
+    rows = ["<tr>" + "".join(_th(h) for h in MMO_RESERVES_HEADER) + "<!--<th>&nbsp; </th>--></tr>",
+            f"<tr>{_th('G. Cash Reserves Position of Scheduled Commercial Banks', colspan=4)}</tr>"]
+    rows += [f"<tr>{_th(label)}<td>{date}</td><td>{amount}</td><!--<td>&nbsp;</td>--></tr>"
+             for label, date, amount in day["reserves"]]
+    return f'<table cellspacing="1"><tbody>{"".join(rows)}</tbody></table>'
+
+
+def mmo_body(day: dict, units: str = MMO_UNITS, tables: tuple[str, ...] | None = None) -> str:
+    """The content cell of a Money Market Operations release: a units table, three data tables, the footnotes.
+
+    ``tables`` replaces the three data tables (to drop, change or add one).
+    """
+    if tables is None:
+        tables = (mmo_markets_table(day), mmo_operations_table(day), mmo_reserves_table(day))
+    unit_table = ('<table cellspacing="1" width="100%" role="presentation"><tbody><tr><td colspan="4"><hr></td></tr>'
+                  f'<tr><td align="right" colspan="4"> {units}</td></tr><tr><td colspan="4"><hr></td></tr>'
+                  "</tbody></table>")
+    cells = "".join(f'<tr><td align="center">{t}</td></tr>' for t in (unit_table, *tables))
+    notes = "".join(f"<div><p>{n}</p></div>" for n in MMO_FOOTNOTES)
+    return (f'<table class="MMO" cellspacing="1" width="100%" role="presentation"><tbody>{cells}</tbody></table>'
+            f"{notes}<div><p><b>A Name</b><br>Communications</p></div>"
+            f'<div><p><b>Press Release: {day["pr_no"]}</b></p></div>')
+
+
+def mmo_title(day: dict) -> str:
+    return f"Money Market Operations as on {day['as_on']}"
+
+
+def mmo_page(day: dict, **kw) -> str:
+    return release_page(mmo_title(day), day["date_line"], mmo_body(day, **kw), prid=day["prid"])
+
+
+def mmo_item(day: dict, **kw) -> dict:
+    return dict(title=mmo_title(day), prid=day["prid"], pub=day["pub"], html=mmo_body(day, **kw))
+
+
+# --- Variable rate repo and reverse repo auctions ---------------------------------------------------
+
+LAF_RESULT_TITLE = "Result of the 3-day Variable Rate Reverse Repo (VRRR) auction held on November 13, 2026"
+LAF_REVERSE_REPO_LABELS = ("Tenor", "Notified Amount (in ₹ crore)", "Total amount of offers received (in ₹ crore)",
+                           "Amount accepted (in ₹ crore)", "Cut off Rate (%)", "Weighted Average Rate (%)",
+                           "Partial Acceptance Percentage of offers received at cut off rate")
+LAF_REPO_LABELS = ("Tenor", "Notified Amount (in ₹ crore)", "Total amount of bids received (in ₹ crore)",
+                   "Amount allotted (in ₹ crore)", "Cut off Rate (%)", "Weighted Average Rate (%)",
+                   "Partial Allotment Percentage of bids received at cut off rate (%)")
+LAF_RESULT_VALUES = ("3-day", "75,000", "38,592", "38,592", "5.49", "5.49", "NA")  # the auction of 13 Nov 2026
+
+
+def laf_result_table(values=LAF_RESULT_VALUES, labels=LAF_REVERSE_REPO_LABELS) -> str:
+    """The seven-row label and value table of a variable rate auction result (all cells ``<td>``)."""
+    rows = "".join(f"<tr><td>{label}</td><td align='center'>{value}</td></tr>"
+                   for label, value in zip(labels, values, strict=True))
+    return f'<table width="85%" class="tablebg">{rows}</table>'
+
+
+LAF_ANNOUNCEMENT_TITLE = "RBI to conduct 2-day Variable Rate Reverse Repo (VRRR) auction under LAF on November 17, 2026"
+LAF_ANNOUNCEMENT_TEXT = ("After a look at liquidity the Reserve Bank announces a Variable Rate Reverse Repo (VRRR) "
+                         "auction on Tuesday, November 17, 2026, on the terms below.")  # our own words
+LAF_ANNOUNCEMENT_HEADER = ("Sl. No.", "Notified Amount <br> (&#8377; crore)", "Tenor (day)", "Window Timing",
+                           "Date of Reversal")
+LAF_ANNOUNCEMENT_ROW = ("1", "50,000", "2", "09:30 AM to 10:00 AM", "November 19, 2026 <br>(Thursday)")
+
+
+def laf_announcement_table(rows=(LAF_ANNOUNCEMENT_ROW,), header=LAF_ANNOUNCEMENT_HEADER, after: str = "") -> str:
+    """Header row (``<td>`` cells of class head) and one row per auction."""
+    head = '<tr class="head">' + "".join(f"<td>{h}</td>" for h in header) + "</tr>"
+    body_rows = "".join("<tr>" + "".join(f"<td>{v}</td>" for v in row) + "</tr>" for row in rows)
+    return f'<table width="85%" class="tablebg">{head}{body_rows}{after}</table>'
+
+
+# --- Open market operations -------------------------------------------------------------------------
+
+OMO_RESULT_TITLE = "Detailed Result: OMO Purchase Auction held on Mar 13, 2026 and Settlement on Mar 16, 2026"
+OMO_SUMMARY = ("₹25,000 crore", "₹42,000 crore", "₹25,000 crore")  # notified, offered, accepted: made up
+OMO_SUMMARY_LABELS = ("Aggregate Amount (Face value) notified by RBI",
+                      "Total amount offered (Face value) by participants", "Total amount accepted (Face value) by RBI")
+OMO_SALE_SUMMARY_LABELS = (OMO_SUMMARY_LABELS[0], "Total amount bid (Face value) by participants",
+                           OMO_SUMMARY_LABELS[2])
+OMO_DETAIL_LABELS = (
+    "No. of offers received", "Total amount (face value) offered (₹ in crore)", "No. of offers accepted",
+    "Total offer amount (face value) accepted by RBI (₹ in crore)", "Cut off yield (%)", "Cut off price (₹)",
+    "Weighted average yield (%)", "Weighted average price (₹)",
+    "Partial allotment % of competitive offers at cut off price")
+OMO_SALE_DETAIL_LABELS = (
+    "No. of bids received", "Total amount (face value) bid (₹ in crore)", "No. of bids accepted",
+    "Total bid amount (face value) accepted by RBI (₹ in crore)", *OMO_DETAIL_LABELS[4:8],
+    "Partial allotment % of competitive bids at cut off price")
+OMO_SECURITIES = [  # real names, made-up figures: RBI buys the cheapest offers, so way >= cut-off yield, wap <= price
+    dict(name="6.45% GS 2029", values=("120", "20,000", "30", "9,000", "6.1200", "101.02", "6.1350", "100.97",
+                                       "75.50")),
+    dict(name="7.41% GS 2036", values=("90", "15,500", "40", "11,000", "6.7300", "105.10", "6.7500", "104.95", "NA")),
+    dict(name="7.06% GS 2046", values=("35", "6,500", "1", "5,000", "7.3200", "97.20", "7.3200", "97.20", "NA")),
+]
+
+
+def omo_summary_table(values=OMO_SUMMARY, labels=OMO_SUMMARY_LABELS) -> str:
+    rows = "".join(f"<tr><td>{label}</td><td>:</td><td>{value}</td></tr>"
+                   for label, value in zip(labels, values, strict=True))
+    return f'<table width="75%" class="tablebg">{rows}</table>'
+
+
+def omo_detail_table(securities=None, labels=OMO_DETAIL_LABELS) -> str:
+    securities = OMO_SECURITIES if securities is None else securities
+    rows = ["<tr><td>Security</td>" + "".join(f"<td>{s['name']}</td>" for s in securities) + "</tr>"]
+    rows += ["<tr><td>" + label + "</td>" + "".join(f"<td>{s['values'][i]}</td>" for s in securities) + "</tr>"
+             for i, label in enumerate(labels)]
+    return f'<table width="95%" class="tablebg">{"".join(rows)}</table>'
+
+
+def omo_result_tables(summary: str | None = None, detail: str | None = None, operation: str = "Purchase") -> str:
+    """The two tables of a detailed OMO result, each under its heading paragraph."""
+    return (f'<p align="center">I. Summary OMO {operation} Results</p>{summary or omo_summary_table()}'
+            f'<p align="center">II. Details of OMO {operation} Issue</p>{detail or omo_detail_table()}')
+
+
+OMO_ANNOUNCEMENT_TITLE = "RBI announces OMO Purchase of Government of India Securities"
+OMO_ANNOUNCEMENT_TEXT = (  # our own words around the phrases the parser looks for
+    "Further to Press Release 2025-26/2228 dated March 06, 2026, the Reserve Bank sets an OMO purchase auction "
+    "for an aggregate amount of ₹25,000 crore on March 13, 2026. Offers for the securities listed below are taken "
+    "by the multiple price method.")
+OMO_ANNOUNCEMENT_AFTER = ("<p>Offers are taken on March 13, 2026 and the result is out the same day. Sellers need "
+                          "the securities in their SGL account by noon on March 16, 2026.</p>")
+OMO_ANNOUNCED = [  # ISINs and maturity dates of the three securities above, as RBI's list has them
+    ("1", "IN0020190362 ", "6.45% GS 2029", "7-Oct-2029"), ("2", "IN0020220102", "7.41% GS 2036", "19-Dec-2036"),
+    ("3", "IN0020160068", "7.06% GS 2046", "10-Oct-2046"),
+]
+
+
+def omo_announcement_table(rows=None, amount: str = "₹25,000 crore<br>(no amount is notified security by security)",
+                           after: str = "") -> str:
+    """S. No., ISIN, Security, Date of Maturity and one Aggregate Amount cell spanning every row."""
+    rows = OMO_ANNOUNCED if rows is None else rows
+    head = "<tr>" + "".join(f"<td>{h}</td>" for h in ("S. No.", "ISIN", "Security", "Date of Maturity",
+                                                      "Aggregate Amount")) + "</tr>"
+    trs = []
+    for i, row in enumerate(rows):
+        span = f'<td rowspan="{len(rows)}">{amount}</td>' if i == 0 else ""
+        trs.append("<tr>" + "".join(f"<td>{v}</td>" for v in row) + span + "</tr>")
+    return f'<table width="95%" class="tablebg">{head}{"".join(trs)}{after}</table>'
+
+
+# --- Issuance calendars -----------------------------------------------------------------------------
+
+GSEC_CALENDAR_TITLE = "Issuance Calendar for Marketable Dated Securities for October 2026 - March 2027"
+GSEC_CALENDAR_TEXT = ("Auctions of dated securities planned for the second half of 2026-27 (October 01, 2026 to "
+                      "March 31, 2027):")  # our own words
+GSEC_CALENDAR_WEEKS = [  # (auction week, amount, allocation lines): five weeks in the three forms a week is printed in
+    ("September 28-October 02, 2026", "33,000", ["(i) 3 Year for ₹9,000 crore", "(ii) 7 Year for ₹12,000 crore",
+                                                 "(iii) 30 Year for ₹9,000 crore",
+                                                 "(iv) 30 Year SGrB for ₹3,000 crore"]),
+    ("October 05-09, 2026", "36,000", ["(i) 15 Year for ₹23,000 crore", "(ii) 50 Year for ₹13,000 crore"]),
+    ("October 12-16, 2026", "34,000", ["(i) 10 Year for ₹34,000 crore"]),
+    ("December 28, 2026-January 01, 2027", "36,000", ["(i) 15 Year for ₹23,000 crore",
+                                                      "(ii) 50 Year for ₹13,000 crore"]),
+    ("January 04-08, 2027", "35,000", ["(i) 10 Year for ₹35,000 crore"]),
+]
+
+
+GSEC_CALENDAR_PERIOD = "(October 01, 2026 to March 31, 2027)"
+GSEC_CALENDAR_HEADER = ("Sl. No.", "Auction Week", "Amount (in ₹ crore)", "Security-wise Allocation")
+
+
+def gsec_calendar_table(weeks=None, total: str | None = "1,74,000", period: str = GSEC_CALENDAR_PERIOD,
+                        header=GSEC_CALENDAR_HEADER, after: str = "") -> str:
+    """Two title rows, the header, one row per allocation line (a week's first three cells span its lines), Total."""
+    weeks = GSEC_CALENDAR_WEEKS if weeks is None else weeks
+    rows = ['<tr><td colspan="4">Calendar for Issuance of Government of India Dated Securities</td></tr>']
+    if period:
+        rows.append(f'<tr><td colspan="4">{period}</td></tr>')
+    rows.append("<tr>" + "".join(f"<td>{h}</td>" for h in header) + "</tr>")
+    for number, (week, amount, lines) in enumerate(weeks, start=1):
+        span = f' rowspan="{len(lines)}"' if len(lines) > 1 else ""
+        rows.append(f"<tr><td{span}>{number}</td><td{span}>{week}</td><td{span}>{amount}</td><td>{lines[0]}</td></tr>")
+        rows += [f"<tr><td>{line}</td></tr>" for line in lines[1:]]
+    if total is not None:
+        rows.append(f"<tr><td></td><td>Total</td><td>{total}</td><td></td></tr>")
+    return f'<table width="90%" class="tablebg">{"".join(rows)}{after}</table>'
+
+
+SDL_CALENDAR_TITLE = ("Indicative Calendar of Market borrowings by State Governments/ Union Territories for the "
+                      "Quarter October – December 2026")
+
+
+def sdl_calendar_text(quarter: str = "October – December 2026", total: str = "₹3,60,820 crore",
+                      annexes: tuple[str, ...] = ("Annex 1", "Annex 2")) -> str:
+    """The prose of a state borrowing calendar: the quarter, links to the annexes and one total."""
+    links = " and ".join(f'<a href="https://rbidocs.example/rdocs/content/pdfs/PR1237_A{i}.pdf">{name}</a>'
+                         for i, name in enumerate(annexes, start=1))
+    return (f"The calendars for the quarter {quarter} are attached as {links}. Taken together, borrowing by the "
+            f"States and Union Territories in that quarter is expected to be {total}. Each auction's amounts "
+            "follow a few days ahead of it.")

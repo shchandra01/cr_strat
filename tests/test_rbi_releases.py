@@ -174,8 +174,9 @@ def test_feed_errors():
     ("Auction of State Government Securities", "sdl_announcement"),
     ("Money Market Operations as on November 13, 2026", "money_market_operations"),
     ("RBI to conduct 2-day Variable Rate Reverse Repo (VRRR) auction under LAF on November 17, 2026",
-     "vrrr_announcement"),
-    ("Result of the 3-day Variable Rate Reverse Repo (VRRR) auction held on November 13, 2026", "vrrr_result"),
+     "laf_auction_announcement"),
+    ("Result of the 3-day Variable Rate Reverse Repo (VRRR) auction held on November 13, 2026", "laf_auction_result"),
+    ("Auction of Government of India Dated Security", "gsec_announcement"),  # one security on offer: the singular
     ("Detailed Result: OMO Purchase Auction held on Mar 13, 2026 and Settlement on Mar 16, 2026", "omo_result"),
     ("Issuance Calendar for Marketable Dated Securities for October 2026 - March 2027", "gsec_calendar"),
     ("RBI cancels Certificate of Registration of 49 NBFCs", "other"),
@@ -303,6 +304,15 @@ def test_sdl_total_column_must_add_up():
     assert "comp_accepted_cr sums to" in _only_reason(_parse(_sdl_page(total=total)))
 
 
+def test_sdl_row_missing_from_one_table_is_a_failed_sum_not_an_error():
+    page = _sdl_page(per_table=2)
+    row = "<tr><td>(i) No.</td><td>3</td><td>8</td></tr>"  # the first table's non-competitive bids: received, accepted
+    assert page.count(row) == 2
+    reason = _only_reason(_parse(page.replace(row, "", 1)))  # without the row of the bids received
+    assert reason == ("failed check: <text 1>: nc_received_count sums to 15 over the securities but the Total "
+                      "column says 26")
+
+
 def test_sdl_parts_must_make_the_total():
     columns = copy.deepcopy(fx.SDL_COLUMNS)
     columns[0]["total"] = "1100"
@@ -313,6 +323,59 @@ def test_sdl_reissue_cell_must_match_its_column():
     columns = copy.deepcopy(fx.SDL_COLUMNS)
     columns[0]["tenor"] = "Re-issue of 7.83% BIHAR SGS 2046 issued on 29-APR-2026"
     assert "tenor cell names another security" in _only_reason(_parse(_sdl_page(columns)))
+
+
+def _sdl_column(name, tenor):
+    return dict(fx.SDL_ASSAM, name=name, tenor=tenor)
+
+
+def test_sdl_reissue_cell_may_spell_the_state_another_way():
+    # RBI's result of 17 Nov 2026: a shorter state name in the reissue cell than in the column heading
+    columns = [_sdl_column("ANDHRA PRADESH SGS 2051", "Re-issue of 7.68% ANDHRA SGS 2051 issued on 29-JUL-2026"),
+               _sdl_column("MADHYA PRADESH SGS 2030", "Re-issue of 7.77% MADHYAPRADESH SGS 2030 issued on 21-OCT-2026"),
+               _sdl_column("WEST BENGAL SGS 2031", "Re-issue of 7.07% WESTBENGAL SGS 2031 issued on 08-JUL-2026")]
+    batch = _parse(_sdl_page(columns, footnote=""))
+    df = batch.tables["sdl_result"]
+    assert not batch.skipped and batch.releases.iloc[0]["notes"] == ""
+    assert df["state_code"].tolist() == ["AP", "MP", "WB"] and df["issue_type"].eq("reissue").all()
+    assert df["name_key"].tolist() == ["7.68% AP SGS 2051", "7.77% MP SGS 2030", "7.07% WB SGS 2031"]
+    assert df["coupon_pct"].tolist() == [7.68, 7.77, 7.07] and df["maturity_year"].tolist() == [2051, 2030, 2031]
+    assert df["first_issue_date"].dt.strftime("%Y-%m-%d").tolist() == ["2026-07-29", "2026-10-21", "2026-07-08"]
+
+
+@pytest.mark.parametrize("name, tenor, message", [
+    # another state, though its name begins alike
+    ("ANDHRA PRADESH SGS 2051", "Re-issue of 7.68% ARUNACHAL PRADESH SGS 2051 issued on 29-JUL-2026",
+     "[ANDHRA PRADESH SGS 2051]: tenor cell names another security: its state is AR, the column's AP"),
+    ("MADHYA PRADESH SGS 2030", "Re-issue of 7.77% MAHARASHTRA SGS 2030 issued on 21-OCT-2026",
+     "[MADHYA PRADESH SGS 2030]: tenor cell names another security: its state is MH, the column's MP"),
+    # the same state, another maturity year
+    ("ANDHRA PRADESH SGS 2051", "Re-issue of 7.68% ANDHRA SGS 2052 issued on 29-JUL-2026",
+     "[ANDHRA PRADESH SGS 2051]: tenor cell names another security: it matures in 2052, the column's in 2051"),
+    ("ANDHRA PRADESH SGS 2051", "Re-issue of 7.68% ANDHRA PRADESH SGS 2015 issued on 29-JUL-2026",
+     "tenor cell names another security: it matures in 2015, the column's in 2051"),
+    # a short form the state table does not list is not matched by resemblance
+    ("ANDHRA PRADESH SGS 2051", "Re-issue of 7.68% ANDHRA PR SGS 2051 issued on 29-JUL-2026",
+     "cannot tell whether the tenor cell names the column's security: state 'ANDHRA PR' has no code"),
+    ("UTTAR PRADESH SGS 2038", "Re-issue of 8.11% UTTAR SGS 2038 issued on 14-OCT-2026",
+     "cannot tell whether the tenor cell names the column's security: state 'UTTAR' has no code"),
+    ("LADAKH SGS 2040", "Re-issue of 7.50% ASSAM SGS 2040 issued on 29-JUL-2026",
+     "cannot tell whether the tenor cell names the column's security: state 'LADAKH' has no code"),
+    # two states without a code are one state only when spelt alike
+    ("LADAKH SGS 2040", "Re-issue of 7.50% LAKSHADWEEP SGS 2040 issued on 29-JUL-2026",
+     "tenor cell names another security: its state is 'LAKSHADWEEP', and neither state has a code"),
+])
+def test_sdl_reissue_cell_naming_another_security_is_refused(name, tenor, message):
+    reason = _only_reason(_parse(_sdl_page([_sdl_column(name, tenor), fx.SDL_BIHAR])))
+    assert reason.startswith("cannot parse: <text 1> [") and message in reason and repr(tenor) in reason
+
+
+def test_sdl_state_without_a_code_is_kept_when_both_cells_spell_it_alike():
+    column = _sdl_column("LADAKH SGS 2040", "Re-issue of 7.50% Ladakh SGS 2040 issued on 29-JUL-2026")
+    batch = _parse(_sdl_page([column]))
+    row = batch.tables["sdl_result"].iloc[0]
+    assert pd.isna(row["state_code"]) and pd.isna(row["name_key"]) and row["coupon_pct"] == 7.5
+    assert "state 'LADAKH' has no code" in batch.releases.iloc[0]["notes"]
 
 
 def test_sdl_without_total_or_date_notes_it():
@@ -473,15 +536,21 @@ def test_skip_reasons(tmp_path):
     blocked.write_text(fx.blocked_page(), encoding="utf-8")
     items = [dict(title="RBI cancels Certificate of Registration of 49 NBFCs", prid=63979,
                   pub="Mon, 16 Nov 2026 11:05:00", html=fx.body("Text only.")),
+             dict(title="Conversion/Switch of Government of India Securities", prid=63958,
+                  pub="Wed, 11 Nov 2026 17:40:00", html=fx.body("Tables.")),
              dict(title="Money Market Operations as on November 15, 2026", prid=63981,
                   pub="Mon, 16 Nov 2026 12:05:00", html=fx.body("Tables."))]
     batch = _parse(blocked, fx.feed(items))
     reasons = {s.release_id: (s.kind, s.reason) for s in batch.skipped}
     assert reasons[3973][0] == "unreadable" and "Support ID 123456789" in reasons[3973][1]
     assert reasons[63979] == ("other", "title not recognised: 'RBI cancels Certificate of Registration of 49 NBFCs'")
-    assert reasons[63981] == ("money_market_operations", "no parser for money_market_operations yet")
+    # a kind registered without a parser says why; a kind with a parser refuses a body that is not its layout
+    assert reasons[63958] == ("switch_announcement", "no parser for switch_announcement: no page or feed item of "
+                                                     "this kind has been sampled")
+    assert reasons[63981] == ("money_market_operations", "cannot parse: <bytes 2>#3: no '(Amount in ₹ crore, Rate in "
+                                                         "Per cent)' line; units unknown")
     assert all(t.empty for t in batch.tables.values()) and set(batch.tables) == set(rr.COLUMNS)
-    assert list(batch.skipped_frame().columns) == list(rr.SKIPPED_COLUMNS) and len(batch.releases) == 3
+    assert list(batch.skipped_frame().columns) == list(rr.SKIPPED_COLUMNS) and len(batch.releases) == 4
 
 
 def test_unknown_title_classified_from_tables():

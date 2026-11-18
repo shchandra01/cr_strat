@@ -111,6 +111,11 @@ def test_sdl_tenor_cells():
     assert cell.reissue_of.first_issue_date == D(2026, 7, 8)
     with pytest.raises(ValueError, match="not an SDL tenor"):
         sv.parse_sdl_tenor("7.83% ASSAM SGS 2046")
+    short = sv.parse_sdl_tenor("Re-issue of 7.68% ANDHRA SGS 2051 issued on 29-JUL-2026").reissue_of
+    assert (short.state_code, short.key, short.state_name) == ("AP", "7.68% AP SGS 2051", "ANDHRA")
+    assert sv.parse_security_name("ANDHRA PRADESH SGS 2051").state_code == "AP"
+    unknown = sv.parse_sdl_tenor("Re-issue of 7.68% ANDHRA PR SGS 2051 issued on 29-JUL-2026").reissue_of
+    assert unknown.state_code is None and unknown.key is None and "unknown_state" in unknown.flags
 
 
 def test_add_name_fields():
@@ -135,6 +140,10 @@ def test_state_table():
     ("CHHATTISGARH", "CG"), ("Chattisgarh", "CG"), ("JAMMU AND KASHMIR", "JK"), ("Jammu & Kashmir", "JK"),
     ("ODISHA", "OD"), ("Orissa", "OD"), ("Puducherry", "PY"), ("Tripura", "TR"), ("Delhi", "DL"), ("GJ", "GJ"),
     ("Ladakh", None), ("", None),
+    # the short form in the reissue cells of RBI's SDL results, and Kerala as RBI's state calendar names it
+    ("ANDHRA", "AP"), ("Andhra", "AP"), ("MADHYAPRADESH", "MP"), ("WESTBENGAL", "WB"), ("Keralam", "KL"),
+    # no other short form is listed, and none is matched by resemblance
+    ("MADHYA", None), ("UTTAR", None), ("ANDHRA PR", None), ("PRADESH", None), ("WEST", None),
 ])
 def test_state_code(name, code):
     assert sv.state_code(name) == code
