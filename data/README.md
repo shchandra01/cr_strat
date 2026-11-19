@@ -525,15 +525,15 @@ look at (a release that did not parse, ids possibly missed since the
 previous poll, feed items without a release id or with a `pubDate` not read,
 derived tables not rebuilt), with `needs a look:` lines on stderr; `3` when
 blocked, cooling down or stopped; `1` for any other error, whose line says
-`error:` (network, a 5xx or other HTTP status, a redirect, an answer that is
-not a readable feed, a feed none of whose items has a release id, a store
-locked by another run or damaged, a damaged `state.json`, a clock that moved
-back: a last request recorded in the future makes no request and says so);
-`2` for bad arguments, checked before anything is recorded: `--min-interval`
-from 1 to 1440 minutes, `--timeout` above 0 and up to 600 seconds (a run
-holds the store's lock while it waits), a `--user-agent` of one line of
-visible ASCII, a `--url` without spaces whose port, if it names one, is from
-1 to 65535.
+`error:` (network, a 5xx or other HTTP status that does not come with a
+refusal page, a redirect, an answer that is not a readable feed, a feed none
+of whose items has a release id, a store locked by another run or damaged, a
+damaged `state.json`, a clock that moved back: a last request recorded in
+the future makes no request and says so); `2` for bad arguments, checked
+before anything is recorded: `--min-interval` from 1 to 1440 minutes,
+`--timeout` above 0 and up to 600 seconds (a run holds the store's lock
+while it waits), a `--user-agent` of one line of visible ASCII, a `--url`
+without spaces whose port, if it names one, is from 1 to 65535.
 
 **Every morning, check the store**, before the feed's one to three days run
 out: `cr-strat rbi-store-status --store rbi_store` (or mail it from cron
@@ -562,19 +562,21 @@ right after a poll): what the feed showed cannot be collected again.
 
 **When RBI blocks.** HTTP 418, 403 or 429, a firewall page ("Unauthorised
 Access ... Support ID"), a bot challenge (a page of script that asks for
-JavaScript) or a second web page in a row in place of the feed is a block.
-Nothing from it is stored as data. RBI blocks by Internet address, so a
-block the poller causes blocks every browser behind the same address too.
-The poller makes no further request that India day: the next comes at 08:00
-India time the next day at the earliest. If that request is blocked again,
-the poller stops and asks nothing until a person resumes it: check the site
-in a browser first, then run `cr-strat rbi-store-poll --store rbi_store
---resume` by hand (never from cron), which ends the stop or cool-down and
-makes one request if the minimum interval has passed; a block of it stops
-the poller again at once. A good answer resets the count. RBI does not say
-what its throttle counts or for how long it blocks (a block on 17 Nov 2026
-cleared within minutes, others lasted longer). A 5xx or a network error is
-recorded and the next scheduled poll tries again.
+JavaScript) or a second web page in a row in place of the feed is a block; a
+firewall page or a challenge is one whatever HTTP status it comes with (a
+challenge with 503, a firewall page with 404, as much as with 200). Nothing
+from it is stored as data. RBI blocks by Internet address, so a block the
+poller causes blocks every browser behind the same address too. The poller
+makes no further request that India day: the next comes at 08:00 India time
+the next day at the earliest. If that request is blocked again, the poller
+stops and asks nothing until a person resumes it: check the site in a
+browser first, then run `cr-strat rbi-store-poll --store rbi_store --resume`
+by hand (never from cron), which ends the stop or cool-down and makes one
+request if the minimum interval has passed; a block of it stops the poller
+again at once. A good answer resets the count. RBI does not say what its
+throttle counts or for how long it blocks (a block on 17 Nov 2026 cleared
+within minutes, others lasted longer). A 5xx or a network error (without a
+refusal page) is recorded and the next scheduled poll tries again.
 
 **A stale lock.** A run that was killed leaves `store.lock`; the next run
 refuses to start, says who held it, since when, and whether that process
@@ -694,15 +696,20 @@ read after its final release is `final` (a row saying when a value was
 confirmed is not built: it would need the store to keep the time of each
 later read that found the value unchanged).
 
-**Where `public_from` can still be early.** A release later than its rule
-or planned date while the store was not polling (history read later: the
+**Where `public_from` can still be early.** A release later than its rule or
+planned date while the store was not polling (history read later: the
 2025-26 rows of the shipped table are planned dates, and every date before
-April 2025 and every WPI date come from rules; type in actual dates from
-the updated calendars or PIB's "Posted On" stamps with `--release-dates`);
-a holiday the proxies do not know (a central-government holiday that is not
-a Mumbai one, a US closure not in the rules such as a national day of
-mourning, any holiday outside 2015 to 2026 for MoSPI); a past BIS rupee release later than its rule; the US
-target before 4 Feb 1994. Detail tables are assumed to reach MoSPI's API
+April 2025 and every WPI date come from rules; type in actual dates from the
+updated calendars or PIB's "Posted On" stamps with `--release-dates`); a
+holiday the proxies do not know (a central-government holiday that is not a
+Mumbai one, a US closure not in the rules such as a national day of
+mourning, any holiday outside 2015 to 2026 for MoSPI); a past BIS rupee
+release later than its rule; the US target before 4 Feb 1994; an answer
+saved elsewhere (not a copy of one in the store's `raw/`) that holds a value
+the store's own read after its rule's time lacked: the ingest does not know
+which of its reads would have held it, so the value is dated by the rules
+and the release table alone (ingest the store's own raw copies, which are
+dated by its request log). Detail tables are assumed to reach MoSPI's API
 with their headline unless the store read them without it (then they wait,
 below).
 
@@ -772,18 +779,20 @@ host, and is recorded in `state.json` before it is sent. The answers of each
 source are committed when it is done, the derived tables at the end; a run
 killed during a source's requests loses that source's answers of the run
 (the next run logs them `interrupted` and asks again), not those of the
-sources before it. An answer its parser refuses, or a MoSPI page that is
-not the one asked or whose query changed size since its first page (that
-query is then asked again from page 1), keeps no validator, so that the
-next request asks for it whole; it goes to `failed`, as does a request
-answered with an HTTP 4xx: once per request (a recent window, whose dates
-move every day, once per window), and off the list as soon as it, or a
-later read of the same data, answers; `--retry-failed` queues the history
-and pending ones again (a recent request is asked again by every run). A history step that the caps
-cut short waits for the next run; `macro-store-status` says how far each
-history got (`history: 9 requests done, 27 to go, 2 given up`) and what is
-pending. `--no-backfill` fetches no history; a changed plan
-(`--mospi-history full`, `--states`) adds what it lacks.
+sources before it. An answer its parser refuses, or a MoSPI page that is not
+the one asked or whose query changed size since its first page (that query
+is then asked again from page 1), keeps no validator, so that the next
+request asks for it whole (the time of that URL's last good read is kept: a
+value a later answer brings is not dated before it); it goes to `failed`, as
+does a request answered with an HTTP 4xx: once per request (a recent window,
+whose dates move every day, once per window), and off the list as soon as
+it, or a later read of the same data, answers; `--retry-failed` queues the
+history and pending ones again (a recent request is asked again by every
+run). A history step that the caps cut short waits for the next run;
+`macro-store-status` says how far each history got (`history: 9 requests
+done, 27 to go, 2 given up`) and what is pending. `--no-backfill` fetches no
+history; a changed plan (`--mospi-history full`, `--states`) adds what it
+lacks.
 
 Each source prints one line, and a line per thing that needs a look; every
 line starts with the run's start time in UTC, so that a log appended to
@@ -852,7 +861,7 @@ needs:
 | Line | What to do |
 |---|---|
 | `blocked`, `cooling down`, `stopped` (status: `host ...: cool-down until`, `stopped since`) | HTTP 403, 418 or 429, a refusal page or bot challenge whatever its HTTP status, a demand for contact details (none is ever given) or a second web page in a row where data were expected is a block. That host gets no request before 08:00 India time the next day (counted from the latest time the block can have happened); a second block in a row stops it until you check the site in a browser and run `cr-strat macro-store-update --store macro_store --sources <source> --resume` by hand (never from cron). Read a site's terms again before resuming one that asked for contact details |
-| `needs a look: ... refused` (status: `failed ...`) | The parser refused an answer (a layout never seen, a page that does not fit its query, an answer cut short). The request is given up (`failed` in `state.json`) and asked whole next time; the US and BIS answers are in `raw/`. After an update of this package, read them again with `macro-store-ingest --store macro_store macro_store/raw/<source>/<file>`, or queue the requests again with `--retry-failed`; a recent request is asked again by every run anyway |
+| `needs a look: ... refused` (status: `failed ...`) | The parser refused an answer (a layout never seen, a page that does not fit its query, an answer cut short). The request is given up (`failed` in `state.json`) and asked whole next time; the US and BIS answers are in `raw/`. After an update of this package, read them again with `macro-store-ingest --store macro_store macro_store/raw/<source>/<file>` (a copy of the store's own answer is dated by its request log, as the update would have dated it), or queue the requests again with `--retry-failed`; a recent request is asked again by every run anyway |
 | `needs a look: ... had not reached this table` | A MoSPI table still lacked the month its headline showed after 6 reads: check the table in the API's answer by hand; `--retry-failed` asks again. Status lines `tables behind the headline` say the same of what the store holds |
 | `needs a look: ... HTTP 404` (or another 4xx) | A request this package should not have made (a page limit, a moved address): no more requests to that host in the run; report it |
 | `error: server error`, `error: network error` | Nothing once: the next run tries again. If it goes on (status: `requests in a row without a usable answer`), check this machine's network, then the site. A network error at MoSPI's TLS handshake (`SSL`, `handshake` or `renegotiation` in the message) is what MoSPI's own client says its server needs legacy renegotiation for: add `--legacy-tls` to the MoSPI lines (certificates are still checked) |
@@ -861,20 +870,30 @@ needs:
 | `error: clock error` | Check the machine's clock. If a source's `last_update` or a host's `last_request` in `state.json` is the problem, clear the time the line names; if the store's own clock is ahead (a clock that ran fast), wait until the real time passes it |
 | `needs a look: derived tables not rebuilt` (an ingest: `error: derived tables not rebuilt`) | An update of this package, or a bug report: the values read were kept, and the previous tables too |
 
-**Saved answers and repairs.** `macro-store-ingest` reads files in the
-order of their full names as given (then their content), so the same files
-in any order give the same store, and the same files again change nothing:
-name saved answers by the time they were saved, or keep them in dated
-folders. A saved answer is dated by the ingest (`first_seen`), not by when
-it was saved, which the store cannot know: ingest saved answers oldest
-first; a value equal to one the store has already superseded is not taken
-as a change back; an ingest with a clock behind the store's is refused. Two
-inputs of one ingest that disagree on a value keep the later one by name,
-and say so, naming both. Base-2012 and 2010 CPI rows do not say their
-series (Current or Back): a raw copy of the store's own request is read as
-its URL says, any other such answer only with `--cpi-series Current` or
-`Back` (refused otherwise, so that a back series is never taken for a
-revision of the current one).
+**Saved answers and repairs.** `macro-store-ingest` reads files in the order
+of their full names as given (then their content), so the same files in any
+order give the same store, and the same files again change nothing: name
+saved answers by the time they were saved, or keep them in dated folders. A
+saved answer is dated by the ingest (`first_seen`), not by when it was
+saved, which the store cannot know: ingest saved answers oldest first; a
+value equal to one the store has already superseded is not taken as a change
+back; an ingest with a clock behind the store's is refused. Two inputs of
+one ingest that disagree on a value keep the later one by name, and say so,
+naming both. A copy of one of the store's own answers (the bytes of a file
+in its `raw/` that `fetches.csv` logs as the answer to a request: a refused
+answer, say, read again after an update of this package, from `raw/` or from
+a copy elsewhere) is of known age. Such copies are read first, in the order
+the store received them, and each value is dated as the update would have
+dated it: first seen at the `latest` of the request that first brought it,
+and bounded by the store's reads of the same data logged before that request
+(`prior_seen`); a change back is taken like any change, and a value older
+than what the store holds (a vintage first seen after the copy came, or a
+read of the same data since) is not taken (the ingest's line says how many).
+A copy whose file is gone from `raw/` is dated as any saved answer.
+Base-2012 and 2010 CPI rows do not say their series (Current or Back): a raw
+copy of the store's own request is read as its URL says, any other such
+answer only with `--cpi-series Current` or `Back` (refused otherwise, so
+that a back series is never taken for a revision of the current one).
 
 **Dropping a source** (MoSPI says no, say): with no command running, delete
 `observations/<source>.csv` and `raw/<source>/`, delete that source's rows
@@ -899,7 +918,7 @@ IIP 2011-12 before 1 Jun 2026; WPI 2011-12 before 15 Jun 2026).
 | `india_monthly.csv` | Family (`cpi`, `iip`, `wpi`), base and month, and each moment a value of it became public (a print) | `month`, `family`, `base` (`2024`, `2024back` for base 2024's back series, `2012`, `2010`, `2022-23`, `2011-12`), `print`, `stage`, `status`, `public_from`, `first_public_from`, `public_from_basis`, `release_id`, `seen`, `revised`; CPI `cpi_<m>_index`, `cpi_<m>_yoy`, `cpi_<m>_public_from` for `combined`, `rural`, `urban`, `food` (base 2024's group 01.1, the CFPI of MoSPI's release; base 2012's CFPI), `food_bev`, `fuel` (group 04.5; base 2012's fuel and light), `housing` (division 04; base 2012's housing), and `cpi_rent_index` (group 04.1); IIP `iip_index`, `iip_yoy`, `iip_manufacturing_index`, `_yoy`, each with `_public_from`; WPI `wpi_index`, `wpi_yoy` (computed here, on one base, from the month a year before as known at `public_from`: WPI publishes no inflation), `wpi_food_index`; `notes`. Every measure is as known at the row's `public_from`: a final row carries the measures that did not change |
 | `india_quarterly.csv` | Base, quarter and moment | `quarter`, `base`, the same columns as above, `gdp_current_cr`, `gdp_constant_cr`, `gdp_public_from`, `gva_current_cr`, `gva_constant_cr`, `gva_public_from`, `gdp_constant_yoy`, `gva_constant_yoy` (computed from the same base as known then), `notes` |
 | `index_events.csv` | Event of the table you gave | Its columns (below) and `public_from`, `public_from_basis`, `public_from_rule` |
-| `policy_rates_bis.csv` | Change of India's repo rate in BIS's series, from 3 Apr 2001 (the bank rate before) | `effective_date`, `repo_pct`, `sdf_pct`, `msf_pct`, `source`, `public_from`: the RBI store's policy-rate columns, with `sdf_pct` and `msf_pct` **blank**, as BIS has no corridor. `rbi-store-ingest --policy-rates` refuses the file until you fill them in from RBI's resolutions; check the dates too (BIS lags about a month and dates some 2019 changes a day after RBI's decision): `macro-store-status --policy-rates <your table>` lists the changes BIS and your table date differently (within a week) or one of them lacks |
+| `policy_rates_bis.csv` | Change of India's repo rate in BIS's series, from 3 Apr 2001 (the bank rate before) | `effective_date`, `repo_pct`, `sdf_pct`, `msf_pct`, `source`, `public_from`: the RBI store's policy-rate columns, with `sdf_pct` and `msf_pct` **blank**, as BIS has no corridor. `rbi-store-ingest --policy-rates` refuses the file until you fill them in from RBI's resolutions; check the dates too (BIS lags about a month and dates some 2019 changes a day after RBI's decision): `macro-store-status --policy-rates <your table>` lists the changes of the repo rate BIS and your table date differently (within a week) or one of them lacks (a row of your table that leaves the repo rate as the row before had it, the corridor alone moving, is counted and not compared) |
 
 **Index events**, kept by hand: none is shipped as a default. An example
 with the decisions found on 17 and 18 Nov 2026 is

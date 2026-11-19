@@ -897,7 +897,8 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("macro-store-ingest", help="add saved answers of the macro and global sources to a store; "
                                                   "rebuild its tables")
     p.add_argument("files", nargs="*", help="saved answers (MoSPI JSON, Treasury and New York Fed CSV or JSON, EIA "
-                                            "and H.10 pages, BIS CSV), recognised by their content")
+                                            "and H.10 pages, BIS CSV), recognised by their content; copies of the "
+                                            "store's own answers (its raw/) are dated by its request log")
     p.add_argument("--store", required=True, help="store directory, created on first use")
     p.add_argument("--cpi-series", choices=("Current", "Back"),
                    help="the series of saved base-2012 or 2010 CPI answers, whose rows do not say it (the store's own "
@@ -911,7 +912,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--series", type=_pattern_arg, help="list the series whose id matches this regular expression")
     p.add_argument("--policy-rates", type=_existing_file_arg,
                    help="a policy-rate table kept by hand (rbi-store-ingest --policy-rates columns): compare BIS's "
-                        "repo rate changes with it")
+                        "repo rate changes with its own (a row that moves only the corridor is not compared)")
     p.set_defaults(func=_macro_store_status)
 
     p = sub.add_parser("sovereign-master", help="one row per G-sec ISIN from saved RBI security lists")

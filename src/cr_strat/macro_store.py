@@ -103,8 +103,9 @@ far as the rules, the release table and the store's own reads know it:
 * Where these can still be early: a release later than a rule or a planned date when the store was not polling
   then (history read later); a closure the holiday rules do not know (a central-government holiday that is not a
   Mumbai one, an unscheduled US closure); a past BIS rupee release later than its rule (one calendar and one
-  observation); the US target before 4 Feb 1994 (not announced: an assumption). ``seen`` says which values the store
-  read at publication.
+  observation); the US target before 4 Feb 1994 (not announced: an assumption); an answer saved elsewhere (not the
+  bytes of one of the store's raw copies) with a value the store's own read after the rule's time lacked: the ingest
+  cannot tell which of its reads would have held it. ``seen`` says which values the store read at publication.
 * ``seen``: ``live`` if the store saw the value within six hours of ``public_from`` (``LIVE_WINDOW``), so that it is
   the value then published; ``later`` if it was read later (the history of a first update, a value seen late): it
   may include revisions made after ``public_from``. ``print``: ``first``, ``final`` (the last stage of its ladder) or
@@ -138,7 +139,8 @@ page whatever its status, a demand for contact details, a second web page in a r
 08:00 India time the next day, counted from the latest time the block can have happened, and a second block in a
 row stops it until ``resume`` after a person checked the site in a browser). A refused answer (kept in ``raw/``
 where copies are kept) or a MoSPI page that does not fit its query keeps no validator, so that it is asked again
-whole, and goes to ``failed``, as does a request answered with an HTTP 4xx: once per request (a recent window, whose
+whole (the time of the URL's last good read, ``last_ok``, is kept: it bounds what a later answer brings), and goes
+to ``failed``, as does a request answered with an HTTP 4xx: once per request (a recent window, whose
 URL moves every day, once per window), until it or a later read of the same data answers; ``retry_failed`` queues
 the history and pending ones again (a recent request is asked again by every run). A MoSPI table that still lacks
 the month its headline showed stays pending, with the other tables of that release, for ``MAX_LAG_TRIES`` reads. A
@@ -151,7 +153,11 @@ nothing, and their order does not matter. A saved answer is dated by the ingest 
 saved, which the store cannot know: ingest saved answers oldest first; a value equal to a vintage already superseded
 is not taken as a change back; a ``now`` before the store's clock is refused. Base-2012 and 2010 CPI rows do not say
 their series: an answer of them is read as the series of the store's own request (its raw copy), else as
-``cpi_series``, else refused.
+``cpi_series``, else refused. A copy of one of the store's own answers (the bytes of a raw copy ``fetches.csv`` logs
+as an answer: a refused one read again after an update of this package, say) is of known age: such copies are read
+first, in the order the store received them, and each value is dated as the update would have dated it (first seen
+at the ``latest`` of the request that first brought it, ``prior_seen`` the store's logged reads of the same data
+before that); a value older than what the store holds is not taken.
 
 **Derived tables** (``derived/``, deterministic). Each value is the latest vintage; ``public_from`` is the latest of
 the row's values, with a ``_public_from`` per group of values that became public together; ``seen`` is ``later`` if
@@ -177,7 +183,8 @@ revision was public.
 * ``policy_rates_bis``: India's repo rate changes in BIS's series from 3 Apr 2001 in ``rbi_store``'s policy-rate
   columns, ``sdf_pct`` and ``msf_pct`` blank (BIS has no corridor): to be completed by hand before
   ``rbi-store-ingest --policy-rates``, which refuses blanks; BIS lags about a month and dates some changes a day
-  after RBI's decision. ``policy_rate_check`` compares it with a table kept by hand.
+  after RBI's decision. ``policy_rate_check`` compares it with a table kept by hand (the table's repo-rate changes:
+  a row that moves only the corridor is not compared).
 
 ``status(store)`` reports per source its series, periods, the history queue, pending and failed requests, the host's
 last request, blocks and cool-downs, MoSPI's tables behind their headline, and the series the derived tables use;
@@ -1084,7 +1091,9 @@ class _Answer:
         latest vintage is older than it (``None``) if that vintage was first seen after the last receipt, or the
         store read the same data again since; else it came with the first receipt after both that vintage and the
         store's last read of the same data before the last receipt (each later read showed the store's value)."""
-        covering = [(row, when) for row, start, end, when in self.logged if _covers(start, end, obs)]
+        day = dt.date.fromisoformat(obs.period) if obs.period_type == "day" else None  # as _covers, parsed once
+        covering = [(row, when) for row, start, end, when in self.logged
+                    if day is None or ((start is None or start <= day) and (end is None or day <= end))]
         last, latest = self.received[-1]
         first = self.received[0]
         if held and _identity(held[-1]) != _identity(obs.as_dict()):
@@ -1093,6 +1102,14 @@ class _Answer:
             floor = max((row for row, _ in covering if row < last), default=-1)
             first = next(r for r in self.received if r[0] > floor and _ist(r[1]) >= held[-1]["first_seen"])
         return first[1], max((when for row, when in covering if row < first[0]), default=None)
+
+
+def _dates_earlier(new: tuple[dt.datetime, dt.datetime | None], held: tuple[dt.datetime, dt.datetime | None]) -> bool:
+    """Whether the dating ``new`` of a value (first seen, the latest read without it before that) replaces ``held``:
+    first seen earlier, or as early with a later read without it (the tighter bound)."""
+    if new[0] != held[0]:
+        return new[0] < held[0]
+    return new[1] is not None and (held[1] is None or new[1] > held[1])
 
 
 def _covers(start: dt.date | None, end: dt.date | None, obs: Observation) -> bool:
@@ -1157,11 +1174,14 @@ def _absorb(data: _Data, answers: list[_Answer], *, settings: Settings, live: bo
     take a value equal to an earlier, superseded vintage as a change back: it is counted in ``older``, nothing added.
     A copy of an answer the store received (``_Answer.received``) is of known age and dated value by value as the
     update would have dated it (``_Answer.received_at``): a value older than what the store holds is not taken
-    (``superseded``), and a change back is taken like any change.
+    (``superseded``), a change back is taken like any change, and a value two such copies agree on is dated by, and
+    named after, the one that came first (copies are read in the order of their last receipt, and the same bytes can
+    come twice).
     """
     out = _Absorbed()
     incoming: dict[tuple[str, str], list] = {}  # key -> [observation, first answer with it, last answer with it]
-    dated: dict[tuple[int, tuple[str, str]], tuple[dt.datetime, dt.datetime | None]] = {}  # received copies' values
+    # received copies: per key, the earliest dating of the value kept (first seen, prior read) and the copy it is from
+    best: dict[tuple[str, str], tuple[tuple[dt.datetime, dt.datetime | None], int]] = {}
     facts_by_series: dict[str, tuple[Observation, int]] = {}
     releases: dict[str, str] = {}
     for i, answer in enumerate(answers):
@@ -1171,20 +1191,26 @@ def _absorb(data: _Data, answers: list[_Answer], *, settings: Settings, live: bo
                 out.out_of_scope += 1
                 continue
             answer.counts["kept"] += 1
+            when = None
             if answer.received:
                 when = answer.received_at(obs, data.vintages.get(obs.key))
                 if when is None:
                     out.superseded += 1
                     continue
-                dated[(i, obs.key)] = when
             held = incoming.get(obs.key)
             if held is None or _identity(held[0].as_dict()) != _identity(obs.as_dict()):
                 if held is not None:
                     out.conflicts.append(f"{obs.series_id} {obs.period}: {held[0].value} in "
                                          f"{answers[held[2]].label}, {obs.value} in {answer.label} (the later kept)")
                 incoming[obs.key] = [obs, i, i]
+                if when is not None:
+                    best[obs.key] = (when, i)
+                else:
+                    best.pop(obs.key, None)
             else:
                 held[2] = i
+                if when is not None and obs.key in best and _dates_earlier(when, best[obs.key][0]):
+                    best[obs.key] = (when, i)
             facts_by_series[obs.series_id] = (obs, i)
             releases[obs.series_id] = max(releases.get(obs.series_id, ""), answer.result.meta.get("release_date", ""))
     for sid, (obs, i) in sorted(facts_by_series.items()):
@@ -1208,12 +1234,15 @@ def _absorb(data: _Data, answers: list[_Answer], *, settings: Settings, live: bo
             out.older += 1
             continue
         conflict = next((c for c in out.conflicts if c.startswith(f"{key[0]} {key[1]}:")), "")
-        seen, prior = dated.get((first, key)) or (answer.seen, answer.prior(obs))
+        if key in best:
+            (seen, prior), origin = best[key][0], answers[best[key][1]].name
+        else:
+            seen, prior, origin = answer.seen, answer.prior(obs), answer.name
         seen_text = max(_ist(seen), held[-1]["first_seen"]) if held else _ist(seen)
         facts = {"series_id": key[0], "period": key[1], "vintage": str(len(held) + 1), "value": obs.value,
                  "unit": obs.unit, "status": obs.status, "revision": obs.revision, "footnote": obs.footnote,
                  "imputation": obs.imputation, "first_seen": seen_text,
-                 "prior_seen": _naive_text(prior) if prior is not None else "", "source_file": answer.name,
+                 "prior_seen": _naive_text(prior) if prior is not None else "", "source_file": origin,
                  "notes": f"two answers disagreed: {conflict.split(': ', 1)[1]}" if conflict else ""}
         if held:
             last = held[-1]
@@ -1222,7 +1251,7 @@ def _absorb(data: _Data, answers: list[_Answer], *, settings: Settings, live: bo
                                    "old_value": last["value"], "new_value": obs.value, "old_status": last["status"],
                                    "new_status": obs.status, "old_revision": last["revision"],
                                    "new_revision": obs.revision, "old_first_seen": last["first_seen"],
-                                   "prior_seen": facts["prior_seen"], "source_file": answer.name})
+                                   "prior_seen": facts["prior_seen"], "source_file": origin})
             out.changed += 1
             answer.counts["changed"] += 1
         else:
@@ -2591,10 +2620,12 @@ def ingest(store: str | Path, sources: Iterable, *, now: dt.datetime, settings: 
 
     A copy of an answer the store received itself (the bytes of a raw copy that ``fetches.csv`` logs as saved by a
     request, its file in ``raw/`` compared byte for byte; a refused answer, say, read again after an update of this
-    package) is dated as an update would have dated it: first seen at the ``latest`` of the request that first
-    saved it, bounded by the store's reads of the same data logged before that request (``prior_seen``); a value of
-    it older than what the store holds (a vintage first seen after it, or a read of the same data since) is not
-    taken. These copies are read first, in the order the store received them, then the other inputs.
+    package) is dated as an update would have dated it: each value first seen at the ``latest`` of the request that
+    first brought it (after the vintage it replaces, if any; of two such copies that agree on it, the one received
+    first), bounded by the store's reads of the same data logged before that request (``prior_seen``); a value older
+    than what the store holds (a vintage first seen after the copy came, or a read of the same data since) is not
+    taken. These copies are read first, in the order the store last received them, then the other inputs. A copy
+    whose file is gone from ``raw/`` is read as any other input.
     """
     now = _check_now(now)
     settings = settings or Settings()
@@ -2998,7 +3029,11 @@ def policy_rate_check(store: str | Path, policy_rates: str | Path | bytes, *, wi
     """BIS's repo rate changes for India against a policy-rate table kept by hand (``rbi_store``'s columns, as
     ``rbi-store-ingest --policy-rates`` reads it): a cross-check, never a fill. Each line says what agrees, what BIS
     dates differently (within ``window_days``), and the changes one has that the other lacks, over the span both
-    cover. BIS lags about a month and has dated some changes a day after RBI's decision; the table is the source."""
+    cover. BIS lags about a month and has dated some changes a day after RBI's decision; the table is the source.
+
+    A row of the table is a change of any of the repo rate, the SDF and the MSF; BIS has the repo rate only, so a row
+    that leaves the repo rate as the row before had it (the corridor alone moved) is not compared, and the first
+    line says how many there were in the span."""
     from cr_strat import rbi_store  # a table in its format, read by its own checks
     kept = rbi_store.read_policy_rates(policy_rates)
     data = _load(StorePaths(Path(store)))
@@ -3007,9 +3042,11 @@ def policy_rate_check(store: str | Path, policy_rates: str | Path | bytes, *, wi
     if not bis or not kept:
         return ["policy rates: nothing to compare (" + ("no BIS repo rate in the store" if not bis else
                                                        "the table is empty") + ")"]
+    repo = [r for n, r in enumerate(kept) if n == 0 or float(r["repo_pct"]) != float(kept[n - 1]["repo_pct"])]
     first, last = max(bis[0]["effective_date"], kept[0]["effective_date"]), max(held)
     span = [r for r in bis if first < r["effective_date"] <= last]  # changes after the start both cover
-    table = [r for r in kept if first < r["effective_date"] <= last]
+    table = [r for r in repo if first < r["effective_date"] <= last]
+    corridor = sum(first < r["effective_date"] <= last for r in kept) - len(table)
     lines, matched, agree = [], set(), 0
     for row in span:
         day = dt.date.fromisoformat(row["effective_date"])
@@ -3030,8 +3067,10 @@ def policy_rate_check(store: str | Path, policy_rates: str | Path | bytes, *, wi
         if row["effective_date"] not in matched:
             lines.append(f"policy rates: the table changes the repo rate to {row['repo_pct']}% on "
                          f"{row['effective_date']}, a change BIS lacks")
+    skipped = (f"; {_n(corridor, 'row')} of the table that left the repo rate unchanged (the corridor alone moved) "
+               "not compared" if corridor else "")
     return [f"policy rates: BIS and the table agree on {_n(agree, 'change')} from {first} to {last} (BIS's latest "
-            "date)"] + lines
+            f"date){skipped}"] + lines
 
 
 def status(store: str | Path, *, now: dt.datetime | None = None) -> StoreStatus:

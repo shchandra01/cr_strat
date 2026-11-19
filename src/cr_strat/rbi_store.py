@@ -196,13 +196,15 @@ request. No request if the last one, answered or not, was less than
 ``min_interval`` ago, during a cool-down, or once the poller has stopped. The
 attempt is recorded in ``state.json`` before the request is sent, and the
 answer in ``polls.csv``. HTTP 418, 403 or 429, a firewall page or a bot
-challenge in place of the feed, or a second web page in a row where the feed
-should be, is a block (spec: make no further request that day; resuming is
-the operator's decision): no request before 08:00 India time the next day,
-and a second block in a row stops the poller until it is resumed
-(``resume=True``, ``cr-strat rbi-store-poll --resume``) after the site was
-checked in a browser. A good answer resets the count. A 5xx or network error
-is recorded; the next poll after ``min_interval`` tries again. A last request
+challenge in place of the feed (whatever HTTP status it comes with: a
+challenge with 503, a firewall page with 404), or a second web page in a row
+where the feed should be, is a block (spec: make no further request that
+day; resuming is the operator's decision): no request before 08:00 India
+time the next day, and a second block in a row stops the poller until it is
+resumed (``resume=True``, ``cr-strat rbi-store-poll --resume``) after the
+site was checked in a browser. A good answer resets the count. A 5xx
+(without a refusal page) or a network error is recorded; the next poll after
+``min_interval`` tries again. A last request
 recorded after ``now``, or a cool-down longer than its maximum, means the
 clock moved back: no request, and an error says so instead of waiting
 quietly. The request is conditional (``If-None-Match``,
@@ -2275,6 +2277,22 @@ def _decoded(response: FeedResponse) -> bytes:
     return decode_body(response.body, response.headers, MAX_FEED_BYTES)
 
 
+def _refusal_page(response: FeedResponse) -> str:
+    """Why an answer that is not the feed is a refusal page (``check_not_blocked``: a firewall page, a bot
+    challenge), whatever its HTTP status; ``""`` if it is not one (or cannot be read)."""
+    try:
+        body = _decoded(response)
+    except ValueError:
+        return ""
+    if not body.strip() or is_feed(body):
+        return ""
+    try:
+        check_not_blocked(parse_html(body.decode("utf-8-sig", errors="replace")), "the answer")
+    except BlockedPageError as exc:
+        return str(exc)
+    return ""
+
+
 # _resume_time (08:00 India time the next India day) is storekit.resume_time
 
 
@@ -2322,6 +2340,9 @@ def _answer(paths: StorePaths, stored: _Store, state: dict, response: FeedRespon
         return failed("network_error", f"network error: {response.error or 'no answer'}; the next poll tries again")
     if status in BLOCK_STATUSES:
         return _block(poller, now, f"HTTP {status}", status), None
+    refused = _refusal_page(response) if status not in (200, 304) else ""  # 200: the feed's own checks, below
+    if refused:  # a refusal page is a block whatever its status: a bot challenge with 503, a firewall page with 404
+        return _block(poller, now, f"a refusal page in place of the feed, with HTTP {status} ({refused})", status), None
     if 500 <= status <= 599:
         return failed("server_error", f"server error: HTTP {status}; the next poll tries again")
     if status == 304:

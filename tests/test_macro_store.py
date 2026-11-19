@@ -1117,7 +1117,7 @@ def test_a_refused_mospi_probe_keeps_the_time_of_its_last_good_read_for_the_mont
     refuse["on"] = False
     server = mospi_server(etag='W/"p2"', november=True)
     run(store, server, when=planned + 24 * HOUR, sources=["mospi"], settings=off)
-    assert "If-None-Match" not in [h for u, h in server.requests if "division_code=0" in u][0]  # asked whole
+    assert "If-None-Match" not in next(h for u, h in server.requests if "division_code=0" in u)  # asked whole
     (nov,) = [v for v in _vintages(store, "mospi", "cpi_2024_all_india_combined_general") if v["period"] == "2026-11"]
     assert (nov["prior_seen"], nov["public_from_basis"], nov["public_from"]) == (
         "2026-12-14T16:06:00", "first_seen", nov["first_seen"])  # the 304 at 16:05, before the refused answer
@@ -1156,7 +1156,7 @@ def test_a_retried_request_is_asked_whole_and_keeps_the_time_of_its_last_good_re
     ready["on"] = True
     sent = len(server.requests)
     run(store, server, when=start + dt.timedelta(days=7), sources=["mospi"], settings=off, retry_failed=True)
-    assert "If-None-Match" not in [h for u, h in server.requests[sent:] if u == url][0]  # asked whole
+    assert "If-None-Match" not in next(h for u, h in server.requests[sent:] if u == url)  # asked whole
     (food,) = [v for v in _vintages(store, "mospi", "cpi_2024_all_india_combined_g01_1") if v["period"] == "2026-10"]
     assert (food["prior_seen"], food["public_from_basis"], food["public_from"]) == (
         "2026-11-17T16:18:00", "first_seen", food["first_seen"])  # that read, in India time
@@ -1197,7 +1197,7 @@ def test_a_query_asked_again_from_page_1_keeps_the_time_of_page_1s_last_read(tmp
     phase["page1"] = True
     sent = len(server.requests)
     run(store, server, when=start + 2 * HOUR, sources=["mospi"], settings=off)
-    assert "If-None-Match" not in [h for u, h in server.requests[sent:] if u == page1][0]
+    assert "If-None-Match" not in next(h for u, h in server.requests[sent:] if u == page1)
     (fuel,) = [v for v in _vintages(store, "mospi", "cpi_2024_all_india_combined_g04_5") if v["period"] == "2026-10"]
     assert (fuel["prior_seen"], fuel["public_from_basis"], fuel["public_from"]) == (
         "2026-11-13T10:40:20", "first_seen", fuel["first_seen"])  # page 1's read of the second run lacked it
@@ -1262,6 +1262,30 @@ def test_every_refused_history_request_stays_retryable_and_out_of_done(tmp_path,
     assert (len(src["backfill"]["done"]), src["failed"], src["backfill"]["queue"]) == (36, [], [])
 
 
+def test_more_than_fifty_refused_requests_are_all_kept_and_all_asked_again(tmp_path, monkeypatch):
+    # MoSPI's default history is 82 requests: every answer refused, every one stays in failed (a list once cut to its
+    # last 50), and --retry-failed asks every one again
+    store, history = tmp_path / "s", {r.url for r, _ in st.history_requests("mospi", NOW)}
+    real, refuse = st.ms.parse, {"on": True}
+    monkeypatch.setattr(st.ms, "parse", lambda request, body, name=None: (_ for _ in ()).throw(
+        st.SourceError("a layout not sampled (simulated)")) if refuse["on"] and request.url in history
+        else real(request, body, name))
+    caps = {"sources": ["mospi"], "max_requests": 500, "max_per_host": 500}
+    for day in range(2):  # MoSPI's daily cap (60) spreads them over two days
+        run(store, Server(("api.mospi.gov.in", ok(fx.NO_DATA))), when=NOW + dt.timedelta(days=day), **caps)
+    src = _state(store)["sources"]["mospi"]
+    assert len(history) == 82 and {f["request"]["url"] for f in src["failed"]} == history
+    assert len(src["failed"]) == 82 and src["backfill"]["done"] == [] and src["backfill"]["queue"] == []
+    refuse["on"] = False
+    asked = set()
+    for day in (2, 3):
+        server = Server(("api.mospi.gov.in", ok(fx.NO_DATA)))
+        run(store, server, when=NOW + dt.timedelta(days=day), retry_failed=day == 2, **caps)
+        asked |= set(server.urls()) & history
+    src = _state(store)["sources"]["mospi"]
+    assert asked == history and (len(src["backfill"]["done"]), src["failed"], src["backfill"]["queue"]) == (82, [], [])
+
+
 def test_an_ingest_orders_inputs_by_their_full_names_and_names_them_in_its_conflicts(tmp_path):
     store = tmp_path / "s"
     old = (str(tmp_path / "2026-11-17" / "secured.json"), secured(("2026-11-16", "3.93")))
@@ -1272,6 +1296,13 @@ def test_an_ingest_orders_inputs_by_their_full_names_and_names_them_in_its_confl
     assert (sofr["value"], sofr["revision"]) == ("3.95", "r")  # the one saved later, by its folder
     conflict = next(c for c in report.conflicts if c.startswith("sofr 2026-11-16"))
     assert "2026-11-17/secured.json" in conflict and "2026-11-19/secured.json" in conflict
+    # the same two values the other way round: in one of the two pairs the earlier folder's answer has the larger
+    # SHA-256, so only the order of the full names (not of base names, then content) keeps the later folder's value
+    for earlier, later in (("3.93", "3.95"), ("3.95", "3.93")):
+        pair = [(str(tmp_path / f"{day}" / "secured.json"), secured(("2026-11-16", value)))
+                for day, value in (("2026-11-19", later), ("2026-11-17", earlier))]
+        st.ingest(tmp_path / f"order_{earlier}", pair, now=NOW)
+        assert [v["value"] for v in _vintages(tmp_path / f"order_{earlier}", "nyfed", "sofr")] == [later]
 
 
 H10_START = dt.datetime(2026, 11, 18, 1, 0, tzinfo=UTC)  # 20:00 New York time on Tue 17 Nov, 06:30 in India
@@ -1332,8 +1363,8 @@ def test_raw_copies_are_read_in_the_order_received_and_never_over_a_newer_vintag
     report = st.ingest(first, copies, now=H10_START + dt.timedelta(days=3))
     (v,) = [r for r in _vintages(first, "h10", "usdinr_h10_noon") if r["period"] == "2026-11-13"]
     assert (v["value"], v["first_seen"], v["prior_seen"]) == ("94.2500", "2026-11-20T06:31:00", "2026-11-18T06:31:00")
-    assert report.conflicts == ["usdinr_h10_noon 2026-11-13: 94.2400 in b_first.htm, 94.2500 in a_second.htm (the "
-                                "later kept)"]
+    assert report.conflicts == [("usdinr_h10_noon 2026-11-13: 94.2400 in b_first.htm, 94.2500 in a_second.htm (the "
+                                 "later kept)")]
     _h10_runs(second, monkeypatch, pages, refused={1, 2})
     again = st.ingest(second, copies, now=H10_START + dt.timedelta(days=4))
     assert (again.received, again.new, again.changed, again.superseded) == (2, 0, 0, 2)
@@ -1360,6 +1391,33 @@ def test_a_raw_copy_is_not_taken_over_a_later_read_and_brings_a_change_back_at_i
               if v["period"] == "2026-11-13"]
     assert values == [("94.2400", "2026-11-18T06:31:00"), ("94.2500", "2026-11-19T06:31:00"),
                       ("94.2400", "2026-11-20T06:31:00")]
+
+
+def test_two_raw_copies_that_agree_date_a_value_by_the_one_received_first(tmp_path, monkeypatch):
+    # page X (13 Nov), then Y (13 Nov and 16 Nov), then X again, all refused: copies are read in the order of their
+    # last receipt (Y, then X), but 13 Nov came first with X's first receipt, and is dated and named by it
+    x, y = _h10(("13-NOV-26", "94.2400")), _h10(("13-NOV-26", "94.2400"), ("16-NOV-26", "94.3000"))
+    store = tmp_path / "s"
+    raws = _h10_runs(store, monkeypatch, [_h10(), x, y, x], refused={1, 2, 3})
+    assert raws[1] == raws[3] != raws[2]  # the same bytes are kept once
+    report = st.ingest(store, [store / raws[1], store / raws[2]], now=H10_START + dt.timedelta(days=4))
+    assert (report.received, report.new) == (2, 2)
+    (v,) = [r for r in _vintages(store, "h10", "usdinr_h10_noon") if r["period"] == "2026-11-13"]
+    assert (v["first_seen"], v["prior_seen"], v["source_file"]) == ("2026-11-19T06:31:00", "2026-11-18T06:31:00",
+                                                                    raws[1])
+
+
+def test_a_copy_of_a_raw_file_gone_from_raw_is_dated_as_an_answer_saved_elsewhere(tmp_path, monkeypatch):
+    # the store's own answers are known by their bytes in raw/: with the file gone, a copy kept elsewhere is dated by
+    # the ingest, as any saved answer (and saved again)
+    store = tmp_path / "s"
+    raws = _h10_runs(store, monkeypatch, [_h10(), _h10(("13-NOV-26", "94.2400"))], refused={1})
+    copy = _write(tmp_path / "kept.htm", (store / raws[1]).read_bytes())
+    (store / raws[1]).unlink()
+    report = st.ingest(store, [copy], now=H10_START + dt.timedelta(days=2))
+    assert (report.received, report.new, len(report.raw_saved)) == (0, 1, 1)
+    (v,) = [r for r in _vintages(store, "h10", "usdinr_h10_noon") if r["period"] == "2026-11-13"]
+    assert (v["first_seen"], v["prior_seen"], v["source_file"]) == ("2026-11-20T06:30:00", "", report.raw_saved[0])
 
 
 def test_a_clock_behind_the_store_is_refused_and_vintages_never_go_back_in_time(tmp_path):
@@ -1530,3 +1588,20 @@ def test_bis_policy_rates_are_checked_against_a_table_kept_by_hand(tmp_path):
     assert lines[0] == ("policy rates: BIS and the table agree on 1 change from 2001-04-03 to 2026-10-07 (BIS's "
                         "latest date)")
     assert "policy rates: BIS dates the change to 5.25% 2026-10-06, the table 2026-10-05" in lines
+
+
+def test_a_table_row_that_moves_only_the_corridor_is_not_taken_for_a_repo_change(tmp_path):
+    # rbi_store's table has a row per change of any of the repo rate, SDF and MSF (typed-in rates); BIS has the repo
+    # rate only: a row that leaves the repo rate as it was is no repo change BIS lacks
+    store = tmp_path / "s"
+    st.ingest(store, [("b.csv", CBPOL)], now=NOW)
+    table = (b"effective_date,repo_pct,sdf_pct,msf_pct,source\n2001-04-03,8.5,7.5,9.5,typed in for the test\n"
+             b"2015-06-01,8.5,8,9,typed in: the corridor alone moved\n2026-10-06,5.25,5,5.5,typed in\n"
+             b"2026-10-07,5.5,5.25,5.75,typed in\n")
+    assert st.policy_rate_check(store, table) == [
+        ("policy rates: BIS and the table agree on 2 changes from 2001-04-03 to 2026-10-07 (BIS's latest date); 1 row "
+         "of the table that left the repo rate unchanged (the corridor alone moved) not compared")]
+    typo = st.policy_rate_check(store, table.replace(b"2015-06-01,8.5,", b"2015-06-01,8.25,"))  # a repo rate typed
+    assert typo == [  # wrong on such a row is still found
+        "policy rates: BIS and the table agree on 2 changes from 2001-04-03 to 2026-10-07 (BIS's latest date)",
+        "policy rates: the table changes the repo rate to 8.25% on 2015-06-01, a change BIS lacks"]

@@ -1180,6 +1180,26 @@ def test_poll_treats_a_bot_challenge_and_a_second_web_page_in_a_row_as_blocks(tm
     assert st.poll(tmp_path / "b", now=T0 + HOUR, transport=fake).outcome == "cooling_down" and len(fake.requests) == 2
 
 
+@pytest.mark.parametrize("status", [503, 404, 401])
+def test_poll_treats_a_refusal_page_as_a_block_whatever_its_http_status(tmp_path, status):
+    # a bot challenge served with HTTP 503 (as some firewalls do) or a firewall page with 404 is a block, as with 200:
+    # the next poll an hour later asks nothing; a plain error page with the same status stays an error
+    challenge = (b"<html><head><title></title><script>document.cookie='t=1';location.reload();</script></head>"
+                 b"<body><noscript>Please enable JavaScript to view this site.</noscript></body></html>")
+    for n, page in enumerate((challenge, fx.blocked_page().encode())):
+        fake = FakeTransport(st.FeedResponse(status, {"content-type": "text/html"}, page), _ok(_feed16()))
+        first = st.poll(tmp_path / f"s{n}", now=T0, transport=fake)
+        assert (first.outcome, first.exit_code, first.http_status) == ("blocked", 3, status)
+        assert f"blocked: a refusal page in place of the feed, with HTTP {status} (the answer: " in first.message
+        assert _state(tmp_path / f"s{n}")["cooldown_until"] == "2026-11-17T02:30:00Z"  # 08:00 in India the next day
+        later = st.poll(tmp_path / f"s{n}", now=T0 + HOUR, transport=fake)
+        assert later.outcome == "cooling_down" and len(fake.requests) == 1
+    plain = FakeTransport(*[st.FeedResponse(status, {}, b"<html><head><title>Error</title></head><body><p>Not "
+                                                        b"available</p></body></html>")] * 2)
+    errors = [st.poll(tmp_path / "t", now=T0 + n * HOUR, transport=plain).outcome for n in range(2)]
+    assert errors == ["server_error" if status >= 500 else "http_error"] * 2 and len(plain.requests) == 2
+
+
 def test_poll_of_a_feed_without_release_ids_is_an_error_and_keeps_the_raw_copy(tmp_path):
     store = tmp_path / "s"
     feed = _feed16().replace(b"BS_PressReleaseDisplay.aspx?prid=", b"BS_PressReleaseDisplay.aspx?Id=")
