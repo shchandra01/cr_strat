@@ -455,7 +455,7 @@ Draft letters for every row, with placeholders for the firm's details, are in
 | To | Ask |
 |---|---|
 | CCIL Data Services ([form](https://www.ccilindia.com/web/ccil/data-request-form)) | Price, depth and format of trade history by security, repo by security, TREPS, MTM prices and OIS prints; whether the haircut PDF may be kept |
-| FBIL | Which tier applies to back-testing and curve fitting; the fee below ₹500 crore turnover; the FY2026-27 SORR price; whether a subscription includes history and from when; whether an in-house curve needs a Derived Product License; whether MIBOR-OIS starts at 1 or 6 months; price of the USD/INR reference rate |
+| FBIL | Which tier applies to back-testing and curve fitting; the fee below ₹500 crore turnover; the FY2026-27 SORR price; whether a subscription includes history and from when; whether an in-house curve needs a Derived Product License; since when the 1-3 month MIBOR-OIS rates are published, and its own statement of their quote basis; price of the USD/INR reference rate |
 | NSE Data & Analytics | Whether corporate bond history is sold, from when and at what price; storage and back-testing rights; price of its valuations |
 | BSE | Current debt tariff and history depth; website terms |
 | RBI | Written permission to store press-release data and back-test on it; an acceptable request rate; bulk access to DBIE |
@@ -476,8 +476,10 @@ What can be built now, with no licence:
    for coupons and redemptions. Sources: FIMMDA's handbook and holiday lists,
    RBI's Master Directions. Built for Mumbai settlement, with holiday lists
    for 2015 to 2026 checked against the settlement dates RBI prints and the
-   auction yields imply ([`conventions.md`](conventions.md#calendar)); MIBOR
-   fixing and exchange calendars remain.
+   auction yields imply ([`conventions.md`](conventions.md#calendar)). MIBOR
+   fixings use the same calendar: the handbook's MIBOR business days are
+   Mumbai business days, an equivalence reasoned, not confirmed
+   ([`analytics.md`](analytics.md)). Exchange calendars remain.
 2. **Sovereign security master and issuance ledger.** One row per ISIN per
    issue, reissue, switch, buyback and maturity, so outstanding stock is known
    on any past date. Sources: RBI's lists kept as daily snapshots from now;
@@ -609,11 +611,34 @@ What can be built now, with no licence:
 Then, as licences arrive: the sovereign price panel (extend
 [`fbil.py`](../src/cr_strat/fbil.py) to the security sheets; a CCIL trade
 loader on the pattern of [`trades.py`](../src/cr_strat/trades.py)); the curve
-fit for S3; OIS bootstrapping, asset-swap spreads and funding for S1; a return
-engine with carry, roll-down, funding, haircuts and costs; S2 on the existing
-trade and price-panel code; the event ledger for S4; the state panel for S6
-and implied policy paths for S7; corporate cash-flow terms, primary data and
-fundamentals for S8 and S10.
+fit for S3 (built ahead of the prices and tested on synthetic bonds only:
+Nelson-Siegel-Svensson with a spline cross-check, rich/cheap residuals in the
+fit and out of sample with each bond's leverage, z-scores against a daily
+history the code keeps, butterflies and DV01-neutral pairs in
+[`curvefit.py`](../src/cr_strat/curvefit.py) and `cr-strat curve-fit`,
+described in [`analytics.md`](analytics.md), with each residual's coupon, age,
+FAR flag, reissues and stock joined and an optional regression on them; not
+built: controls for liquidity and special repo, which need CCIL's trades and
+repo by security; it waits for the price panel); OIS bootstrapping, asset-swap
+spreads and funding for S1 (built ahead of the quotes and tested on synthetic
+ones only: MIBOR-OIS conventions, compounding of fixings, the bootstrapped
+curve and swap valuation in [`ois.py`](../src/cr_strat/ois.py),
+`cr-strat ois-curve`; yield-yield, par-par, proceeds and z-spreads in
+[`asset_swaps.py`](../src/cr_strat/asset_swaps.py), `cr-strat asset-swaps`;
+repo funding from the RBI store's money-market rates, only as published by a
+given time, haircuts from a table kept by the user, CCIL's TREPS concentration
+caps and the carry of a bond or asset swap, long or short, in
+[`funding.py`](../src/cr_strat/funding.py), `cr-strat repo-carry`; all
+described in [`analytics.md`](analytics.md); they wait for FBIL's MIBOR and
+MIBOR-OIS, longer OIS quotes and the price panel); a return engine with
+roll-down and costs (carry, funding and haircuts are in `funding.py`); S2 on
+the existing trade and price-panel code; the event ledger for S4; the state
+panel for S6; implied policy paths for S7 (built on synthetic quotes: the MPC
+dates of FY2026-27 as package data with the day each became public, a step
+model of overnight MIBOR and the back-out of the level after each meeting
+decided after the trade date, with what the quotes identify, in
+[`policy_path.py`](../src/cr_strat/policy_path.py), `cr-strat policy-path`);
+corporate cash-flow terms, primary data and fundamentals for S8 and S10.
 
 ## Pitfalls
 
@@ -673,8 +698,9 @@ fundamentals for S8 and S10.
 - Fields and history of CCIL's script-loaded tables and FBIL's tables: no
   data rows were seen. Whether CCIL's Market by Price page shows depth, and
   whether guests can open the MTM archive.
-- Whether MIBOR-OIS starts at 1 or 6 months, and FBIL's fee below the
-  ₹500 crore threshold.
+- Since when FBIL publishes MIBOR-OIS rates for 1 to 3 months (its current
+  methodology statement lists 1 month to 5 years, an older version 6 months
+  to 5 years), and FBIL's fee below the ₹500 crore threshold.
 - Contents of RBI's SDL list, DBIE's depth and terms, and the Ministry of
   Finance debt reports.
 - BSE's terms and debt data; AMC Repo Clearing's haircuts; F-TRAC's fields;

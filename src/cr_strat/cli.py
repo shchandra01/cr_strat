@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import math
 import re
 import sys
@@ -14,6 +15,7 @@ import pandas as pd
 
 from cr_strat import macro_store, rbi_store
 from cr_strat.amfi_debt_trades import build_mf_trades, mapping_report, to_price_trades
+from cr_strat.asset_swaps import asset_swap_table, fill_from_master
 from cr_strat.auctions import (
     REPORT_COLUMNS,
     build_auctions,
@@ -29,10 +31,44 @@ from cr_strat.bonds import FixedRateBond, ZeroCouponBond
 from cr_strat.calendars import mumbai_settlement_calendar
 from cr_strat.conventions import CONVENTIONS, FINAL_PERIOD_RULES, as_date
 from cr_strat.cra_disclosures import disclosure_summary, load_cra_disclosures, unmapped_issuers
+from cr_strat.curvefit import (
+    CONTROL_DRIVERS,
+    LOSSES,
+    METHODS,
+    MODEL_RISK_BP,
+    OBJECTIVES,
+    RESIDUAL_CHOICES,
+    WEIGHT_SCHEMES,
+    ZSCORE_MIN_OBS,
+    ZSCORE_WINDOW,
+    FitSettings,
+    append_history,
+    benchmark_frame,
+    bond_butterflies,
+    bond_pairs,
+    compare_curves,
+    control_residuals,
+    curve_points,
+    curve_spreads,
+    fit_curve,
+    model_risk_flags,
+    prepare_prices,
+    refitter,
+    residual_drivers,
+    rich_cheap_table,
+)
 from cr_strat.curves import BenchmarkCurve, SpreadBenchmark
 from cr_strat.event_prices import DEFAULT_ANCHORS, event_price_paths
 from cr_strat.fbil import GSEC_KINDS, MM_KINDS, combine_curves, load_fbil_gsec_curve, load_fbil_money_market
 from cr_strat.flows import DEFAULT_WINDOWS, event_flows, parse_windows
+from cr_strat.funding import (
+    FUNDING_SOURCES,
+    REPO_COMPOUNDING,
+    carry_table,
+    fbil_published_at,
+    funding_rates,
+    read_haircuts,
+)
 from cr_strat.issuance import (
     build_ledger,
     coverage,
@@ -46,7 +82,28 @@ from cr_strat.issuance import (
 )
 from cr_strat.mandates import load_mandates
 from cr_strat.mf_portfolio import parse_mf_portfolio
+from cr_strat.ois import (
+    MIBOR_OIS,
+    SORR_OIS,
+    add_months,
+    as_time,
+    bootstrap_ois,
+    curve_table,
+    fixing_map,
+    ois_quotes,
+    tenor_months,
+)
 from cr_strat.ownership import event_ownership, load_events, load_securities
+from cr_strat.policy_path import (
+    DEFAULT_LAM,
+    DEFAULT_MPC_CSV,
+    EFFECTIVE_RULES,
+    implied_policy_path,
+    load_mpc_calendar,
+    mibor_repo_spread,
+    policy_rate_on,
+    read_policy_table,
+)
 from cr_strat.price_panel import build_price_panel, read_price_panel
 from cr_strat.rating_actions import load_rating_actions
 from cr_strat.rating_events import build_rating_events, rating_timeline
@@ -674,6 +731,341 @@ def _bond_price(args: argparse.Namespace) -> int:
     return 0
 
 
+def _curve_fit(args: argparse.Namespace) -> int:
+    """Fit a curve to one settlement date's prices, cross-check it and write the curve and every residual."""
+    try:
+        settlement = _date_arg(args.settlement, "--settlement")
+        if args.control and not (args.master or args.ledger):
+            raise ValueError("--control needs the drivers: give --master and/or --ledger")
+        prices = pd.read_csv(args.prices, dtype=str, keep_default_na=False)
+        master = read_master(args.master) if args.master else None
+        frame = prepare_prices(prices, master)
+        settings = FitSettings(
+            method=args.method, objective=args.objective, loss=args.loss, outlier_bp=args.outlier_bp,
+            weights=args.weights, include_kinds=tuple(k for k in args.kinds.split(",") if k.strip()),
+            min_volume_cr=args.min_volume_cr, anchor_pct=args.anchor, drop_benchmarks=args.drop_benchmarks,
+            leave_one_out=not args.no_leave_one_out)
+        result = fit_curve(frame, settlement, settings)
+        residuals, check, comparison = result.residuals, None, None
+        if args.check not in ("none", args.method):
+            # the check is refitted without each bond too, so model risk at a bond is judged on curves it cannot sway;
+            # on a day with suspect bonds a flag is judged again on curves fitted without them as well
+            check_settings = replace(settings, method=args.check)
+            check = fit_curve(frame, settlement, check_settings)
+            comparison = compare_curves(result.curve, check.curve, threshold_bp=args.model_risk_bp)
+            loo = settings.leave_one_out
+            residuals = model_risk_flags(residuals, comparison, check_residuals=check.residuals if loo else None,
+                                         refit=refitter(frame, settlement, settings, check_settings) if loo else None)
+        column = RESIDUAL_CHOICES[args.residual]
+        if args.residual == "loo" and not settings.leave_one_out:
+            raise ValueError("--residual loo needs the leave-one-out refits: drop --no-leave-one-out")
+        rich = None
+        if args.history:
+            history = pd.read_csv(args.history, dtype=str, keep_default_na=False).replace({"": None})
+            rich = rich_cheap_table(residuals, history, window=args.window, min_obs=args.min_obs, column=column)
+        appended = None
+        if args.append_history:
+            past = Path(args.append_history)
+            old = pd.read_csv(past, dtype=str, keep_default_na=False).replace({"": None}) if past.exists() else None
+            appended = append_history(old, residuals)
+        flies = None
+        if args.fly:
+            flies = bond_butterflies(residuals, [tuple(text.split(",")) for text in args.fly])
+        pairs = None
+        if args.pair:
+            pairs = bond_pairs(residuals, [tuple(text.split(",")) for text in args.pair])
+        drivers = controlled = None
+        if args.master or args.ledger:
+            ledger = read_ledger(args.ledger) if args.ledger else None
+            stock = outstanding_on(ledger, settlement) if ledger is not None else None
+            drivers = residual_drivers(residuals, master, ledger=ledger, stock=stock)
+            if args.control:
+                names = [c.strip() for c in args.control.split(",") if c.strip()]
+                drivers = control_residuals(drivers, names, column=column)
+                controlled = drivers.attrs["coefficients"]
+    except (ValueError, TypeError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    out = Path(args.out_dir)
+    _write(curve_points(result.curve), out / "curve.csv")
+    _write(residuals, out / "residuals.csv")
+    _write(benchmark_frame([result.curve]), out / "benchmark_par.csv")
+    _write(curve_spreads(result.curve), out / "curve_spreads.csv")
+    if check is not None:
+        _write(curve_points(check.curve), out / "curve_check.csv")
+        _write(comparison, out / "crosscheck.csv")
+    if rich is not None:
+        _write(rich, out / "rich_cheap.csv")
+    if flies is not None:
+        _write(flies, out / "butterflies.csv")
+    if pairs is not None:
+        _write(pairs, out / "pairs.csv")
+    if drivers is not None:
+        _write(drivers, out / "drivers.csv")
+    if controlled is not None:
+        _write(controlled, out / "controls.csv")
+    if appended is not None:
+        _write(appended, Path(args.append_history))
+    diagnostics = {"primary": result.diagnostics, "check": check.diagnostics if check is not None else None}
+    path = out / "diagnostics.json"
+    path.write_text(json.dumps(diagnostics, indent=2, allow_nan=False) + "\n")
+    print(f"wrote diagnostics  {path}")
+    d = result.diagnostics
+    print(f"{d['method']}: {d['n_fit']} of {d['n_input']} rows in the fit, RMSE {d['rmse_bp']:.2f} bp, largest "
+          f"{d['max_abs_bp']:.2f} bp, curve {d['curve_id']}")
+    if comparison is not None:
+        flagged = comparison[comparison["model_risk"]]
+        print(f"cross-check {args.check}: {len(flagged)} of {int(comparison['in_joint_range'].sum())} tenors in the "
+              f"joint data range differ by more than {args.model_risk_bp:g} bp in par yield")
+    for warning in d["warnings"]:
+        print(f"warning: {warning}")
+    for note in (residuals.attrs.get("notes", []) if check is not None else []):
+        print(f"note: {note}")
+    for note in (rich.attrs.get("notes", []) if rich is not None else []):
+        print(f"note: {note}")
+    for note in (drivers.attrs.get("notes", []) if drivers is not None else []):
+        print(f"note: {note}")
+    return 0
+
+
+OIS_CONVENTIONS = {"mibor": MIBOR_OIS, "sorr": SORR_OIS}
+
+
+def _ois_calendar(args: argparse.Namespace):
+    calendar = mumbai_settlement_calendar()
+    return calendar.lenient() if args.project_calendar else calendar
+
+
+def _read_csv_text(path: str) -> pd.DataFrame:
+    return pd.read_csv(path, dtype=str, keep_default_na=False)
+
+
+def _bootstrap(args: argparse.Namespace, trade):
+    return bootstrap_ois(_read_csv_text(args.quotes), trade, args.overnight,
+                         conventions=OIS_CONVENTIONS[args.conventions], calendar=_ois_calendar(args),
+                         max_extrapolation_years=args.max_extrapolation_years, source=Path(args.quotes).name)
+
+
+def _calendar_warning(projected: bool) -> None:
+    if projected:
+        print("warning: dates past 2026 are projected on weekends alone (no holiday list yet): calendar_projected")
+
+
+def _ois_curve(args: argparse.Namespace) -> int:
+    """Bootstrap an OIS curve from one day's par quotes; write its nodes and a monthly table."""
+    try:
+        trade = _date_arg(args.trade_date, "--trade-date")
+        curve = _bootstrap(args, trade)
+        nodes, table = curve.nodes(), curve_table(curve)
+    except (ValueError, TypeError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    out = Path(args.out_dir)
+    _write(nodes, out / "nodes.csv")
+    _write(table, out / "curve.csv")
+    print(f"{curve.conventions.name} curve of {trade}: effective {curve.effective}, {len(curve.quotes)} quotes to "
+          f"{curve.node_dates[-1]}, largest repricing error {nodes['error_bp'].abs().max():.1e} bp")
+    _calendar_warning(curve.calendar_projected)
+    return 0
+
+
+def _asset_swaps(args: argparse.Namespace) -> int:
+    """Asset-swap measures of each bond in a file against the OIS curve of one day's quotes."""
+    try:
+        trade = _date_arg(args.trade_date, "--trade-date")
+        settlement = _date_arg(args.settlement, "--settlement")
+        curve = _bootstrap(args, trade)
+        bonds = _read_csv_text(args.bonds)
+        if args.master:
+            bonds = fill_from_master(bonds, read_master(args.master))
+        table = asset_swap_table(bonds, curve, settlement)
+    except (ValueError, TypeError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    _write(table, Path(args.out))
+    failed = table[table["error"] != ""]
+    print(f"{len(table) - len(failed)} of {len(table)} bonds measured against the {curve.conventions.name} curve of "
+          f"{trade} (to {curve.node_dates[-1]})")
+    for rec in failed.to_dict("records"):
+        print(f"refused {rec['isin']}: {rec['error']}")
+    _calendar_warning(curve.calendar_projected)
+    return 0 if len(failed) < len(table) else 1
+
+
+def _horizon(quotes: pd.DataFrame, trade) -> dt.date:
+    """The last date a set of policy-path quotes can reach, with room for the spot lag and the roll."""
+    columns = [str(c).strip().lower() for c in quotes.columns]
+    if "end_date" in columns:
+        return max(as_date(v) for v in quotes[quotes.columns[columns.index("end_date")]])
+    months = int(ois_quotes(quotes)["months"].max())
+    return add_months(trade, months) + dt.timedelta(days=10)
+
+
+def _policy_path(args: argparse.Namespace) -> int:
+    """The repo-rate path after each MPC meeting implied by one day's OIS quotes."""
+    try:
+        trade = _date_arg(args.trade_date, "--trade-date")
+        calendar = _ois_calendar(args)
+        quotes = _read_csv_text(args.quotes)
+        meetings = load_mpc_calendar(args.meetings or DEFAULT_MPC_CSV, until=_horizon(quotes, trade),
+                                     project=args.project, calendar=calendar, as_of=trade)
+        policy = _read_csv_text(args.policy_rates) if args.policy_rates else None
+        notes = []
+        current = args.policy_rate
+        if current is None:
+            if policy is None:
+                raise ValueError("give --policy-rate, or --policy-rates for the repo rate in force")
+            current = policy_rate_on(policy, trade)  # known on the trade date: never a later row of the table
+            if math.isnan(current):
+                raise ValueError(f"--policy-rates has no repo rate in force on {trade}")
+            listed = set(meetings.loc[~meetings["projected"].astype(bool), "decision_date"])
+            later = [(d, r) for d, r in read_policy_table(policy) if trade < d <= calendar.add_business_days(trade, 1)]
+            if trade in listed and later:
+                # a decision day and a change dated the next business day: most likely that day's decision dated a day
+                # late (BIS dates some so), and then the rate known on the trade date is the later row's; never guess
+                raise ValueError(f"{trade} is an MPC decision day and --policy-rates dates a repo-rate change to "
+                                 f"{later[0][1]:g}% on {later[0][0]}, the next business day: if that is the decision "
+                                 f"announced on {trade} dated a day late (as BIS dates some), the rate known on "
+                                 f"{trade} is {later[0][1]:g}%, not the table's {current:g}%. Give --policy-rate with "
+                                 "the repo rate known on the trade date")
+            if trade in listed:
+                notes.append(f"{trade} is an MPC decision day: the starting rate {current:g}% from --policy-rates "
+                             "must include that day's decision")
+            if later:
+                notes.append(f"--policy-rates dates a repo-rate change on {later[0][0]}, after the trade date: not "
+                             "used (if it is a decision announced on the trade date and dated a day late, as BIS "
+                             "dates some, give --policy-rate)")
+        spread, estimate = args.spread_bp, None
+        if spread is None:
+            if not (args.store and policy is not None):
+                raise ValueError("give --spread-bp, or --store with --policy-rates to estimate it from the call rate")
+            as_of = _time_arg(args.as_of, "--as-of") if args.as_of else None
+            rates = funding_rates(rbi_store.read_table(args.store, "money_market_daily"), "call")
+            estimate = mibor_repo_spread(rates, policy, trade, as_of=as_of, calendar=calendar)
+            spread = estimate.spread_bp
+        result = implied_policy_path(quotes, trade, current_policy_pct=current, meetings=meetings, spread_bp=spread,
+                                     lam=args.lam, calendar=calendar, effective_rule=args.effective_rule)
+    except (ValueError, TypeError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    out = Path(args.out_dir)
+    _write(result.path, out / "path.csv")
+    _write(result.quotes, out / "quote_fit.csv")
+    diagnostics = dict(result.diagnostics)
+    if estimate is not None:
+        diagnostics["spread_estimate"] = {"spread_bp": estimate.spread_bp, "days": estimate.n_obs,
+                                          "first": estimate.first.isoformat(), "last": estimate.last.isoformat(),
+                                          "regime_start": estimate.regime_start.isoformat(),
+                                          "as_of": estimate.as_of.isoformat(), "proxy": "weighted average call rate",
+                                          "fallback": estimate.fallback, "note": estimate.note}
+    diagnostics["notes"] = notes
+    path = out / "diagnostics.json"
+    path.write_text(json.dumps(diagnostics, indent=2, allow_nan=False) + "\n")
+    print(f"wrote diagnostics  {path}")
+    for note in notes:
+        print(f"note: {note}")
+    if estimate is not None:
+        print(f"MIBOR-repo spread {spread:+.2f} bp: median of {estimate.n_obs} day(s) of the call rate (a stand-in for "
+              f"MIBOR) from {estimate.first} to {estimate.last}")
+        if estimate.fallback:
+            print(f"warning: {estimate.note}")
+    for rec in result.path.to_dict("records"):
+        if rec["in_horizon"]:
+            mark = "" if rec["identified"] else " (not identified by the quotes alone)"
+            label = " projected" if rec["projected"] else ""
+            print(f"{rec['decision_date']}{label}: {rec['level_pct']:.4f}% ({rec['change_bp']:+.2f} bp){mark}")
+    d = result.diagnostics
+    print(f"largest quote error {d['max_abs_error_bp']:.2e} bp, {d['levels']} levels, rank {d['rank']}")
+    _calendar_warning(result.diagnostics["calendar_projected"])
+    return 0
+
+
+def _time_arg(value: str, flag: str) -> dt.datetime:
+    """``value`` as a time (India time, no zone, ISO 8601), with errors naming the flag."""
+    try:
+        return as_time(value, flag)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(str(exc)) from None
+
+
+def _read_fixings(path: str) -> tuple[pd.Series, dict | None]:
+    """A fixings file (``date``, ``rate_pct``, optional ``public_from``) as a Series indexed by date, so that two
+    different rates for one date are refused, and the publication times when the column is there: a blank cell is
+    FBIL's publication time of that day (``funding.fbil_published_at``), as for a file without the column."""
+    table = _read_csv_text(path)
+    table.columns = [str(c).strip().lower() for c in table.columns]
+    missing = [c for c in ("date", "rate_pct") if c not in table]
+    if missing:
+        raise ValueError(f"the fixings file {path} lacks {missing} (columns: date, rate_pct, optional public_from)")
+    kept = table[table["rate_pct"].astype(str).str.strip() != ""]
+    dates = [_date_arg(d, f"the fixings file's date {d!r}") for d in kept["date"]]
+    try:
+        rates = [float(r) for r in kept["rate_pct"]]
+    except ValueError as exc:
+        raise ValueError(f"the fixings file {path}: {exc}") from None
+    series = pd.Series(rates, index=dates, dtype=float)
+    fixing_map(series)  # refuses two different rates for one date
+    times = None
+    if "public_from" in kept:
+        times = {d: (_time_arg(t, f"the fixings file's public_from {t!r}") if str(t).strip() else fbil_published_at(d))
+                 for d, t in zip(dates, kept["public_from"])}
+    return series, times
+
+
+def _repo_carry(args: argparse.Namespace) -> int:
+    """Carry of each bond in a file funded in repo at the RBI store's rates over a horizon."""
+    try:
+        start, end = _date_arg(args.start, "--start"), _date_arg(args.end, "--end")
+        as_of = _time_arg(args.as_of, "--as-of") if args.as_of else None
+        policy = _read_csv_text(args.policy_rates) if args.policy_rates else None
+        daily = rbi_store.read_table(args.store, "money_market_daily")
+        funding = funding_rates(daily, args.source, as_of=as_of, policy=policy)
+        excess, excess_missing = None, ""
+        if args.source == "triparty" and not args.no_treps_caps:
+            try:
+                excess = funding_rates(daily, args.excess_source, as_of=as_of, policy=policy)
+            except ValueError as exc:  # needed only where CCIL's caps bind: those rows are refused, saying why
+                excess_missing = str(exc)
+        bonds = _read_csv_text(args.bonds)
+        if args.master:
+            bonds = fill_from_master(bonds, read_master(args.master))
+        haircuts = read_haircuts(args.haircuts) if args.haircuts else None
+        fixings = times = None
+        if args.pay_fixed is not None:
+            if not (args.fixings and args.swap_tenor):
+                raise ValueError("--pay-fixed needs --swap-tenor and --fixings (date, rate_pct: overnight MIBOR)")
+            fixings, times = _read_fixings(args.fixings)
+        months = tenor_months(args.swap_tenor) if args.swap_tenor else None
+        calendar = mumbai_settlement_calendar()
+        result = carry_table(bonds, start, end, funding=funding, haircuts=haircuts, face=args.face,
+                             swap_rate_pct=args.pay_fixed, swap_months=months, fixings=fixings,
+                             excess_funding=excess, treps_caps=not args.no_treps_caps,
+                             repo_compounding=args.repo_compounding, projection="last" if args.project else None,
+                             pull_to_par=not args.no_pull_to_par,
+                             calendar=calendar.lenient() if args.project_calendar else calendar, as_of=as_of,
+                             fixing_times=times, spread_bp=args.funding_spread_bp)
+    except (ValueError, TypeError, OSError, KeyError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    _write(result, Path(args.out))
+    failed = result[result["error"] != ""]
+    print(f"{len(result) - len(failed)} of {len(result)} bonds carried from {start} to {end} on {args.source} rates"
+          + (f" public by {as_of}" if as_of else "") + (" (fixings too)" if as_of and fixings is not None else ""))
+    for rec in failed.to_dict("records"):
+        print(f"refused {rec['isin']}: {rec['error']}")
+    if excess_missing and failed["error"].str.contains("excess_funding").any():
+        print(f"no {args.excess_source} rates for the rest: {excess_missing}")
+    carried = result[result["error"] == ""]
+    capped = carried[carried["funding_share"] < 1]
+    if len(capped):
+        print(f"{len(capped)} position(s) partly funded at {args.excess_source} rates under CCIL's TREPS caps")
+    if len(carried) and carried["projected_fixings"].max() > 0:
+        print(f"{int(carried['projected_fixings'].max())} business day(s) of MIBOR projected (not public by --as-of "
+              "or past the fixings given)")
+    _calendar_warning(bool(carried["calendar_projected"].any()) if len(carried) else False)
+    return 0 if len(failed) < len(result) else 1
+
+
 def _add_peer_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--match-on", default="instrument_class,rating_bucket,tenor_bucket",
                    help="peer-group columns; add 'sector' if the security master has it")
@@ -801,6 +1193,133 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--first-coupon-date", help="first coupon date, for an irregular first period")
     p.add_argument("--cash-flows", action="store_true", help="also list the remaining cash flows")
     p.set_defaults(func=_bond_price)
+
+    p = sub.add_parser("curve-fit", help="fit a zero curve to one settlement date's G-sec and T-bill prices or "
+                                         "yields; write the curve on a grid and every bond's rich/cheap residual")
+    p.add_argument("--prices", required=True,
+                   help="CSV, one row per ISIN: isin and clean_price or yield_pct; optional kind, coupon_pct, "
+                        "maturity_date, issue_date, first_coupon_date, weight, flags, traded, trade_count, volume_cr")
+    p.add_argument("--master", help="security master CSV (sovereign-master) giving kind, coupon and dates by ISIN")
+    p.add_argument("--settlement", required=True, help="settlement date of the prices, YYYY-MM-DD")
+    p.add_argument("--method", choices=METHODS, default="nss")
+    p.add_argument("--check", choices=(*METHODS, "none"), default="pspline",
+                   help="cross-check curve (default pspline); residuals where it differs are flagged model_risk")
+    p.add_argument("--model-risk-bp", type=float, default=MODEL_RISK_BP,
+                   help="par-yield gap between the curves that flags model risk (UNVERIFIED default 3)")
+    p.add_argument("--objective", choices=OBJECTIVES, default="yield")
+    p.add_argument("--loss", choices=LOSSES, default="squared")
+    p.add_argument("--outlier-bp", type=float,
+                   help="take the worst bond out of the fit while its residual exceeds this and 4 robust sd")
+    p.add_argument("--weights", choices=WEIGHT_SCHEMES, default="equal")
+    p.add_argument("--kinds", default="gsec,tbill,cmb", help="kinds in the fit, comma-separated (sdl for an SDL curve)")
+    p.add_argument("--min-volume-cr", type=float, default=5.0,
+                   help="smallest daily volume (Rs crore) in the fit; rows without a volume are kept")
+    p.add_argument("--anchor", type=float, help="overnight rate (percent) anchoring the start of the curve")
+    p.add_argument("--drop-benchmarks", action="store_true", help="keep rows flagged benchmark out of the fit")
+    p.add_argument("--no-leave-one-out", action="store_true", help="skip the leave-one-out refits")
+    p.add_argument("--history", help="earlier residuals (date, isin, resid_yield_bp, optional years_to_maturity) "
+                                     "for z-scores; written to rich_cheap.csv")
+    p.add_argument("--residual", choices=tuple(RESIDUAL_CHOICES), default="in_fit",
+                   help="residual scored against --history: in_fit (resid_yield_bp) or loo (each bond against the "
+                        "curve refitted without it, which end bonds cannot pull towards themselves)")
+    p.add_argument("--append-history", metavar="CSV",
+                   help="add the day's residuals to this history file (created if absent; the day's old rows replaced)")
+    p.add_argument("--window", type=int, default=ZSCORE_WINDOW, help="z-score window, observations")
+    p.add_argument("--min-obs", type=int, default=ZSCORE_MIN_OBS, help="fewest observations for a z-score")
+    p.add_argument("--fly", action="append", metavar="SHORT,BODY,LONG",
+                   help="ISINs of a butterfly, short to long (repeatable); written to butterflies.csv")
+    p.add_argument("--pair", action="append", metavar="SHORTER,LONGER",
+                   help="ISINs of a DV01-neutral pair (repeatable), e.g. the 10-year against a 40-year; pairs.csv")
+    p.add_argument("--ledger", help="issuance ledger CSV (cr-strat auctions): reissues and outstanding stock as of the "
+                                    "settlement date, joined to each residual in drivers.csv")
+    p.add_argument("--control", metavar="DRIVERS",
+                   help="regress the day's --residual on these drivers of drivers.csv, comma-separated, e.g. "
+                        f"{','.join(CONTROL_DRIVERS)} (UNVERIFIED form): resid_ctrl_bp and controls.csv")
+    p.add_argument("--out-dir", required=True)
+    p.set_defaults(func=_curve_fit)
+
+    def _ois_args(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--quotes", required=True,
+                       help="CSV of one day's par quotes: tenor and rate_pct, or fbil-mm's columns (rate_quoted_pct)")
+        p.add_argument("--trade-date", required=True, help="the quotes' trade date, YYYY-MM-DD")
+        p.add_argument("--overnight", type=float, required=True, help="the trade date's overnight fixing, percent")
+        p.add_argument("--conventions", choices=tuple(OIS_CONVENTIONS), default="mibor")
+        p.add_argument("--max-extrapolation-years", type=float, default=0.0,
+                       help="years past the last quote the curve may run on its last forward rate (default none)")
+        p.add_argument("--project-calendar", action="store_true",
+                       help="treat weekdays of years without a holiday list (2027 on) as business days")
+
+    p = sub.add_parser("ois-curve", help="bootstrap a MIBOR-OIS discount curve from one day's par quotes")
+    _ois_args(p)
+    p.add_argument("--out-dir", required=True)
+    p.set_defaults(func=_ois_curve)
+
+    p = sub.add_parser("asset-swaps", help="yield-yield, par-par, proceeds and z-spreads of bonds against an OIS curve")
+    _ois_args(p)
+    p.add_argument("--bonds", required=True,
+                   help="CSV: isin, clean_price or yield_pct; kind, coupon_pct, maturity_date (or --master); optional "
+                        "issue_date, settlement_date")
+    p.add_argument("--master", help="security master CSV (sovereign-master) filling kind, coupon and dates by ISIN")
+    p.add_argument("--settlement", help="settlement date of the prices (default: the swaps' effective date, T+1)")
+    p.add_argument("--out", required=True)
+    p.set_defaults(func=_asset_swaps)
+
+    p = sub.add_parser("policy-path", help="the repo-rate level after each MPC meeting implied by one day's OIS quotes")
+    p.add_argument("--quotes", required=True, help="CSV: tenor and rate_pct, or end_date and rate_pct")
+    p.add_argument("--trade-date", required=True, help="the quotes' trade date, YYYY-MM-DD")
+    p.add_argument("--policy-rate", type=float,
+                   help="the repo rate known on the trade date (in force that day, after any decision announced that "
+                        "day), percent")
+    p.add_argument("--policy-rates", help="policy-rate table (effective_date, repo_pct): the rate in force on the "
+                                          "trade date, and the regime for the spread estimate; on a decision day a "
+                                          "change it dates the next business day is refused (give --policy-rate)")
+    p.add_argument("--spread-bp", type=float, help="overnight MIBOR minus the repo rate, bp")
+    p.add_argument("--store", help="RBI store: estimate the spread from its call rate (a stand-in for MIBOR)")
+    p.add_argument("--as-of", help="use only store rates public by this time (India time); default: the trade date's "
+                                   "start")
+    p.add_argument("--meetings", help=f"MPC meeting file in the layout of {DEFAULT_MPC_CSV.name} (default: shipped)")
+    p.add_argument("--project", action="store_true", help="project meetings past the last complete year (UNVERIFIED)")
+    p.add_argument("--lam", type=float, default=DEFAULT_LAM, help="penalty on changes between meetings")
+    p.add_argument("--effective-rule", choices=EFFECTIVE_RULES, default="next_business_day")
+    p.add_argument("--project-calendar", action="store_true",
+                   help="treat weekdays of years without a holiday list (2027 on) as business days")
+    p.add_argument("--out-dir", required=True)
+    p.set_defaults(func=_policy_path)
+
+    p = sub.add_parser("repo-carry", help="carry of bonds funded in repo at an RBI store's daily rates over a horizon")
+    p.add_argument("--store", required=True, help="RBI store whose derived/money_market_daily.csv gives the rates")
+    p.add_argument("--bonds", required=True,
+                   help="CSV: isin, kind, coupon_pct, maturity_date, clean_price; optional face (rupees), liquidity "
+                        "(CCIL's class), haircut_pct, side (long or short) and a short's special_repo_pct")
+    p.add_argument("--master", help="security master CSV filling kind, coupon and dates by ISIN")
+    p.add_argument("--haircuts", help="haircut table kept by you (effective_date, isin or kind, buckets, haircut_pct, "
+                                      "source)")
+    p.add_argument("--start", required=True, help="the purchase's settlement date, YYYY-MM-DD")
+    p.add_argument("--end", required=True, help="end of the horizon, YYYY-MM-DD (exclusive)")
+    p.add_argument("--source", choices=FUNDING_SOURCES, default="triparty")
+    p.add_argument("--excess-source", choices=FUNDING_SOURCES, default="market_repo",
+                   help="rates for the cash TREPS does not lend against SDLs and illiquid G-secs under CCIL's caps "
+                        "(RMD/SS/26/13; default market_repo)")
+    p.add_argument("--no-treps-caps", action="store_true", help="fund every position in full at --source's rates")
+    p.add_argument("--funding-spread-bp", type=float, default=0.0,
+                   help="spread over every repo rate, bp, e.g. what a constituent pays its bank (UNVERIFIED default 0)")
+    p.add_argument("--as-of", help="use only rates and fixings public by this time (India time), as a signal would")
+    p.add_argument("--project", action="store_true",
+                   help="hold the last known rate (and MIBOR fixing) past the end of what is known")
+    p.add_argument("--project-calendar", action="store_true",
+                   help="treat weekdays of years without a holiday list (2027 on) as business days")
+    p.add_argument("--policy-rates", help="policy-rate table for the repo rate column")
+    p.add_argument("--face", type=float, default=1e9,
+                   help="face in rupees where the file gives none (default 100 crore)")
+    p.add_argument("--pay-fixed", type=float, help="add a pay-fixed OIS at this rate (percent) on each bond's face")
+    p.add_argument("--swap-tenor", help="the OIS tenor, e.g. 5Y")
+    p.add_argument("--fixings", help="CSV of overnight MIBOR fixings (date, rate_pct, optional public_from: a blank "
+                                     "cell is FBIL's publication time that day) for the OIS's floating leg; with "
+                                     "--as-of only those public by then are used")
+    p.add_argument("--repo-compounding", choices=REPO_COMPOUNDING, default="simple")
+    p.add_argument("--no-pull-to-par", action="store_true", help="leave the pull to par out of the carry")
+    p.add_argument("--out", required=True)
+    p.set_defaults(func=_repo_carry)
 
     p = sub.add_parser("rbi-releases", help="auctions, liquidity operations, money-market rates and calendars from "
                                             "saved RBI pages and RSS feeds")

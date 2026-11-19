@@ -101,6 +101,30 @@ dealer marks. A curve date is used for up to 7 days. Set `--benchmark-compoundin
 to the curve's convention (G-sec yields are semi-annual) and `--bond-compounding`
 to the trade yields' convention. Spreads are computed on the bond's basis.
 
+## Analytics inputs: prices, OIS quotes, positions, haircuts, fixings, MPC dates
+
+`cr-strat curve-fit`, `ois-curve`, `asset-swaps`, `repo-carry` and
+`policy-path` read files you prepare. Their layouts, with the defaults and
+the conventions each command assumes, are in
+[`docs/analytics.md`](../docs/analytics.md) (each part's "What it does"):
+
+| File | Read by | Main columns |
+|---|---|---|
+| Price file (one day) | `curve-fit --prices` | `isin`, `clean_price` or `yield_pct`; optional `kind`, `coupon_pct`, `maturity_date`, `weight`, `flags`, `traded`, `trade_count`, `volume_cr` |
+| Residual history | `curve-fit --history`, written by `--append-history` | `HISTORY_COLUMNS` of `curvefit`; a file fitted with other settings is refused (an `--anchor` at each day's own rate counts as the same settings) |
+| Issuance ledger | `curve-fit --ledger` (reissues and stock beside each residual) | the `cr-strat auctions` ledger, below |
+| OIS quotes (one day) | `ois-curve`, `asset-swaps`, `policy-path --quotes` | `tenor`, `rate_pct`, or the `fbil-mm --kind miborois` output |
+| Bonds and positions | `asset-swaps --bonds`, `repo-carry --bonds` | `isin` (each once), `clean_price` or `yield_pct`; positions add `face`, `liquidity` (CCIL's class), `side`, `special_repo_pct` |
+| Haircut table (kept by you) | `repo-carry --haircuts` | `effective_date`, `isin` or `kind`, `min_years`, `max_years`, `liquidity`, `haircut_pct`, `source` |
+| Overnight MIBOR fixings | `repo-carry --fixings` | `date` (each once), `rate_pct`, optional `public_from` (a blank cell, like a file without the column: FBIL's publication time that day) |
+| MPC dates | shipped as `src/cr_strat/data/mpc_meetings.csv`; `policy-path --meetings` for your own | `meeting_start`, `decision_date`, `fy`, `kind`, `announced`, `source`, `confirmed` |
+| Policy rates | `policy-path --policy-rates`, `repo-carry --policy-rates` | the RBI store's policy-rate table, or the macro store's `policy_rates_bis` (on a decision day, a change it dates the next business day, as BIS dates some, makes `policy-path` ask for `--policy-rate`) |
+
+CCIL's haircut list and liquidity classes are restricted: type your own table
+from what your clearing member gives you. FBIL's MIBOR and MIBOR-OIS need a
+subscription before they are kept as a history
+([`docs/rates_data_sources.md`](../docs/rates_data_sources.md)).
+
 ## RBI press releases: saved pages and `pressreleases_rss.xml`
 
 RBI publishes every auction and liquidity operation as a press release: GoI

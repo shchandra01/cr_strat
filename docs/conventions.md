@@ -338,6 +338,9 @@ Amortisation and calls or puts change that list; record dates need
 `ex_coupon_days` (now refused unless 0); annualised yields on actual days use
 `compounding="annual", time_basis="act/365"`; a quarterly or monthly basis
 needs an entry in `COMPOUNDING` and `COMPOUNDING_FREQUENCY` (`convert_yield`
-converts any basis listed there); floating coupons need a fixing source. Also
-missing: MIBOR fixing and exchange calendars. T+2 for FPI trades is
+converts any basis listed there); floating coupons need a fixing source.
+MIBOR fixings and OIS dates use the Mumbai settlement calendar (the
+handbook's MIBOR business days taken as Mumbai business days, an equivalence
+reasoned, not confirmed: [`analytics.md`](analytics.md)). Also missing:
+exchange calendars. T+2 for FPI trades is
 `settlement_date(trade_date, GSEC, lag=2)`.

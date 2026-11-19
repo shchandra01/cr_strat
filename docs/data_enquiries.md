@@ -127,8 +127,8 @@ Please tell us:
 2. The fee for a money-market benchmark when the user's annual turnover or outstanding contracts in it are below ₹500 crore.
 3. The SORR fees for FY2026-27.
 4. Whether a subscription includes history, and from what date for each benchmark.
-5. Whether an in-house curve fitted to FBIL prices needs a Derived Product License under clause 5.1 of your Terms of Use, and its fee.
-6. Whether MIBOR-OIS starts at 1 month or 6 months.
+5. Whether what we would derive from FBIL data needs a Derived Product License under clause 5.1 of your Terms of Use, and its fee: an in-house zero curve fitted to FBIL prices, an OIS curve bootstrapped from MIBOR-OIS rates, asset-swap spreads against that curve, a policy-rate path implied by MIBOR-OIS rates, and a comparison of our fitted curve with FBIL's.
+6. Since what date MIBOR-OIS rates for 1, 2 and 3 months have been published, and FBIL's statement of how the rates are quoted (whether they are par rates of swaps starting on the spot date, simple up to one year and semi-annual beyond).
 7. The fee for the USD/INR reference rate.
 8. The file format by API and SFTP, whether stored data may be kept after the subscription ends, and the lead time.
 
