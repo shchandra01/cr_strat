@@ -78,6 +78,9 @@ cr-strat rbi-releases data/raw/rbi/releases/*.html data/raw/rbi/feeds/*.xml --ou
 cr-strat rbi-store-poll --store data/rbi_store            # one request at most; run it from cron (data/README.md)
 cr-strat rbi-store-ingest --store data/rbi_store data/raw/rbi/releases/*.html --master data/out/sovereign_master.csv
 cr-strat rbi-store-status --store data/rbi_store
+cr-strat macro-store-update --store data/macro_store       # New York Fed, H.10, BIS; MoSPI only with --sources mospi
+cr-strat macro-store-ingest --store data/macro_store data/raw/macro/* --index-events data/raw/index_events.csv
+cr-strat macro-store-status --store data/macro_store
 cr-strat sovereign-master --goi-list data/raw/rbi/goi_outstanding_*.html --far data/raw/rbi/far.html \
     --snapshots data/out/goi_outstanding.csv --out data/out/sovereign_master.csv
 cr-strat auctions --fimmda-gsec data/raw/fimmda/Gsec_Auction_data_*.xlsx --fimmda-sdl data/raw/fimmda/SDL_*.xlsx \
@@ -110,6 +113,13 @@ the pressure variable and the price response for each event.
 | `rbi_releases` | RBI press releases from saved pages and the RSS feed: GoI, T-bill and SDL auction results, underwriting and switch results, auction announcements. A registry of release types; checks that refuse a release rather than misread it |
 | `rbi_operations` | The other RBI releases of that registry: the daily Money Market Operations (one row per printed line: call, triparty and market repo rates and volumes, the SDF-MSF corridor, every liquidity operation, net liquidity, reserves), variable rate repo and reverse repo auctions, open market operations, the GoI and state issuance calendars |
 | `rbi_store` | A daily store fed by RBI's press-release feed: a poller that makes one conditional request at most, never within its minimum interval, logs every request, asks nothing more that India day after a block and stops after a second block in a row until resumed by hand; ingest that keeps each release and every copy read once, logs corrected rows, repairs failed releases (also from its raw copies after a parser fix, which bring every entry up to date), reads RBI's press-release listing and lists possible gaps (ids never seen, listed releases never read, days without Money Market Operations); derived tables of daily money-market rates and liquidity (with quarter-end flags, changed footnote marks, a check of outstanding operations across days and policy rates kept by hand), liquidity auctions joined across announcement, result and Money Market Operations, open market operations and switches with ISINs, and a supply calendar, each row with the time from which all its values were public. Atomic, locked writes |
+| `storekit` | What the stores share: one GET with the standard library (no redirect followed, a byte cap, an optional TLS context that keeps certificate checks), gzip decoding, checks of the client name and timeout, the block rule's clock (no request before 08:00 India time the next day), and the writes: atomic files, a commit journal that the next command completes or drops, and a lock that is reported and never broken |
+| `ustime` | New York, London and India time from the published daylight-saving rules, without time-zone data (checked against `zoneinfo`: New York 1987 to 2030, London 1996 to 2030) |
+| `macro_base` | The long format every macro and global source parses into (one row per value, kept as the publisher's text, with base, series, sector, level, code, status, revision), the refusal, and India's financial-year periods |
+| `mospi` | MoSPI's eSankhyiki API: CPI (bases 2024, 2012, 2010), IIP, national accounts and WPI. Request builders, parsers that refuse an answer they cannot read whole (pages that do not add up, a changed unit, a layout never sampled), the release-date table shipped in `src/cr_strat/data/macro_release_dates.csv`, and the time from which each value was public (release rules, revision ladders, base launches) |
+| `global_sources` | US Treasury par yields, the New York Fed's reference rates, EIA's Brent price, the Fed's H.10 rupee rate, BIS policy and rupee rates, and index inclusion events from a table kept by hand (an example with each fact's source: `data/index_events_example.csv`, never a default): requests, parsers that refuse an answer cut short, and publication-time rules in New York, London and India time that move past US federal holidays |
+| `macro_sources` | The macro sources together: the hosts that may be asked (RBI, FRED, FBIL, CCIL, the exchanges and others never), a polite fetch (generic client name, conditional requests where honoured, a pause between requests to a host, caps per run and per day, the block rule), parsing by kind, and the series catalogue with each publisher's terms and citation |
+| `macro_store` | A store of the macro and global series: every value ever seen as a vintage with the time from which it was public (release calendar and rules for MoSPI, publication rules in New York time for the US, BIS's dates in force; never before the store's own read of the same data, after the rule's time, that lacked it) and whether the store saw it at publication; `as_of` for what was known at a time. Updates that ask the recent window (reaching back over any outage), follow-ups and a history in steps within caps per run, per host and per day (MoSPI only when named), with the block rule; a refused answer is asked again whole and kept in `failed` until it reads; ingest of saved answers in any order; derived tables of global daily rates, Indian monthly prices and output and quarterly GDP by print, the index events kept by hand and BIS's repo rate in the RBI store's policy-rate columns, with a check against a table kept by hand. Atomic, locked writes |
 | `sovereign` | Sovereign security names (G-sec, SDL, T-bill, FRB, green bond) parsed to a join key; state codes; RBI's GoI-outstanding and FAR lists; a master with one row per ISIN; name-to-ISIN matching |
 | `auctions` | One table of G-sec, SDL and T-bill auctions from FIMMDA's yearly and SDL workbooks, RBI's Handbook Table 221 and RBI's releases: ISINs, settlement dates, and a check that the cut-off price reproduces the printed yield, which infers settlement and missing maturity dates |
 | `issuance` | Ledger of issues, reissues, switches, buybacks and maturities per ISIN; outstanding stock on any date, backward from RBI's lists or forward, with completeness flags; reconciliation with RBI's list; supply by month and tenor bucket |
@@ -179,6 +189,35 @@ the pressure variable and the price response for each event.
   which are not even recognised. RBI's SDL and STRIPS lists sit
   behind rbidocs' bot challenge and have no loader, so the master holds
   G-secs unless SDL ISINs are added with `--extra`.
+- **The macro store keeps only what it reads.** MoSPI's API serves the
+  latest value only and overwrites a first print when it is revised, so
+  first prints exist only for releases the store polled; history read later
+  is dated by the release table or rules and flagged `later` (it may include
+  revisions), and is visible only from the release that set its latest
+  value: quarterly GDP only from its year's final estimates, CPI 2012 from
+  28 Feb 2015, IIP and WPI 2011-12 from 31 May 2017 (data/README.md).
+  MoSPI's terms for a stored history are not known (letter 12 of
+  `docs/data_enquiries.md`): it is fetched only when named, without raw
+  copies, CPI down to groups unless `--cpi-levels items`. Treasury (it
+  refused a probe on 18 Nov 2026, then answered the per-year path the same
+  day) and EIA (the Brent series' copyright field is unread) are off by
+  default. Release dates before April 2025, and every WPI date, come from
+  rules: a "next working day" skips the Mumbai settlement holidays as a
+  proxy for the central government's, a "previous working day" (GDP, IIP
+  before 2025) knows weekends only; the 2025-26 dates are planned ones;
+  launch dates of the older bases are from memory. BIS's rupee figure is
+  dated by a rule from one calendar (weekly releases, a week of margin):
+  H.10 is the rupee for back-tests. The parsers were checked on answers
+  saved on 17 and 18 Nov 2026 and two live runs on 18 Nov 2026 (43
+  requests) made by an earlier version of the store; the fixes after them
+  were checked on the saved answers and with fake servers only. MoSPI's
+  history queue, WPI's major-group filters, IIP's one-month tables and
+  release-day polling were not run against the real API, and no block was
+  met. Not built: consensus forecasts, the CGA fiscal accounts, GST, trade,
+  PIB's first prints, FBIL's reference rate, a core CPI, Treasury's real
+  yields, bills and long-term rates (their files were never sampled: the
+  parser refuses them), the base-2010 CPI history (its parser exists),
+  polling of MoSPI's release-calendar pointer.
 - **The RBI store's history starts at its first poll.** The feed holds 10
   releases; earlier ones come only from pages saved by hand, a few a day.
   Possible gaps are listed, not filled: nothing fetches a release page, and

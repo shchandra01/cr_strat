@@ -461,6 +461,15 @@ def test_rbi_store_poll_exit_codes_and_one_line_messages(tmp_path, capsys, monke
     assert daily["public_from_source"].tolist() == ["feed", "feed", "release_date"]
 
 
+def _documented_grep(heading):
+    """The one ``grep -E '...'`` pattern of the section of data/README.md that starts with ``heading``."""
+    readme = (Path(__file__).resolve().parents[1] / "data" / "README.md").read_text(encoding="utf-8")
+    section = readme.split(f"\n{heading}", 1)[1].split("\n## ", 1)[0]
+    patterns = re.findall(r"grep -E\s+'([^']+)'", section)
+    assert len(patterns) == 1, (heading, patterns)
+    return patterns[0]
+
+
 def test_the_documented_daily_grep_flags_every_poll_that_exits_non_zero_and_no_other(tmp_path, capsys, monkeypatch):
     import datetime as dt
     import json
@@ -469,10 +478,7 @@ def test_the_documented_daily_grep_flags_every_poll_that_exits_non_zero_and_no_o
 
     from cr_strat import rbi_store
 
-    readme = (Path(__file__).resolve().parents[1] / "data" / "README.md").read_text(encoding="utf-8")
-    patterns = re.findall(r"grep -E\s+'([^']+)'", readme)
-    assert len(patterns) == 1
-    documented = re.compile(patterns[0])
+    documented = re.compile(_documented_grep("## RBI operations store"))
     feed = fx.feed([fx.mmo_item(fx.mmo_saturday()), fx.mmo_item(fx.mmo_friday())])
     broken = fx.mmo_friday()
     broken["net_total"] = "-1,70,000.00"
@@ -628,3 +634,195 @@ def test_rbi_store_ingest_takes_policy_rates_and_listings_and_reports_a_failed_r
     assert main(["rbi-store-ingest", "--store", str(store)]) == 1
     assert capsys.readouterr().err == ("rbi-store-ingest: error: derived tables not rebuilt: ValueError: a bug (the "
                                        "previous ones are kept; the parsed rows and raw copies were saved)\n")
+
+
+def _macro_transport(answers):
+    """A fake transport for macro-store-update: the first route whose text the URL contains answers; 404 else."""
+    from cr_strat.storekit import FeedResponse
+
+    sent = []
+
+    def transport(url, headers, timeout, **kwargs):
+        sent.append(url)
+        for key, answer in answers.items():
+            if key in url:
+                return answer
+        return FeedResponse(404, {}, b"")
+    return transport, sent
+
+
+def test_macro_store_update_exit_codes_one_line_messages_and_the_mospi_reminder(tmp_path, capsys, monkeypatch):
+    import macro_fixtures as mfx
+
+    from cr_strat import macro_store
+    from cr_strat.storekit import FeedResponse
+
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+    good = {"unsecured/all": FeedResponse(200, {}, mfx.nyfed_json([mfx.effr_row("2026-11-16")])),
+            "secured/all": FeedResponse(200, {}, mfx.nyfed_json([mfx.sofr_row("2026-11-16")])),
+            "dat00_in": FeedResponse(200, {}, mfx.h10_page([("13-NOV-26", "94.2400")])),
+            "dat96_in": FeedResponse(200, {}, mfx.h10_page_1990s([("2-Jan-90", "16.9600")])),
+            "WS_CBPOL": FeedResponse(200, {}, mfx.cbpol_v2([("IN", "2026-10-07", "5.5", "A")])),
+            "WS_XRU": FeedResponse(200, {}, mfx.xru_v1([("2026-11-10", "93.928571", "A")])),
+            "api.mospi.gov.in": FeedResponse(200, {}, mfx.NO_DATA)}
+    transport, sent = _macro_transport(good)
+    monkeypatch.setattr(macro_store, "urllib_transport", transport)
+    import datetime as dt
+    _fixed_clock(monkeypatch, dt.datetime(2026, 11, 18, 14, 0, tzinfo=dt.timezone.utc))
+    run = "macro-store-update: 2026-11-18T14:00:00Z "  # every line carries the run's time: the log is appended to
+    store = str(tmp_path / "store")
+    assert main(["macro-store-update", "--store", store]) == 0
+    out = capsys.readouterr()
+    assert out.err == "" and out.out.splitlines()[0].startswith(run + "nyfed: 4 requests (4 ok): ")
+    assert out.out.splitlines()[-1].startswith(run + "done: 10 requests, ")
+    assert not [u for u in sent if "mospi" in u]  # MoSPI only when named
+    assert main(["macro-store-update", "--store", str(tmp_path / "m"), "--sources", "mospi"]) == 0
+    first = capsys.readouterr().out.splitlines()[0]
+    assert first.startswith(run + "mospi: reminder: MoSPI's licence for a stored history is not settled")
+    for answer, code, text in ((FeedResponse(403, {}, b""), 3, run + "h10: blocked: HTTP 403;"),
+                               (FeedResponse(503, {}, b""), 1, run + "h10: error: server error: HTTP 503"),
+                               (FeedResponse(404, {}, b""), 4, run + "needs a look: h10: ")):
+        transport, sent = _macro_transport({**good, "dat00_in": answer})
+        monkeypatch.setattr(macro_store, "urllib_transport", transport)
+        assert main(["macro-store-update", "--store", str(tmp_path / f"s{code}"), "--sources", "h10"]) == code
+        err = capsys.readouterr().err
+        assert any(line.startswith(text) for line in err.splitlines()), (code, err)
+    assert main(["macro-store-update", "--store", str(tmp_path / "s3"), "--sources", "h10"]) == 3  # cooling down
+    assert "cooling down after HTTP 403" in capsys.readouterr().err
+
+
+def test_macro_store_commands_refuse_bad_arguments_before_anything_is_recorded(tmp_path, capsys):
+    for command, argv, message in (
+            ("macro-store-update", ["--sources", "rbi"], "no source 'rbi'"),
+            ("macro-store-update", ["--sources", "mospi,fred"], "no source 'fred'"),
+            ("macro-store-update", ["--max-requests", "0"], "from 1 to 500"),
+            ("macro-store-update", ["--max-per-host", "x"], "not a whole number"),
+            ("macro-store-update", ["--min-interval", "-1"], "from 0 to 10080"),
+            ("macro-store-update", ["--min-interval", "nan"], "finite"),
+            ("macro-store-update", ["--user-agent", "client (me@example.com)"], "names someone"),
+            ("macro-store-update", ["--timeout", "0"], "positive, finite"),
+            ("macro-store-update", ["--cpi-levels", "all"], "invalid choice"),
+            ("macro-store-update", ["--index-events", str(tmp_path / "missing.csv")], "no such file"),
+            ("macro-store-ingest", ["--release-dates", str(tmp_path / "missing.csv")], "no such file"),
+            ("macro-store-status", ["--series", "("], "not a regular expression")):
+        with pytest.raises(SystemExit) as stop:
+            main([command, "--store", str(tmp_path / "s"), *argv])
+        assert stop.value.code == 2 and message in capsys.readouterr().err, argv
+    assert not (tmp_path / "s").exists()
+
+
+def test_macro_store_ingest_and_status_print_one_line_each_and_errors_in_one_line(tmp_path, capsys):
+    import macro_fixtures as mfx
+
+    saved = tmp_path / "saved"
+    saved.mkdir()
+    (saved / "n.json").write_bytes(mfx.nyfed_json([mfx.sofr_row("2026-11-16"), mfx.sofr_row("2026-11-17")]))
+    (saved / "e.json").write_bytes(mfx.LIMIT_ERROR)
+    (saved / "x.bin").write_bytes(b"\x00")
+    store = tmp_path / "store"
+    files = [str(p) for p in sorted(saved.iterdir())]
+    assert main(["macro-store-ingest", *files, "--store", str(store)]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0].startswith("macro-store-ingest: 3 inputs: 1 read, 1 refused, 1 not recognised, 12 new values, ")
+    assert lines[1].startswith(f"refused {saved / 'e.json'}: ") and lines[2].startswith(f"not recognised {saved}")
+    assert main(["macro-store-ingest", *reversed(files), "--store", str(store)]) == 0
+    assert capsys.readouterr().out.splitlines()[0].endswith("; no file changed")
+    assert main(["macro-store-status", "--store", str(store), "--series", "^sofr$"]) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert out[0] == f"store {store}" and out[-1].startswith("  sofr: 2 periods 2026-11-16 to 2026-11-17")
+    (store / "store.lock").write_text("{}", encoding="utf-8")
+    assert main(["macro-store-ingest", "--store", str(store)]) == 1
+    assert capsys.readouterr().err == (f"macro-store-ingest: error: store {store} is locked by a command. Wait for "
+                                       f"that command to end; if none is running, delete {store / 'store.lock'}.\n")
+    assert main(["macro-store-status", "--store", str(tmp_path / "none")]) == 1
+    assert capsys.readouterr().err.startswith("macro-store-status: error: ")
+
+
+def test_the_documented_daily_grep_of_the_macro_store_flags_every_update_that_exits_non_zero_and_no_other(
+        tmp_path, capsys, monkeypatch):
+    import datetime as dt
+    import json
+
+    import macro_fixtures as mfx
+
+    from cr_strat import macro_store
+    from cr_strat.storekit import FeedResponse
+
+    documented = re.compile(_documented_grep("## Macro and global store"))
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+    good = {"unsecured/all": FeedResponse(200, {}, mfx.nyfed_json([mfx.effr_row("2026-11-16")])),
+            "secured/all": FeedResponse(200, {}, mfx.nyfed_json([mfx.sofr_row("2026-11-16")])),
+            "dat00_in": FeedResponse(200, {}, mfx.h10_page([("13-NOV-26", "94.2400")])),
+            "dat96_in": FeedResponse(200, {}, mfx.h10_page_1990s([("2-Jan-90", "16.9600")])),
+            "WS_CBPOL": FeedResponse(200, {}, mfx.cbpol_v2([("IN", "2026-10-07", "5.5", "A")])),
+            "WS_XRU": FeedResponse(200, {}, mfx.xru_v1([("2026-11-10", "93.928571", "A")])),
+            "api.mospi.gov.in": FeedResponse(200, {}, mfx.NO_DATA)}
+    start = dt.datetime(2026, 11, 18, 14, 0, tzinfo=dt.timezone.utc)  # 19:30 in India
+    clock = _fixed_clock(monkeypatch, start)
+    seen = {}
+
+    def update(name, answers=None, hours=0.0, *extra):
+        transport, _ = _macro_transport({**good, **(answers or {})})
+        monkeypatch.setattr(macro_store, "urllib_transport", transport)
+        clock[0] = start + dt.timedelta(hours=hours)
+        code = main(["macro-store-update", "--store", str(tmp_path / name), *extra])
+        captured = capsys.readouterr()  # cron appends both streams to macro_store.log
+        lines = (captured.out + captured.err).splitlines()
+        seen.setdefault(code, []).append(lines[0])
+        assert bool(documented.search("\n".join(lines))) == (code != 0), (code, lines)
+        return code
+
+    h10 = ("--sources", "h10")
+    assert update("ok") == 0  # new values
+    assert update("ok", None, 0.2) == 0  # too soon
+    assert update("ok", None, 1) == 0  # the same answers again
+    assert update("ok", {"dat00_in": FeedResponse(304, {}, b"")}, 2) == 0  # not modified
+    assert update("mospi", None, 0, "--sources", "mospi") == 0  # the reminder is not a problem line
+    assert update("block", {"dat00_in": FeedResponse(403, {}, b"")}, 0, *h10) == 3
+    assert update("block", None, 1, *h10) == 3  # cooling down
+    assert update("block", {"dat00_in": FeedResponse(418, {}, b"")}, 24, *h10) == 3  # a second block: stopped
+    assert update("block", None, 25, *h10) == 3  # stopped until resumed
+    denied = b"<html><head><title>Access Denied</title></head><body><p>Access denied</p></body></html>"
+    assert update("denied", {"dat00_in": FeedResponse(200, {}, denied)}, 0, *h10) == 3
+    for n, answer in enumerate([FeedResponse(503, {}, b""), FeedResponse(None, error="URLError"),
+                                FeedResponse(301, {"location": "https://www.federalreserve.gov/new/"}, b"")]):
+        assert update(f"error{n}", {"dat00_in": answer}, 0, *h10) == 1
+    assert update("wrong", {"WS_XRU": FeedResponse(404, {}, b"")}, 0, "--sources", "bis") == 4
+    assert update("refused", {"dat96_in": FeedResponse(200, {}, b"<html><body><table><tr><td>x</td></tr></table>"
+                                                                b"</body></html>")}, 0, *h10) == 4
+    state_path = tmp_path / "ok" / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["sources"]["h10"]["in_flight"] = {"url": "https://www.federalreserve.gov/releases/h10/hist/dat00_in.htm",
+                                            "time": "2026-11-18T16:00:00Z"}
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    assert update("ok", None, 3, *h10) == 4  # a run that was killed during a request
+    assert update("ok", None, -3, *h10) == 1  # the clock went back: a clock error
+    (tmp_path / "ok" / "store.lock").write_text("{}", encoding="utf-8")
+    assert update("ok", None, 4) == 1  # locked
+    events = tmp_path / "events.csv"
+    events.write_text("not,an,index,event,table\n", encoding="utf-8")
+    assert update("events", None, 0, "--index-events", str(events)) == 1
+    assert set(seen) == {0, 1, 3, 4}
+
+
+def test_macro_store_ingest_needs_the_series_of_base_2012_cpi_and_status_checks_policy_rates(tmp_path, capsys):
+    import macro_fixtures as mfx
+
+    saved = tmp_path / "cpi2012.json"
+    saved.write_bytes(mfx.mospi_answer([mfx.cpi_group(2025, "December", "Combined", "General", "General-Overall")],
+                                       per=200))
+    store = tmp_path / "store"
+    assert main(["macro-store-ingest", str(saved), "--store", str(store)]) == 0
+    out = capsys.readouterr().out
+    assert "1 refused" in out and "--cpi-series" in out
+    assert main(["macro-store-ingest", str(saved), "--store", str(store), "--cpi-series", "Current"]) == 0
+    assert "2 new values" in capsys.readouterr().out
+    bis = tmp_path / "b.csv"
+    bis.write_bytes(mfx.cbpol_v1([("IN", "2026-10-06", "5.25", "A"), ("IN", "2026-10-07", "5.5", "A")]))
+    assert main(["macro-store-ingest", str(bis), "--store", str(store)]) == 0
+    capsys.readouterr()
+    table = tmp_path / "policy.csv"
+    table.write_text("effective_date,repo_pct,sdf_pct,msf_pct,source\n2026-10-06,5.25,5,5.5,typed in\n"
+                     "2026-10-07,5.5,5.25,5.75,typed in\n", encoding="utf-8")
+    assert main(["macro-store-status", "--store", str(store), "--policy-rates", str(table)]) == 0
+    assert "policy rates: BIS and the table agree on 1 change" in capsys.readouterr().out

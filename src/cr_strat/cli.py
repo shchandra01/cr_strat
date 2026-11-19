@@ -5,13 +5,14 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import math
+import re
 import sys
 from dataclasses import asdict, replace
 from pathlib import Path
 
 import pandas as pd
 
-from cr_strat import rbi_store
+from cr_strat import macro_store, rbi_store
 from cr_strat.amfi_debt_trades import build_mf_trades, mapping_report, to_price_trades
 from cr_strat.auctions import (
     REPORT_COLUMNS,
@@ -332,6 +333,123 @@ def _rbi_store_status(args: argparse.Namespace) -> int:
     for line in report.lines():
         print(line)
     return rbi_store.EXIT_OK
+
+
+def _macro_failed(command: str, exc: Exception) -> int:
+    message = " ".join(str(exc).split()) or type(exc).__name__
+    if not isinstance(exc, (macro_store.StoreError, ValueError, OSError)):
+        message = f"{type(exc).__name__}: {message}"
+    print(f"{command}: error: {message}", file=sys.stderr)
+    return macro_store.EXIT_ERROR
+
+
+def _macro_settings(args: argparse.Namespace) -> macro_store.Settings:
+    return macro_store.Settings(cpi_levels=args.cpi_levels, states=args.states, keep_raw=not args.no_raw,
+                                mospi_raw=args.mospi_raw, backfill=not getattr(args, "no_backfill", False),
+                                mospi_history=getattr(args, "mospi_history", "derived"))
+
+
+def _macro_store_update(args: argparse.Namespace) -> int:
+    now = _clock()
+    stamp = now.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")  # on every line: the log is appended to
+    try:
+        report = macro_store.update(args.store, now=now, sources=args.sources, settings=_macro_settings(args),
+                                    max_requests=args.max_requests, max_per_host=args.max_per_host,
+                                    min_interval=dt.timedelta(minutes=args.min_interval), user_agent=args.user_agent,
+                                    timeout=args.timeout, resume=args.resume, retry_failed=args.retry_failed,
+                                    release_dates=args.release_dates, index_events=args.index_events,
+                                    legacy_tls=args.legacy_tls)
+    except Exception as exc:  # cron wants one line and an exit code, not a traceback
+        return _macro_failed(f"macro-store-update: {stamp}", exc)
+    for problem, line in report.lines():  # problems on stderr, so that a cron job that mails its errors mails these
+        print(f"macro-store-update: {stamp} {line}", file=sys.stderr if problem else sys.stdout)
+    return report.exit_code
+
+
+def _macro_store_ingest(args: argparse.Namespace) -> int:
+    try:
+        report = macro_store.ingest(args.store, args.files, now=_clock(), settings=_macro_settings(args),
+                                    release_dates=args.release_dates, index_events=args.index_events,
+                                    cpi_series=args.cpi_series)
+    except Exception as exc:
+        return _macro_failed("macro-store-ingest", exc)
+    print(f"macro-store-ingest: {report.summary()}")
+    for name, reason in report.refused:
+        print(f"refused {name}: {reason}")
+    for name, reason in report.unreadable:
+        print(f"not recognised {name}: {reason}")
+    for name, reason in report.other:
+        print(f"not data {name}: {reason}")
+    for conflict in report.conflicts:
+        print(f"two inputs disagreed: {conflict}")
+    if report.derive_error:
+        print(f"macro-store-ingest: error: derived tables not rebuilt: {report.derive_error} (the previous ones are "
+              "kept; the values read were saved)", file=sys.stderr)
+        return macro_store.EXIT_ERROR
+    return macro_store.EXIT_OK
+
+
+def _macro_store_status(args: argparse.Namespace) -> int:
+    try:
+        report = macro_store.status(args.store, now=_clock())
+        lines = report.lines(args.series)
+        if args.policy_rates:
+            lines += macro_store.policy_rate_check(args.store, args.policy_rates)
+    except Exception as exc:
+        return _macro_failed("macro-store-status", exc)
+    for line in lines:
+        print(line)
+    return macro_store.EXIT_OK
+
+
+def _sources_arg(text: str) -> tuple[str, ...]:
+    try:
+        return macro_store.resolve_sources([t for t in text.split(",") if t.strip()])
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+
+
+def _count_arg(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a whole number: {text!r}") from None
+    if not 1 <= value <= macro_store.ms.MAX_REQUESTS:
+        raise argparse.ArgumentTypeError(f"from 1 to {macro_store.ms.MAX_REQUESTS}, not {text}")
+    return value
+
+
+def _interval_arg(text: str) -> float:
+    """``--min-interval`` of macro-store-update: minutes from 0 to a week."""
+    most = macro_store.MAX_MIN_INTERVAL.total_seconds() / 60
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number of minutes: {text!r}") from None
+    if not math.isfinite(value) or not 0 <= value <= most:
+        raise argparse.ArgumentTypeError(f"from 0 to {most:g} minutes (a week), and finite, not {text}")
+    return value
+
+
+def _generic_agent_arg(text: str) -> str:
+    try:
+        return macro_store.ms.check_generic_user_agent(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+
+
+def _pattern_arg(text: str) -> str:
+    try:
+        re.compile(text)
+    except re.error as exc:
+        raise argparse.ArgumentTypeError(f"not a regular expression: {exc}") from None
+    return text
+
+
+def _existing_file_arg(text: str) -> str:
+    if not Path(text).is_file():
+        raise argparse.ArgumentTypeError(f"no such file: {text}")
+    return text
 
 
 def _minutes_arg(text: str) -> float:
@@ -727,6 +845,74 @@ def main(argv: list[str] | None = None) -> int:
                                                 "releases, the poller's state")
     p.add_argument("--store", required=True, help="store directory")
     p.set_defaults(func=_rbi_store_status)
+
+    def _macro_scope(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--cpi-levels", choices=macro_store.CPI_LEVELS, default="groups",
+                       help="base-2024 CPI kept for All India: down to groups (default, while MoSPI's terms are not "
+                            "settled), or every node down to items")
+        p.add_argument("--states", action="store_true", help="also keep (and fetch) each state's general CPI index")
+        p.add_argument("--no-raw", action="store_true", help="keep no raw copy of the answers")
+        p.add_argument("--mospi-raw", action="store_true",
+                       help="keep raw copies of MoSPI's answers too (off by default: its terms are not known)")
+        p.add_argument("--release-dates", type=_existing_file_arg,
+                       help="MoSPI release dates kept by hand (the columns of src/cr_strat/data/macro_release_dates."
+                            "csv): kept in the store, its rows override the shipped ones")
+        p.add_argument("--index-events", type=_existing_file_arg,
+                       help="index inclusion events kept by hand (an example with sources: "
+                            "data/index_events_example.csv), checked and kept in the store")
+
+    p = sub.add_parser("macro-store-update", help="fetch what is new from the macro and global sources into a store "
+                                                  "(for cron); exit 0 ok, 4 ok but needs a look, 3 blocked, cooling "
+                                                  "down or stopped, 1 other errors, 2 bad arguments")
+    p.add_argument("--store", required=True, help="store directory, created on first use")
+    p.add_argument("--sources", type=_sources_arg, default=macro_store.DEFAULT_SOURCES,
+                   help="comma-separated: mospi, ust, nyfed, eia, h10, bis, or all; default "
+                        f"{','.join(macro_store.DEFAULT_SOURCES)} (MoSPI only when named: its licence is not settled; "
+                        "Treasury and EIA are off by default too)")
+    p.add_argument("--max-requests", type=_count_arg, default=macro_store.DEFAULT_MAX_REQUESTS,
+                   help=f"requests in this run, at most (default {macro_store.DEFAULT_MAX_REQUESTS})")
+    p.add_argument("--max-per-host", type=_count_arg, default=macro_store.DEFAULT_MAX_PER_HOST,
+                   help=f"requests to one host in this run, at most (default {macro_store.DEFAULT_MAX_PER_HOST}); each "
+                        "host's own daily cap applies too")
+    p.add_argument("--min-interval", type=_interval_arg, default=macro_store.DEFAULT_MIN_INTERVAL.total_seconds() / 60,
+                   help="minutes: a source whose last update that asked something began more recently is skipped "
+                        "(default 25)")
+    p.add_argument("--user-agent", type=_generic_agent_arg, default=macro_store.ms.DEFAULT_USER_AGENT,
+                   help="client name sent with each request: generic, nothing that names you or the firm")
+    p.add_argument("--timeout", type=_seconds_arg, default=60.0,
+                   help=f"seconds to wait for each answer (default 60, at most {rbi_store.MAX_TIMEOUT:g})")
+    p.add_argument("--resume", action="store_true",
+                   help="end a stop or a cool-down of the named sources' hosts after a block: the operator's decision, "
+                        "once the site has been checked in a browser (never in cron)")
+    p.add_argument("--retry-failed", action="store_true",
+                   help="queue again the requests an earlier run gave up on (a refused answer, an HTTP 4xx)")
+    p.add_argument("--no-backfill", action="store_true", help="fetch no history, only the recent window")
+    p.add_argument("--mospi-history", choices=macro_store.MOSPI_HISTORY, default="derived",
+                   help="MoSPI history: what the derived tables use, from 2013 (default), or everything kept")
+    p.add_argument("--legacy-tls", action="store_true",
+                   help="allow legacy TLS renegotiation for api.mospi.gov.in (certificates still checked)")
+    _macro_scope(p)
+    p.set_defaults(func=_macro_store_update)
+
+    p = sub.add_parser("macro-store-ingest", help="add saved answers of the macro and global sources to a store; "
+                                                  "rebuild its tables")
+    p.add_argument("files", nargs="*", help="saved answers (MoSPI JSON, Treasury and New York Fed CSV or JSON, EIA "
+                                            "and H.10 pages, BIS CSV), recognised by their content")
+    p.add_argument("--store", required=True, help="store directory, created on first use")
+    p.add_argument("--cpi-series", choices=("Current", "Back"),
+                   help="the series of saved base-2012 or 2010 CPI answers, whose rows do not say it (the store's own "
+                        "raw copies are read as their request asked); without it such an answer is refused")
+    _macro_scope(p)
+    p.set_defaults(func=_macro_store_ingest)
+
+    p = sub.add_parser("macro-store-status", help="what a macro store holds: per source its series, history, last "
+                                                  "request, blocks and failures; the derived tables' series")
+    p.add_argument("--store", required=True, help="store directory")
+    p.add_argument("--series", type=_pattern_arg, help="list the series whose id matches this regular expression")
+    p.add_argument("--policy-rates", type=_existing_file_arg,
+                   help="a policy-rate table kept by hand (rbi-store-ingest --policy-rates columns): compare BIS's "
+                        "repo rate changes with it")
+    p.set_defaults(func=_macro_store_status)
 
     p = sub.add_parser("sovereign-master", help="one row per G-sec ISIN from saved RBI security lists")
     p.add_argument("--goi-list", nargs="*", default=[], help="saved 'GoI securities outstanding' pages (Id=1956)")

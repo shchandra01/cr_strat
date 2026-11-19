@@ -24,9 +24,12 @@ any bulk download.
 
 **Bottom line for a commercial firm.**
 
-- **Free, and the terms allow storage:** US Treasury yields, New York Fed
-  SOFR, EIA Brent, the Federal Reserve's H.10 rupee rate and the BIS Data
-  Portal.
+- **Free, and the terms allow storage:** US Treasury yields (no reuse
+  clause; US government data), New York Fed SOFR (with its notice), the
+  Federal Reserve's H.10 rupee rate and the BIS Data Portal (with a
+  citation). EIA's Brent is public domain, but EIA excludes material it
+  licensed from private companies and the series' copyright field has not
+  been read: not stored until it has.
 - **Free to read, but no reuse licence; ask before storing a history:** RBI
   (auctions, money-market operations, security lists, policy), NSDL's FPI
   Monitor, SEBI's statistics, MoSPI's statistics API, the Controller General
@@ -106,7 +109,7 @@ from its RSS feed. Prices cannot.
 | Corporate trades | NSE and BSE feeds | No history product on either price list | Licence | ₹3.4 lakh (NSE); ₹0.5 to 1.5 lakh (BSE) |
 | Corporate valuation | ICRA Analytics and CRISIL (mutual fund NAVs use their average); NSE Data & Analytics; FIMMDA matrices | FIMMDA security level from Jul 2019 | Licence | Quotes; FIMMDA matrices ₹1 lakh |
 | Corporate primary | BSE bidding-platform file; Prime Database | Not stated | Licence | ₹1.5 lakh (BSE); Prime quote |
-| Global | US Treasury, New York Fed, EIA, Federal Reserve, BIS | Decades | Storage allowed | Use |
+| Global | US Treasury, New York Fed, EIA, Federal Reserve, BIS | Decades | Storage allowed (EIA: once the Brent series' copyright field has been read) | Use |
 
 ### RBI (www.rbi.org.in)
 
@@ -397,9 +400,9 @@ prohibited." Ask NSDL for permission and a bulk file.
 |---|---|---|
 | US Treasury par curve | [Treasury CSV](https://home.treasury.gov/resource-center/data-chart-center/interest-rates/daily-treasury-rates.csv/2026/all?type=daily_treasury_yield_curve&field_tdr_date_value=2026&page&_format=csv) | No reuse clause; robots allow all |
 | SOFR | [New York Fed API](https://markets.newyorkfed.org/api/rates/secured/sofr/last/2.json) | Licence to "Download, store, and use Content", by automated process; notice required |
-| Brent | [EIA](https://www.eia.gov/dnav/pet/hist/RBRTED.htm) | Public domain; published weekly |
+| Brent | [EIA](https://www.eia.gov/dnav/pet/hist/RBRTED.htm) | Public domain with an acknowledgement, but material licensed from private companies is excluded: read the copyright field of series PET.RBRTE.D before storing; published weekly |
 | USD/INR | [Federal Reserve H.10](https://www.federalreserve.gov/releases/h10/hist/dat00_in.htm), also as CSV from its [Data Download Program](https://www.federalreserve.gov/datadownload/Choose.aspx?rel=H10) | Public domain; a New York rate, not FBIL's fixing |
-| Policy rates, exchange rates, long-term yields | [BIS Data Portal](https://data.bis.org) | Unrestricted use with citation; India series not sampled |
+| Policy rates, exchange rates | [BIS Data Portal](https://data.bis.org) | Unrestricted use with citation; India's policy rate and daily rupee figure sampled on 18 Nov 2026. BIS has no long-term yield dataflow (none among its 29) |
 
 Do not build a stored history from FRED: its terms prohibit storing, caching
 or archiving, commercial use without consent, and bulk downloading.
@@ -533,6 +536,75 @@ What can be built now, with no licence:
    the per-state amounts of the state calendar (PDFs on rbidocs). RBI's
    permission to keep this history has not been asked.
 5. **Macro and global store** from MoSPI's API, the US publishers and BIS.
+   Built: the sources, in [`mospi.py`](../src/cr_strat/mospi.py) (CPI,
+   IIP, national accounts and WPI; MoSPI's release dates shipped as
+   `src/cr_strat/data/macro_release_dates.csv`),
+   [`global_sources.py`](../src/cr_strat/global_sources.py) (Treasury, New
+   York Fed, EIA, H.10, BIS, index events) and
+   [`macro_sources.py`](../src/cr_strat/macro_sources.py) (the allowed hosts,
+   a polite fetch with RBI's block rule, the series catalogue); and the
+   store, in [`macro_store.py`](../src/cr_strat/macro_store.py) (`cr-strat
+   macro-store-update`, `macro-store-ingest`, `macro-store-status`; layout,
+   tables, terms, a crontab and a daily check in
+   [`data/README.md`](../data/README.md)). Every value the store reads is
+   kept as a vintage, first seen at the latest time its answer can have
+   come, with the time from which it was public: MoSPI's by the release
+   table and rules (stages from first print to final, base launches,
+   weekends and, as a proxy for the central government's holidays, the
+   Mumbai settlement holidays), the US series by publication rules in New
+   York time (the daylight-saving rules; for EIA and H.10 the federal
+   holidays from the law's rules), BIS's policy rates by their date in
+   force and its rupee figure by its weekly release; never later than the
+   store's first sighting, and dated by that sighting when the store's own
+   earlier read of the same data (or of MoSPI's headline) came after the
+   rule's time without the value. Rows read after publication are marked
+   `later`, as history may include revisions. data/README lists where
+   `public_from` can still be early. `as_of` answers what was known at any
+   time; history read after the fact is the latest vintage only, so a
+   back-test gets from this store no Indian CPI before 28 Feb 2015, no IIP
+   or WPI before the end of May 2017, and each GDP quarter of a closed year
+   23 to 44 months after it ended (a table per family in data/README). An
+   update asks each source's recent window, reaching back to the latest
+   date the store holds (MoSPI by three conditional probes whose change
+   brings every month's tables since the latest held, asked again for up to
+   six reads while a table lacks the month its headline showed), then its
+   history in steps within caps per run, per host and per day; refused
+   answers keep no validator and stay listed until they read. MoSPI only
+   when named, as its licence is not settled, and CPI only down to groups
+   unless asked for items. Derived tables: global daily rates (US yields,
+   SOFR and EFFR with the FOMC range, Brent, both rupee rates, BIS policy
+   rates, with notes at each series' break), Indian monthly prices and
+   output by print (CPI general, food, fuel, housing, rent; IIP; WPI with
+   its inflation computed on one base), quarterly GDP and GVA by print, the
+   index events of a table kept by hand (an example with each fact's source
+   in `data/index_events_example.csv`, never a default), and BIS's repo rate
+   changes in the RBI store's policy-rate columns, with the SDF and MSF left
+   blank for the user (BIS has no corridor, lags a month and dates some 2019
+   changes a day late), and a cross-check of them against a hand-kept
+   policy-rate table (`macro-store-status --policy-rates`). Checked on the
+   answers saved on 17 and 18 Nov 2026 (73 inputs, 189,061 values; 51 of
+   the spec's test vectors) and by two live runs on 18 Nov 2026 (33 and 10
+   requests), made with an earlier version of the store: the fixes since
+   were checked offline only, on synthetic answers and the saved ones. Not
+   built: consensus forecasts (no free source), the Controller General of
+   Accounts' fiscal accounts and GST (no parser; GST's files could not be
+   downloaded), trade data, Treasury's real yields, bill rates and
+   long-term rates (other files of the same site, not sampled), PIB's
+   release pages (where first prints from before the store's start could be
+   read: a loader would need their layout sampled), base-2010 CPI history
+   (its parser exists; not fetched), polling of MoSPI's release-calendar
+   pointer (a monthly step by hand, in data/README), BIS's rupee on API v2
+   (one sample request needed), a row saying when an unchanged value was
+   confirmed final (the store would need the time of every later read that
+   found it unchanged), a row per vintage in the global daily table
+   (`as_of` gives them), FBIL's rupee reference rate (its terms bar a
+   stored history), MoSPI's "RBI" tables (RBI's data, 15 months stale), a
+   core CPI (the headline does not recompose from its published parts),
+   BIS's long-term yields (no such BIS dataflow), and state-level CPI
+   beyond each state's general index. Not checked against the real APIs:
+   MoSPI's history queue run to its end, WPI's major-group filters,
+   release-day polling, any block, and every change made after the two
+   live runs.
 
 Then, as licences arrive: the sovereign price panel (extend
 [`fbil.py`](../src/cr_strat/fbil.py) to the security sheets; a CCIL trade

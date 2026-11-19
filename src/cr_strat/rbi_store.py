@@ -233,20 +233,15 @@ from __future__ import annotations
 
 import calendar as _calendar
 import datetime as dt
-import gzip
 import hashlib
-import http.client
 import io
 import json
 import math
-import os
+import os  # noqa: F401 (storekit's writes call os.replace and os.fsync: crash tests patch them here)
 import re
-import socket
-import urllib.error
 import urllib.parse
-import urllib.request
 from collections import defaultdict
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -289,19 +284,36 @@ from cr_strat.rbi_releases import (
     read_rss_feed,
 )
 from cr_strat.sovereign import GREEN, GSEC, SDL, TBILL, match_isin, normalise_name, parse_security_name, read_master
+from cr_strat.storekit import (  # shared with the macro sources, under the names this module always had
+    BLOCK_STATUSES,
+    MAX_COOLDOWN,
+    MAX_TIMEOUT,  # noqa: F401 (re-exported: the command line reads it here)
+    MAX_USER_AGENT,  # noqa: F401 (re-exported)
+    RESUME_HOUR,  # noqa: F401 (re-exported)
+    STOP_AFTER_BLOCKS,
+    FeedResponse,
+    Transaction,
+    Transport,
+    check_timeout,
+    check_user_agent,
+    decode_body,
+    lock_message,
+    recover,
+    store_lock,
+    urllib_transport,
+    write_atomic,
+)
+from cr_strat.storekit import NoRedirectHandler as _NoRedirect  # noqa: F401 (re-exported under its old name)
+from cr_strat.storekit import printable as _printable
+from cr_strat.storekit import resume_time as _resume_time
 
 FEED_URL = "https://www.rbi.org.in/pressreleases_rss.xml"
 DEFAULT_USER_AGENT = "Mozilla/5.0 (compatible; feed-reader/1.0)"
 DEFAULT_MIN_INTERVAL = dt.timedelta(minutes=25)
 MAX_MIN_INTERVAL = dt.timedelta(days=1)  # the feed's 10 items can span a single day
-MAX_TIMEOUT = 600.0  # seconds: a poll holds the store's lock while it waits for the answer
-MAX_USER_AGENT = 200  # characters of the client name
-RESUME_HOUR = 8  # India time: after a block, no request before this hour of the next India day
-MAX_COOLDOWN = dt.timedelta(hours=24 + RESUME_HOUR)  # a block at 00:00 India time waits until 08:00 the next day
-STOP_AFTER_BLOCKS = 2  # blocks in a row after which the poller stops until the operator resumes it
-BLOCK_STATUSES = frozenset({403, 418, 429})
+# MAX_TIMEOUT, MAX_USER_AGENT, RESUME_HOUR, MAX_COOLDOWN, STOP_AFTER_BLOCKS, BLOCK_STATUSES: from storekit
 REFUSED_HOSTS = frozenset({"rbidocs.rbi.org.in", "website.rbi.org.in"})
-MAX_FEED_BYTES = 5_000_000
+MAX_FEED_BYTES = 5_000_000  # storekit.DEFAULT_MAX_BYTES, which urllib_transport reads by default
 LOCK_STALE_AFTER = dt.timedelta(hours=1)
 CLOCK_SLACK = dt.timedelta(minutes=5)  # a last request recorded this far after "now" means the clock moved back
 STORE_FORMAT = 1
@@ -559,130 +571,32 @@ def _span(ids: Iterable[int]) -> str:
 
 def _write_atomic(path: Path, data: bytes) -> None:
     """Write ``data`` to a temporary file beside ``path``, flush it to disk, then rename it over ``path``."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + _TMP)
-    with open(tmp, "wb") as f:
-        f.write(data)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    write_atomic(path, data, _TMP)
 
 
-class _Transaction:
-    """Files staged by one command, written so that the store gets all of them or none."""
+class _Transaction(Transaction):
+    """Files staged by one command, written so that the store gets all of them or none (``storekit.Transaction``)."""
 
     def __init__(self, paths: StorePaths):
+        super().__init__(paths.root, paths.journal, _TMP)
         self.paths = paths
-        self.files: dict[Path, bytes] = {}
-
-    def put(self, path: Path, data: bytes) -> None:
-        self.files[path] = data
-
-    def commit(self) -> list[str]:
-        """Write the staged files whose bytes differ from what is on disk; their paths, relative to the store."""
-        changed = {p: d for p, d in sorted(self.files.items()) if not (p.exists() and p.read_bytes() == d)}
-        if not changed:
-            return []
-        relative = [str(p.relative_to(self.paths.root)) for p in changed]
-        for path, data in changed.items():
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with open(path.with_name(path.name + _TMP), "wb") as f:
-                f.write(data)
-                f.flush()
-                os.fsync(f.fileno())
-        _write_atomic(self.paths.journal, json.dumps(relative, indent=1).encode("utf-8"))  # the commit point
-        for path in changed:
-            os.replace(path.with_name(path.name + _TMP), path)
-        self.paths.journal.unlink()
-        return relative
 
 
 def _recover(paths: StorePaths) -> list[str]:
     """Finish the renames of a commit that was interrupted after its journal was written; drop stray temps."""
-    done = []
-    if paths.journal.exists():
-        try:
-            relative = json.loads(paths.journal.read_text(encoding="utf-8"))
-        except (ValueError, UnicodeDecodeError) as exc:
-            raise StoreError(f"{paths.journal}: unreadable journal of an interrupted commit ({exc})") from None
-        for rel in relative:
-            target = paths.root / rel
-            tmp = target.with_name(target.name + _TMP)
-            if tmp.exists():
-                os.replace(tmp, target)
-                done.append(rel)
-        paths.journal.unlink()
-    for directory in (paths.root, paths.tables, paths.derived, paths.raw):
-        if directory.is_dir():
-            for stray in directory.glob(f"*{_TMP}"):
-                stray.unlink()
-    return done
+    return recover(paths.root, paths.journal, _TMP, (paths.root, paths.tables, paths.derived, paths.raw), StoreError)
 
 
 def _lock_message(paths: StorePaths, now: dt.datetime | None) -> str:
-    try:
-        info = json.loads(paths.lock.read_text(encoding="utf-8"))
-        if not isinstance(info, dict):
-            raise ValueError("not an object")
-    except (OSError, ValueError) as exc:
-        return (f"store {paths.root} is locked ({paths.lock} exists but cannot be read: {exc}). If no "
-                f"rbi-store command is running, delete {paths.lock} and run again.")
-    since, pid, host = _from_utc_lenient(info.get("since")), info.get("pid"), info.get("host")
-    held = f"by {info.get('command') or 'a command'}"
-    if pid is not None or host:
-        held += f" (pid {pid if pid is not None else 'unknown'} on {host or 'an unknown host'})"
-    if info.get("since"):
-        held += f" since {info['since']}"
-    why = []
-    if now is not None and since is not None and now - since > LOCK_STALE_AFTER:
-        why.append(f"it is {(now - since).total_seconds() / 3600:.1f} hours old")
-    if host == socket.gethostname() and isinstance(pid, int) and not _alive(pid):
-        why.append(f"process {pid} is not running")
-    if why:
-        return (f"store {paths.root} has a stale lock {held}: {' and '.join(why)}. If no rbi-store command is "
-                f"running, delete {paths.lock} and run again; the next command completes or drops an "
-                "interrupted commit.")
-    return (f"store {paths.root} is locked {held}. Wait for that command to end; if none is running, "
-            f"delete {paths.lock}.")
-
-
-def _from_utc_lenient(text: object) -> dt.datetime | None:
-    try:
-        return _from_utc(text)
-    except StoreError:
-        return None
-
-
-def _alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return True
-    return True
+    return lock_message(paths.root, paths.lock, now, "rbi-store", LOCK_STALE_AFTER)
 
 
 @contextmanager
 def _locked(paths: StorePaths, now: dt.datetime, command: str) -> Iterator[None]:
     """Hold ``store.lock`` for one command; complete or drop an interrupted commit first."""
-    paths.root.mkdir(parents=True, exist_ok=True)
-    try:
-        fd = os.open(paths.lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-    except FileExistsError:
-        raise StoreLockedError(_lock_message(paths, now)) from None
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump({"command": command, "pid": os.getpid(), "host": socket.gethostname(), "since": _utc(now)}, f)
-    try:
-        _recover(paths)
+    with store_lock(paths.root, paths.lock, now, command, product="rbi-store", stale_after=LOCK_STALE_AFTER,
+                    locked_error=StoreLockedError, recover_first=lambda: _recover(paths)):
         yield
-    finally:
-        try:
-            paths.lock.unlink()
-        except FileNotFoundError:
-            pass
 
 
 # --- The stored state --------------------------------------------------------------------------------
@@ -2145,47 +2059,8 @@ def read_table(store: str | Path, name: str) -> pd.DataFrame:
 
 
 # --- The poller --------------------------------------------------------------------------------------
-
-@dataclass(frozen=True)
-class FeedResponse:
-    """What a transport got back: HTTP status (``None`` when no answer came), headers (lower-case names), body."""
-
-    status: int | None
-    headers: dict[str, str] = field(default_factory=dict)
-    body: bytes = b""
-    error: str = ""
-
-
-Transport = Callable[[str, dict[str, str], float], FeedResponse]
-
-
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """Turn a redirect into its HTTP error: following it would be a second request, perhaps to another host."""
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
-
-def _lower(headers) -> dict[str, str]:
-    return {k.lower(): v for k, v in headers.items()} if headers is not None else {}
-
-
-def urllib_transport(url: str, headers: dict[str, str], timeout: float, *, opener=None) -> FeedResponse:
-    """One GET with the standard library (the environment's proxy and certificates); no redirect is followed."""
-    opener = opener if opener is not None else urllib.request.build_opener(_NoRedirect())
-    request = urllib.request.Request(url, headers=headers, method="GET")
-    try:
-        with opener.open(request, timeout=timeout) as response:
-            return FeedResponse(response.status, _lower(response.headers), response.read(MAX_FEED_BYTES + 1))
-    except urllib.error.HTTPError as exc:  # an answer with an error status: 304, 418, 403, 5xx, a redirect
-        try:
-            body = exc.read(MAX_FEED_BYTES + 1)
-        except (OSError, http.client.HTTPException):
-            body = b""
-        return FeedResponse(exc.code, _lower(exc.headers), body)
-    except (urllib.error.URLError, OSError, http.client.HTTPException, ValueError, OverflowError) as exc:
-        return FeedResponse(None, error=f"{type(exc).__name__}: {getattr(exc, 'reason', exc)}")
-
+# FeedResponse, Transport, urllib_transport (reading MAX_FEED_BYTES at most by default), check_user_agent and
+# check_timeout come from storekit, shared with the macro sources.
 
 @dataclass
 class PollResult:
@@ -2215,11 +2090,6 @@ class PollResult:
         return EXIT_ERROR
 
 
-def _printable(text: str) -> bool:
-    """Visible ASCII characters and spaces only: what a URL or a header value may carry unencoded."""
-    return all(" " <= c <= "~" for c in text)
-
-
 def check_url(url: str) -> str:
     """``url`` if the poller may request it: http(s), and not a host or file RBI guards with a bot challenge.
 
@@ -2245,28 +2115,6 @@ def check_url(url: str) -> str:
     if host.endswith("rbi.org.in") and parts.path.lower().rstrip("/") == "/robots.txt":
         raise ValueError("RBI's robots.txt answers programs with HTTP 418; the store never requests it")
     return url
-
-
-def check_user_agent(user_agent: str) -> str:
-    """``user_agent`` if it can be sent as the client name: one non-empty line of visible ASCII and spaces.
-
-    Anything else (a tab, a character outside ASCII) the standard library
-    would refuse, or garble, only once the request is under way.
-    """
-    if not isinstance(user_agent, str) or not user_agent.strip() or not _printable(user_agent) \
-            or len(user_agent) > MAX_USER_AGENT:
-        raise ValueError(f"user_agent must be one non-empty line of visible ASCII characters and spaces, at most "
-                         f"{MAX_USER_AGENT} long, not {user_agent!r}")
-    return user_agent
-
-
-def check_timeout(timeout: float) -> float:
-    """``timeout`` if a poll may wait that long for the answer: more than 0 and at most ``MAX_TIMEOUT`` seconds."""
-    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) \
-            or not 0 < timeout <= MAX_TIMEOUT:
-        raise ValueError(f"timeout must be a positive number of seconds, at most {MAX_TIMEOUT:g} (a poll holds the "
-                         f"store's lock while it waits), not {timeout!r}")
-    return timeout
 
 
 def check_min_interval(min_interval: dt.timedelta) -> dt.timedelta:
@@ -2424,28 +2272,10 @@ def _clock_error(now: dt.datetime, last: dt.datetime | None, until: dt.datetime 
 
 
 def _decoded(response: FeedResponse) -> bytes:
-    body = response.body
-    if len(body) > MAX_FEED_BYTES:
-        raise ValueError(f"the answer is larger than {MAX_FEED_BYTES} bytes")
-    encoding = response.headers.get("content-encoding", "").strip().lower()
-    if encoding in ("", "identity"):
-        return body
-    if encoding in ("gzip", "x-gzip"):
-        try:
-            with gzip.GzipFile(fileobj=io.BytesIO(body)) as f:
-                data = f.read(MAX_FEED_BYTES + 1)
-        except (OSError, EOFError) as exc:
-            raise ValueError(f"the gzip body cannot be read ({exc})") from None
-        if len(data) > MAX_FEED_BYTES:
-            raise ValueError(f"the answer is larger than {MAX_FEED_BYTES} bytes once decompressed")
-        return data
-    raise ValueError(f"content-encoding {encoding!r} cannot be decoded (only gzip is asked for)")
+    return decode_body(response.body, response.headers, MAX_FEED_BYTES)
 
 
-def _resume_time(now: dt.datetime) -> dt.datetime:
-    """08:00 India time on the day after ``now``'s India day: the first time a poll may ask after a block."""
-    india = now.astimezone(IST)
-    return dt.datetime.combine(india.date() + dt.timedelta(days=1), dt.time(RESUME_HOUR), tzinfo=IST)
+# _resume_time (08:00 India time the next India day) is storekit.resume_time
 
 
 def _block(poller: dict, now: dt.datetime, why: str, status: int | None) -> PollResult:

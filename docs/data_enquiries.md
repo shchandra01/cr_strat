@@ -393,9 +393,10 @@ Please tell us:
 
 1. Which licence governs this data when it is stored in an internal database for commercial use: the Government Open Data License – India, the website's copyright policy, or another.
 2. If permission is needed, whether this letter can serve as the request, and what acknowledgement you require.
-3. Whether a rate limit applies to the API, and whether the history is available as a bulk file.
-4. How far back each series goes, in particular the CPI base-2024 back series and WPI, and whether first prints and later revisions are both kept.
-5. At what time of day CPI, IIP and GDP are released, and how soon the API carries them.
+3. Whether the same terms cover the series eSankhyiki serves on behalf of others: the WPI compiled by the Office of the Economic Adviser (DPIIT), and the tables republished from the Reserve Bank of India.
+4. Whether a rate limit applies to the API. We would retrieve data with a scheduled program at no more than 60 requests a day, at least ten seconds apart, mostly conditional requests that the API answers with "not modified"; is that acceptable, and is the REST API the intended route for such use?
+5. Whether the history is available as a bulk file, and how far back each series goes, in particular the CPI base-2024 back series and WPI. The API serves only the latest value of each series and replaces a provisional figure when it is revised: are first prints and later revisions (vintages) kept anywhere we could obtain?
+6. At what time of day CPI, IIP and GDP are released, and how soon the API carries them.
 
 Please send the licence text, or your written permission.
 

@@ -581,6 +581,365 @@ refuses to start, says who held it, since when, and whether that process
 still runs, and never deletes it. If no `rbi-store-*` command is running,
 delete the file; the next command completes or drops the interrupted commit.
 
+## Macro and global store: `cr-strat macro-store-update`, `macro-store-ingest`, `macro-store-status`
+
+The policy path (S7), the long end (S5) and every back-test need CPI, IIP,
+GDP and WPI, US yields and SOFR, Brent, the rupee and policy rates, each
+with the time from which it was public. The APIs serve the latest value
+only, and overwrite a first print when it is revised, so a store keeps
+every value it reads, run after run: a value it has seen is never lost, a
+change is a new vintage, and nothing is dated before it could have been
+public as far as the release rules, the release-date table and the store's
+own reads know (where that can still fail is listed below).
+
+**Terms first.** What each publisher allows, as read on 16 to 18 Nov 2026
+(re-read the terms before a bulk download):
+
+| Source (`--sources`) | What is fetched | Terms | Default |
+|---|---|---|---|
+| `mospi`: MoSPI's eSankhyiki API (`api.mospi.gov.in`) | CPI (bases 2024, 2012), IIP, GDP and GVA, WPI (compiled by DPIIT's Office of the Economic Adviser) | No licence, terms of use or rate limit was found for the API; its site's legacy copyright page reportedly asks for permission by mail. Whether a commercial firm may keep a history is for MoSPI to say ([letter 12](../docs/data_enquiries.md#12-mospi)). Its `llms.txt` asks to keep the dataset name, indicator, value, unit, reference period, source and update information (`series.csv` does), and to give attribution and, where possible, a link: `series.csv`'s `citation` (a format of this package) reads "Source: Ministry of Statistics and Programme Implementation (MoSPI), Government of India, eSankhyiki (<dataset>), <URL>, retrieved <date>", for WPI "Source: Office of the Economic Adviser, DPIIT, Government of India, via MoSPI eSankhyiki (...)" | **Only when named** (`--sources mospi` or `all`), with a one-line reminder that its licence is not settled; no raw copies unless `--mospi-raw`; CPI down to groups unless `--cpi-levels items` |
+| `ust`: US Treasury daily par yield curve (`home.treasury.gov`) | One CSV a year | No reuse, copyright or automated-access clause on the Site Policies and Notices page; US government data. Cite "U.S. Department of the Treasury, Daily Treasury Par Yield Curve Rates" | Off: it refused the probe of 18 Nov 2026 (HTTP 403 on another path); name it once you have opened a year's file in a browser from the same network |
+| `nyfed`: New York Fed reference rates (`markets.newyorkfed.org`) | SOFR, BGCR, TGCR, EFFR, OBFR, the SOFR averages and index | A licence to access the content by an automated process and to download, store and use it. Any use of reference-rate data must carry the notice in `series.csv`'s `citation` ("The <rate> is subject to the Terms of Use posted at newyorkfed.org. The New York Fed is not responsible for publication of the <rate> by <publisher>, does not sanction or endorse any particular republication, and has no liability for your use.") | On |
+| `eia`: EIA's Europe Brent spot price (`www.eia.gov`) | The weekly history page | Public domain, cited with the publication date ("Source: U.S. Energy Information Administration (<month year>)": the month of the page's "Release Date"), but material licensed from private companies is excluded, and the series' own copyright field (`PET.RBRTE.D`) was not read | Off until that field has been read |
+| `h10`: Federal Reserve H.10, rupees per US dollar (`www.federalreserve.gov`) | The 1990s and the 2000-present history pages | Public domain unless indicated; cite "Board of Governors of the Federal Reserve System, H.10 Foreign Exchange Rates". A noon New York rate, not FBIL's fixing | On |
+| `bis`: BIS SDMX API (`stats.bis.org`) | India's and the US policy rates, the daily rupee figure | Use unrestricted if the BIS is cited ("Bank for International Settlements, <dataset>, data.bis.org") and, in a commercial product, its statistics add no charge; the API may limit an IP address. Its terms ask users to use the latest API version: the policy rates are asked on v2, the rupee (`WS_XRU`) still on v1, as no v2 answer of it has been sampled (one request would settle it; your call) | On |
+
+Not used: FRED and ALFRED (their terms prohibit storing), FBIL's rupee
+reference rate (storing its delayed data needs a subscription), MoSPI's MCP
+server, and any RBI host (the RBI store has its own rules, above).
+
+```bash
+cr-strat macro-store-update --store data/macro_store                       # New York Fed, H.10, BIS; for cron
+cr-strat macro-store-update --store data/macro_store --sources mospi       # MoSPI too: only once you decide to
+cr-strat macro-store-update --store data/macro_store --sources ust,eia     # once checked (above)
+cr-strat macro-store-ingest --store data/macro_store data/raw/macro/*      # saved answers
+cp data/index_events_example.csv data/raw/index_events.csv                 # check every row first (below)
+cr-strat macro-store-ingest --store data/macro_store --index-events data/raw/index_events.csv
+cr-strat macro-store-ingest --store data/macro_store --release-dates data/raw/release_dates.csv
+cr-strat macro-store-status --store data/macro_store [--series '^cpi_2024_all_india_combined']
+cr-strat macro-store-status --store data/macro_store --policy-rates data/raw/policy_rates.csv  # BIS vs your table
+```
+
+The directory is created on first use. `macro-store-ingest` reads saved
+answers of any of the six sources (MoSPI JSON, Treasury CSV, the New York
+Fed's JSON or CSV, EIA's and H.10's pages, H.10's Data Download CSV, BIS
+CSV), recognised by their content; with no files it only rebuilds the
+derived tables (after `--index-events` or `--release-dates`, or an update of
+this package).
+
+| Path | Contents |
+|---|---|
+| `observations/<source>.csv` | Every value ever seen, one row per series, period and vintage (below) |
+| `series.csv` | One row per series held: the parser's fields (`dataset`, `indicator`, `base`, `series_type`, `area`, `sector`, `level`, `code`, `label`, `unit`, `period_type`), the catalogue's `name`, `frequency`, `update_info` (its family's release rule), `terms`, `terms_url`, `aliases`, the `citation` filled in, `source_url` (the endpoint), `last_release` (the latest "Release Date" an EIA or H.10 page printed), and what the store holds (`first_period`, `last_period`, `periods`, `vintages`, `revised_periods`, `last_value`, `last_public_from`, `last_first_seen`) |
+| `fetches.csv` | One row per request sent: `time` (UTC: when it was sent by the run's clock, the run's start plus its pauses, so no later than the real time), `latest` (the latest its answer can have come: that clock plus the timeout of every request of the run so far), `source`, `host`, `url`, `http_status`, `outcome`, `bytes` (on the wire), `rows` (values in the answer), `kept`, `new`, `changed`, `raw`, `etag`, `last_modified`, `message`; the requests of a run killed before its source's answers were kept are logged `interrupted` by the next |
+| `revisions.csv` | One row per value that changed: `seen`, `source`, `series_id`, `period`, `old_` and `new_vintage`, `_value`, `_status`, `_revision`, `old_first_seen`, `prior_seen`, `source_file` |
+| `raw/<source>/` | The answers byte for byte, named `<UTC time>_<12 hex digits of the SHA-256>.<ext>`; the same bytes are not saved twice. US and BIS copies are on by default (`--no-raw`), MoSPI's off (`--mospi-raw`) |
+| `state.json` | Per host the fetch's state (last request, requests that India day, blocks in a row, cool-down, stop, a demand for contact details); per source its last update, the validators and last read of each URL, the requests left pending, the history queue and what is done of it, the requests given up on (`failed`, each request failing now once); the store's `clock` (the latest time a command recorded); the settings of the last update; a failed rebuild of the derived tables (times in UTC) |
+| `release_dates.csv`, `index_events.csv` | The last `--release-dates` and `--index-events` given |
+| `derived/*.csv` | `global_daily`, `india_monthly`, `india_quarterly`, `index_events`, `policy_rates_bis`, rebuilt by every command (below) |
+| `store.lock`, `journal.json` | Present only while a command runs, or after one was killed |
+
+Times in the CSVs are India time without a zone (`2026-11-12T16:00:00`), as
+in the RBI store; `fetches.csv` and `state.json` are in UTC. Read a table
+back typed with `macro_store.read_table(store, name)` (`observations`, a
+source's key, `series`, `fetches`, `revisions` or a derived table): times
+as Timestamps, counts `Int64`, values floats, blanks missing.
+
+**Vintages** (`observations/<source>.csv`). One row per value as first
+seen: `series_id`, `period` (`2026-11-17` a day, `2026-10` a month,
+`2026-27Q1` a financial-year quarter, Q1 being April to June, `2025-26` a
+financial year), `period_start`, `period_end`, `vintage` (1, 2, ...),
+`value` (the publisher's text: `3.90` stays `3.90`), `unit`, the
+publisher's marks (`status`, such as `F` or a national-accounts estimate
+type; `revision`, the New York Fed's `r`; `footnote`; `imputation`),
+`first_seen` (when the store had it at the latest: for an update, the
+`latest` of the first answer of the run that held it; for an ingest, its
+time; never before the vintage it replaces), `public_from`,
+`public_from_basis`, `seen`, `print`, `stage`, `release_id`,
+`public_from_rule`, `prior_seen` (the latest earlier read of the same data
+that did not hold this value: the same query, page or year's file, or a New
+York Fed or BIS window that covered its date), `source_file` and `notes`.
+The same value seen again adds nothing; a different one (or a changed mark)
+adds the next vintage and a row of `revisions.csv`.
+
+**From when a value was public** (`public_from`), recomputed by every
+command from the facts, so that a better release table reaches every
+vintage; never later than `first_seen`:
+
+| Source | `public_from` |
+|---|---|
+| MoSPI | The last release, at or before `first_seen`, that could have set the value: the shipped release-date table (`src/cr_strat/data/macro_release_dates.csv`, 2025-26 and 2026-27) and yours (`--release-dates`), else the release rules: CPI the 12th of the next month; IIP the 28th of the next month from March 2025 data, the 12th of the second month after (previous working day) before; GDP the last working day of the second month after the quarter, first advance estimates on 7 January; at 16:00 (CPI and IIP from 12 Nov 2024, GDP from 29 Nov 2024; 17:30 before, and 11:30 for CPI and IIP before July 2013); WPI the 14th of the next month at 12:00. A "next working day" (and a planned date in the table) skips weekends and the Mumbai settlement holidays of 2015 to 2026, a proxy for the central government's holidays that can only make a date later; a "previous working day" knows weekends only: on a weekday holiday its date is a day after the real release, late rather than early. Each family's stages run from first print through revisions to final. Never before the base's launch (CPI 2024 on 12 Feb 2026 16:00, national accounts 2022-23 on 27 Feb 2026, IIP 2022-23 on 1 Jun 2026, WPI 2022-23 on 15 Jun 2026; older bases from memory, at the end of the month believed). A release time is not taken, and the value is dated by its sighting, if the store read the same data after it without the value (`prior_seen`), or read the family's headline after it without the new month that release brings: the release came late |
+| Treasury | 23:59:59 New York time on the curve date |
+| New York Fed | 10:00 New York time on the next date the same rate has (SOFR, BGCR, TGCR, published about 08:00), 11:00 for EFFR and OBFR (about 09:00), 17:00 for a row marked revised (the averages and index: 10:00 on their own date, 17:00 if revised); EFFR and OBFR before 1 Mar 2016: 23:59:59 on the next date, revised or not; the latest row: its sighting |
+| EIA | 23:59:59 New York time on the Thursday after the first Wednesday after the price's date, or later when the days from that Monday to that Wednesday on which Washington may be closed (the federal holidays, computed from the law's rules, and 24 December, and 26 December on a Friday, given off in some years) move the release: to Friday 27 Dec 2024, a week of Christmas on a Wednesday |
+| H.10 | 16:15 New York time on the working day after the release that carries the rate (weekly on Mondays, with rates to the Friday before; the next working day after a Monday holiday) |
+| BIS | Policy rates 23:59:59 local time on the date in force, public from the central bank's announcement whatever BIS's lag; the US values before 4 Feb 1994 at 23:59:59 New York time on the second weekday after their date (before 19 Dec 1985 the effective rate, published the next business day; then a target the FOMC did not announce: an assumption, not checked). The rupee figure is BIS's own (six decimals, not H.10's rate; BIS names no source), public when BIS publishes it: 23:59:59 Basel time (taken as UTC+1) a week after the first Thursday release at least two days after its date, two weeks for dates from 15 December to 7 January (a rule from BIS's 2026-27 calendar and one observation). Use `usdinr_h10` for the rupee in back-tests |
+
+New York time comes from the US daylight-saving rules, not from time-zone
+data. A rule time later than `first_seen` gives `first_seen`
+(`public_from_basis` `first_seen`); so does a rule time at or before
+`prior_seen` (the store read the same data then without the value: the
+publication came late), except for BIS's policy rates, and any change of a
+US or BIS value the store held, as these publishers keep no revision
+calendar. `seen` is `live` if the store read the value within six hours of
+`public_from` (it is the value then published) and `later` otherwise: a
+history read, or a value seen late, which may include revisions made after
+`public_from`. `print` is `first`, `final` (the last stage of its family)
+or `revised`, and `stage` names the release stage (`first`, `quick`,
+`provisional`, `first_revision`, `quarter`, `revised`, `fae`, `pe`,
+`final`, ...) of the release that set the value as the store knows it: a
+value a later release confirmed unchanged keeps the label of the release
+that first set it, so `first` may already be final, while a value first
+read after its final release is `final` (a row saying when a value was
+confirmed is not built: it would need the store to keep the time of each
+later read that found the value unchanged).
+
+**Where `public_from` can still be early.** A release later than its rule
+or planned date while the store was not polling (history read later: the
+2025-26 rows of the shipped table are planned dates, and every date before
+April 2025 and every WPI date come from rules; type in actual dates from
+the updated calendars or PIB's "Posted On" stamps with `--release-dates`);
+a holiday the proxies do not know (a central-government holiday that is not
+a Mumbai one, a US closure not in the rules such as a national day of
+mourning, any holiday outside 2015 to 2026 for MoSPI); a past BIS rupee release later than its rule; the US
+target before 4 Feb 1994. Detail tables are assumed to reach MoSPI's API
+with their headline unless the store read them without it (then they wait,
+below).
+
+**From when history is known.** History read after the fact is the latest
+vintage, visible only from the release that set it, so a back-test sees
+little of MoSPI's history before the store's first update:
+
+| Family and base | Visible in a back-test from |
+|---|---|
+| CPI 2024, Current and back series | 12 Feb 2026 16:00, the base's launch |
+| CPI 2012 | 28 Feb 2015 23:59:59 (the end of the month of its believed launch, not checked), each month from its final release after that |
+| CPI 2010 | Not fetched (its parser exists: your call) |
+| IIP 2011-12, WPI 2011-12 | 31 May 2017 23:59:59 (believed launched in May 2017, not checked), then each month from its final release |
+| IIP 2022-23, WPI 2022-23 | 1 Jun 2026 16:00 and 15 Jun 2026 12:00, their launches |
+| GDP and GVA 2011-12, by quarter | Each quarter of a closed year from that year's final estimates: 35 months after the year ends to FY2022-23 (so as of mid-2019 the latest quarter visible is 2015-16 Q4), 23 months after for FY2023-24; later quarters from their latest revision |
+| GDP and GVA 2022-23 | 27 Feb 2026 16:00, the base's launch, then by stage |
+
+So a back-test gets from this store no Indian CPI before 28 Feb 2015, no
+IIP or WPI before the end of May 2017, and each GDP quarter of a closed
+year 23 to 44 months after the quarter ended (the GDP dates checked on the
+store of the saved samples). First prints from before the store's start
+are on PIB's release pages (a loader is not built).
+
+**As known at a time.** `macro_store.as_of(store, series_id, t)` gives, per
+period, the latest vintage public at `t` (`t` aware, or naive India time),
+with `seen` and `not_seen_at_publication`; `seen_only=True` gives only what
+the store itself had read by `t`. A back-test asking what was known at `t`
+uses `as_of`, or the rows of `india_monthly` and `india_quarterly` (one per
+print) with `public_from <= t`; `global_daily` holds each date's latest
+vintage only (below).
+
+**What is kept.** The US and BIS series whole. Of MoSPI, All India only:
+base-2024 CPI for rural, urban and combined down to groups (general index,
+12 divisions, 43 groups; `--cpi-levels items` adds classes, sub-classes and
+358 items, and base 2012's items, once MoSPI's terms allow), base 2012's
+groups and subgroups; IIP's general index, sectors and use-based groups;
+GDP and GVA by industry; WPI's headline and major groups; never the "RBI"
+tables (RBI's data, 15 months stale). `--states` adds each state's general
+CPI index (36 requests a release): the full state-level download is about
+1.5 million rows of base-2024 CPI (15,000 requests), so it is not the
+default.
+
+**An update.** A `now` more than five minutes before the store's clock
+(the latest time a command recorded, or the latest request logged) is a
+clock error: nothing is asked or written. Per source, in the order mospi,
+ust, nyfed, eia, h10, bis: nothing if its last update that asked something
+began less than `--min-interval` minutes ago (default 25: `too soon`), or
+while its host is cooling down or stopped. Otherwise the recent window,
+then what it asks next, then what an earlier run left pending, then the
+history queue, as far as `--max-requests` (default 60 a run),
+`--max-per-host` (default 30 a run) and each host's daily cap (MoSPI 60,
+the others 10 an India day) allow:
+
+| Source | Recent window | Asked next | History (queued on the first update) |
+|---|---|---|---|
+| MoSPI | Three probes, each conditional (`If-None-Match`): general CPI of this year and last, IIP's general index, WPI's headline; GDP and GVA by quarter, GDP by year | A changed CPI probe: the latest month in it and the month before, by sector, and every month since the latest month the store's tables hold (after an outage), the first page of each (`--cpi-levels items`: every page); IIP: the same months' tables; WPI: the four major groups. A table that lacks the month its headline showed is asked again at the next runs, with the other tables of that release, for 6 reads | Default (`--mospi-history derived`): what the derived tables use, from 2013: base-2024 CPI by month and sector from Jan 2025 (the first page), the back series, base 2012 by year, IIP's general index and sectors on both bases, the 2011-12 national accounts, WPI 2011-12's headline: 82 requests and their pages. `full` adds IIP's use-based groups (and base-2012 items and every page of base-2024 CPI with `--cpi-levels items`) |
+| Treasury | This year's file (last year's too in the first week of January, and every year since the latest date held) | | One file a year, 2025 back to 1990 |
+| New York Fed | Both groups, from 14 days ago or the latest date held, whichever is earlier | | Both groups from their first day (two requests) |
+| EIA | The history page, conditional (`If-None-Match`, `If-Modified-Since`) | | None: the page holds 1987 on |
+| H.10 | The 2000-present page, conditional (`If-Modified-Since`) | | The 1990s page |
+| BIS | The policy rates' last 60 observations (from the latest date held if that is older), the rupee from 60 days ago or the latest date held | | Both series whole |
+
+Every request names a generic client (`--user-agent`; one with an e-mail or
+web address, or this package's name, is refused), asks for gzip, follows no
+redirect, waits at least 10 seconds after the previous request to the same
+host, and is recorded in `state.json` before it is sent. The answers of each
+source are committed when it is done, the derived tables at the end; a run
+killed during a source's requests loses that source's answers of the run
+(the next run logs them `interrupted` and asks again), not those of the
+sources before it. An answer its parser refuses, or a MoSPI page that is
+not the one asked or whose query changed size since its first page (that
+query is then asked again from page 1), keeps no validator, so that the
+next request asks for it whole; it goes to `failed`, as does a request
+answered with an HTTP 4xx: once per request (a recent window, whose dates
+move every day, once per window), and off the list as soon as it, or a
+later read of the same data, answers; `--retry-failed` queues the history
+and pending ones again (a recent request is asked again by every run). A history step that the caps
+cut short waits for the next run; `macro-store-status` says how far each
+history got (`history: 9 requests done, 27 to go, 2 given up`) and what is
+pending. `--no-backfill` fetches no history; a changed plan
+(`--mospi-history full`, `--states`) adds what it lacks.
+
+Each source prints one line, and a line per thing that needs a look; every
+line starts with the run's start time in UTC, so that a log appended to
+says which run wrote it. The reminders of MoSPI, Treasury and EIA come first
+when they run. Exit codes, as `rbi-store-poll`: `0` normal (new values,
+nothing new, not modified, too soon, a cap reached); `4` the run worked but
+something needs a look (an answer its parser refused, a MoSPI page that did
+not fit, an HTTP 4xx such as a page limit, a table given up after waiting
+for its release, a run killed during a request, derived tables not
+rebuilt), with `needs a look:` lines on stderr; `3` a host blocked, cooling
+down or stopped (HTTP 403, 418 or 429, a refusal page whatever its status,
+a demand for contact details, a second web page in a row); `1` any other
+error (`error:`: a 5xx, a network error, a redirect, an answer not
+readable, a clock that moved back, a store locked or damaged); `2` bad
+arguments, checked before anything is recorded.
+
+**Schedule** it on your own machine, for example with cron (nothing here
+schedules itself). Give the full path of `cr-strat` or set `PATH`, and
+`HTTPS_PROXY` if the machine reaches the web through a proxy. `CRON_TZ`
+sets the zone of the times in cronie and some other crons (see `man 5
+crontab`); where it is not supported, write the times in the machine's own
+zone (in UTC: 01:45 and 15:15; MoSPI 04:00, 06:35 and 07:35, 10:35 and
+11:10, 12:30; the days stay the same as long as no time crosses midnight):
+
+```
+CRON_TZ=Asia/Kolkata
+PATH=/path/to/venv/bin:/usr/bin:/bin
+# New York Fed, H.10, BIS: every morning (after New York's evening), and after the New York Fed's 09:00 rates
+15 7  * * *  cd /path/to/data && cr-strat macro-store-update --store macro_store >> macro_store.log 2>&1
+45 20 * * *  cd /path/to/data && cr-strat macro-store-update --store macro_store --sources nyfed >> macro_store.log 2>&1
+# Treasury and EIA once checked (above): add them to the morning run, --sources default,ust,eia
+# MoSPI once you have decided to keep it: every morning, and around its release times on the days they can fall
+30 9  * * *                   cd /path/to/data && cr-strat macro-store-update --store macro_store --sources mospi >> macro_store.log 2>&1
+5 12,13 14-18 * *             cd /path/to/data && cr-strat macro-store-update --store macro_store --sources mospi >> macro_store.log 2>&1
+5,40 16 1-9,12-18,26-31 * *   cd /path/to/data && cr-strat macro-store-update --store macro_store --sources mospi >> macro_store.log 2>&1
+0 18  1-9,12-18,26-31 * *     cd /path/to/data && cr-strat macro-store-update --store macro_store --sources mospi >> macro_store.log 2>&1
+```
+
+The days cover the rules' dates moved by weekends and holidays: CPI from the
+12th, WPI from the 14th, IIP from the 28th to the first days of the next
+month (2 Mar 2026 for January's), GDP at the end of the month or early in
+the next (5 Jun 2026), first advance estimates from 7 January (8 Jan 2029).
+A MoSPI run with nothing new costs six conditional requests (MoSPI answered
+its ETag with HTTP 304 on 18 Nov 2026); a CPI release brings six more (the
+latest month and the month before, by sector: the first page of each), 42
+with `--cpi-levels items` (seven pages each); an IIP release two; a WPI
+release four, spread over the runs of that day by the caps. A first update
+with its history: New York Fed, H.10 and BIS finish in one run; Treasury
+takes four days at its cap of ten a day; MoSPI's default history (82
+requests and their pages, while the recent window uses part of the daily
+cap of 60) a few days.
+
+**Once a month, the release calendar.** MoSPI re-issues its advance release
+calendar about monthly and moves dates in it (IIP to 1 Jun and GDP to 5 Jun
+in 2026); this package cannot read the PDF, and nothing polls it. Open
+https://www.mospi.gov.in/api/documents/get-latest-release-calender in a
+browser (it names the current PDF), or save it and ingest it (the ingest
+reports the document and its date), and add the dates that moved, or the
+actual dates and times once released, to your `--release-dates` table.
+
+**Every morning, check the store**: `cr-strat macro-store-status --store
+macro_store`, or `grep -E 'needs a look|error|blocked|cooling|stopped'
+macro_store.log` (each line carries its run's UTC time). What each line
+needs:
+
+| Line | What to do |
+|---|---|
+| `blocked`, `cooling down`, `stopped` (status: `host ...: cool-down until`, `stopped since`) | HTTP 403, 418 or 429, a refusal page or bot challenge whatever its HTTP status, a demand for contact details (none is ever given) or a second web page in a row where data were expected is a block. That host gets no request before 08:00 India time the next day (counted from the latest time the block can have happened); a second block in a row stops it until you check the site in a browser and run `cr-strat macro-store-update --store macro_store --sources <source> --resume` by hand (never from cron). Read a site's terms again before resuming one that asked for contact details |
+| `needs a look: ... refused` (status: `failed ...`) | The parser refused an answer (a layout never seen, a page that does not fit its query, an answer cut short). The request is given up (`failed` in `state.json`) and asked whole next time; the US and BIS answers are in `raw/`. After an update of this package, read them again with `macro-store-ingest --store macro_store macro_store/raw/<source>/<file>`, or queue the requests again with `--retry-failed`; a recent request is asked again by every run anyway |
+| `needs a look: ... had not reached this table` | A MoSPI table still lacked the month its headline showed after 6 reads: check the table in the API's answer by hand; `--retry-failed` asks again. Status lines `tables behind the headline` say the same of what the store holds |
+| `needs a look: ... HTTP 404` (or another 4xx) | A request this package should not have made (a page limit, a moved address): no more requests to that host in the run; report it |
+| `error: server error`, `error: network error` | Nothing once: the next run tries again. If it goes on (status: `requests in a row without a usable answer`), check this machine's network, then the site. A network error at MoSPI's TLS handshake (`SSL`, `handshake` or `renegotiation` in the message) is what MoSPI's own client says its server needs legacy renegotiation for: add `--legacy-tls` to the MoSPI lines (certificates are still checked) |
+| `error: ... not followed` | The address moved: check it in a browser before anything else |
+| `needs a look: ... the run ended ...` | A run was killed: nothing to do, the next run asked again |
+| `error: clock error` | Check the machine's clock. If a source's `last_update` or a host's `last_request` in `state.json` is the problem, clear the time the line names; if the store's own clock is ahead (a clock that ran fast), wait until the real time passes it |
+| `needs a look: derived tables not rebuilt` (an ingest: `error: derived tables not rebuilt`) | An update of this package, or a bug report: the values read were kept, and the previous tables too |
+
+**Saved answers and repairs.** `macro-store-ingest` reads files in the
+order of their full names as given (then their content), so the same files
+in any order give the same store, and the same files again change nothing:
+name saved answers by the time they were saved, or keep them in dated
+folders. A saved answer is dated by the ingest (`first_seen`), not by when
+it was saved, which the store cannot know: ingest saved answers oldest
+first; a value equal to one the store has already superseded is not taken
+as a change back; an ingest with a clock behind the store's is refused. Two
+inputs of one ingest that disagree on a value keep the later one by name,
+and say so, naming both. Base-2012 and 2010 CPI rows do not say their
+series (Current or Back): a raw copy of the store's own request is read as
+its URL says, any other such answer only with `--cpi-series Current` or
+`Back` (refused otherwise, so that a back series is never taken for a
+revision of the current one).
+
+**Dropping a source** (MoSPI says no, say): with no command running, delete
+`observations/<source>.csv` and `raw/<source>/`, delete that source's rows
+from `revisions.csv` (its `source` column) and its entry under `sources` in
+`state.json`, then run `macro-store-ingest --store macro_store` with no
+files: `series.csv` and the derived tables are rebuilt without it (checked
+on a copy of a store of the saved samples: no MoSPI series left, the Indian
+tables empty). `fetches.csv` keeps the log of the requests made.
+
+**Derived tables** (`derived/`, deterministic: the same store gives the
+same bytes). Each value is the latest vintage; `public_from` is the latest
+of the row's values, with a `_public_from` per group of values that became
+public together, `seen` is `later` if any value was read later than its
+publication, `revised` is when the store last saw a value of the row change.
+Nothing is filled forward, and bases are never spliced: a back-test uses the
+base that was current at `t` (CPI 2012 before 12 Feb 2026 16:00, then 2024;
+IIP 2011-12 before 1 Jun 2026; WPI 2011-12 before 15 Jun 2026).
+
+| File | One row per | Columns |
+|---|---|---|
+| `global_daily.csv` | Date any US or BIS series has (the observation date: trade date, curve date, spot date, rate-in-force date) | `date`; `ust_par_1m` ... `ust_par_30y`, `ust_public_from`; `sofr`, `bgcr`, `tgcr`, `nyfed_secured_public_from`; `effr`, `obfr`, `fomc_target_low`, `fomc_target_high` (blank before 16 Dec 2008, when the target was a point), `nyfed_unsecured_public_from`; `sofr_avg_30d`, `sofr_avg_90d`, `sofr_avg_180d`, `sofr_index`, `sofrai_public_from`; `brent_usd_bbl`, `brent_public_from`; `usdinr_h10`, `usdinr_h10_public_from`; `policy_rate_in_bis` (the bank rate before 3 Apr 2001, the repo rate from then), `policy_rate_us_bis` (the effective federal funds rate before 19 Dec 1985, the target's mid-point from then), `bis_policy_public_from`; `usdinr_bis`, `usdinr_bis_public_from`; `public_from`, `seen`, `revised`, `notes` (values the New York Fed marked revised or footnoted; a series' change of definition on its first row: BIS's two, EFFR's layout of 1 Mar 2016, the target range of 16 Dec 2008). The latest vintage of each date only: a date whose value was revised has its row's `public_from` at the revision, so for what was known at `t` use `as_of` or the per-group `_public_from` columns, not the row's |
+| `india_monthly.csv` | Family (`cpi`, `iip`, `wpi`), base and month, and each moment a value of it became public (a print) | `month`, `family`, `base` (`2024`, `2024back` for base 2024's back series, `2012`, `2010`, `2022-23`, `2011-12`), `print`, `stage`, `status`, `public_from`, `first_public_from`, `public_from_basis`, `release_id`, `seen`, `revised`; CPI `cpi_<m>_index`, `cpi_<m>_yoy`, `cpi_<m>_public_from` for `combined`, `rural`, `urban`, `food` (base 2024's group 01.1, the CFPI of MoSPI's release; base 2012's CFPI), `food_bev`, `fuel` (group 04.5; base 2012's fuel and light), `housing` (division 04; base 2012's housing), and `cpi_rent_index` (group 04.1); IIP `iip_index`, `iip_yoy`, `iip_manufacturing_index`, `_yoy`, each with `_public_from`; WPI `wpi_index`, `wpi_yoy` (computed here, on one base, from the month a year before as known at `public_from`: WPI publishes no inflation), `wpi_food_index`; `notes`. Every measure is as known at the row's `public_from`: a final row carries the measures that did not change |
+| `india_quarterly.csv` | Base, quarter and moment | `quarter`, `base`, the same columns as above, `gdp_current_cr`, `gdp_constant_cr`, `gdp_public_from`, `gva_current_cr`, `gva_constant_cr`, `gva_public_from`, `gdp_constant_yoy`, `gva_constant_yoy` (computed from the same base as known then), `notes` |
+| `index_events.csv` | Event of the table you gave | Its columns (below) and `public_from`, `public_from_basis`, `public_from_rule` |
+| `policy_rates_bis.csv` | Change of India's repo rate in BIS's series, from 3 Apr 2001 (the bank rate before) | `effective_date`, `repo_pct`, `sdf_pct`, `msf_pct`, `source`, `public_from`: the RBI store's policy-rate columns, with `sdf_pct` and `msf_pct` **blank**, as BIS has no corridor. `rbi-store-ingest --policy-rates` refuses the file until you fill them in from RBI's resolutions; check the dates too (BIS lags about a month and dates some 2019 changes a day after RBI's decision): `macro-store-status --policy-rates <your table>` lists the changes BIS and your table date differently (within a week) or one of them lacks |
+
+**Index events**, kept by hand: none is shipped as a default. An example
+with the decisions found on 17 and 18 Nov 2026 is
+[`data/index_events_example.csv`](index_events_example.csv): 13 rows, 3
+verified on LSEG's pages, the rest from news reports, each with the page it
+was read on or reported in, except Bloomberg's review of November 2026,
+whose source is a 5paisa.com report named by its title (no URL was found);
+two rows of an earlier example that named no source document were dropped.
+Copy it, check each row, pass the copy with `--index-events`; the store
+keeps a copy and every later command uses it. Columns: `event_id`
+(lower-case letters, digits, `_`, once each), `provider`, `index_name`,
+`event_type` (`watch_list`, `consultation`, `announcement`,
+`inclusion_start`, `tranche`, `inclusion_complete`, `deferral`,
+`review_no_change`, `scheduled_review`), `announced_date` (`YYYY-MM-DD`, or `YYYY-MM` when only
+the month is known), `announced_time` (`HH:MM`, blank if unknown),
+`announced_tz` (`America/New_York`, `Europe/London`, `Asia/Kolkata`),
+`effective_start`, `effective_end`, `phase_in`, `target_weight_pct`,
+`bonds`, `status` (`verified` or `unverified`), `source_url`, `notes`. A
+row that breaks a rule (an unknown status or zone, an end before its start,
+an id used twice, an empty source) is refused, naming the file and the
+line, before anything is written. An event is public from 23:59:59 (or its
+time) in the provider's zone on its announcement date (the last day of its
+month when only the month is known).
+
+**Release dates**, kept by hand: MoSPI's calendar is a PDF this package
+cannot read. The shipped table holds the 2025-26 calendar's planned dates
+and the 2026-27 calendar's actual and planned ones, each with its source.
+Add actual dates and times as you read them (PIB's "Posted On" stamp, the
+updated calendar: the 2025-26 actual dates need the updated 2025-26
+calendar, not read here) in a file of the same columns and pass it with
+`--release-dates`: its rows override or extend the shipped ones, and every
+vintage is dated again.
+
+**Backups and a stale lock.** Back up the store directory (plain files)
+while no `macro-store-*` command runs: what the APIs served cannot be
+fetched again once revised. A killed run leaves `store.lock`; the next run
+refuses to start, says who held it and since when, and never deletes it.
+If no `macro-store-*` command is running, delete the file; the next command
+completes or drops the interrupted commit.
+
 ## RBI security lists: GoI outstanding, FAR, SDLs
 
 Save these pages from www.rbi.org.in by hand:
