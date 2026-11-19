@@ -1050,7 +1050,11 @@ def in_scope(obs: Observation, settings: Settings) -> bool:
 class _Answer:
     """One parsed answer to keep: where it came from (``name``, the raw copy or the request; ``label`` for messages:
     the input's name or the URL), when the store had it at the latest (``seen``, aware), and the store's earlier reads
-    of the same data (``reads``: what each covered and when, newest first) that bound a new value's time."""
+    of the same data (``reads``: what each covered and when, newest first) that bound a new value's time.
+
+    An ingested copy of an answer the store itself received has ``received``: the rows of ``fetches.csv`` that
+    received these bytes (row, ``latest``), in the log's order, and ``logged``: the store's good reads of the same
+    data (row, window, time), so that each value is dated as an update would have dated it (``received_at``)."""
 
     source: str
     name: str
@@ -1060,15 +1064,41 @@ class _Answer:
     label: str = ""
     reads: list[tuple[dt.date | None, dt.date | None, dt.datetime]] = field(default_factory=list)
     counts: dict[str, int] = field(default_factory=lambda: {"rows": 0, "kept": 0, "new": 0, "changed": 0})
+    received: list[tuple[int, dt.datetime]] = field(default_factory=list)
+    logged: list[tuple[int, dt.date | None, dt.date | None, dt.datetime]] = field(default_factory=list)
 
     def prior(self, obs: Observation) -> dt.datetime | None:
         """The latest earlier read that covered ``obs`` (its date in the read's window, if it had one): India time,
         without a zone."""
-        day = dt.date.fromisoformat(obs.period) if obs.period_type == "day" else None
         for start, end, when in self.reads:
-            if day is None or ((start is None or start <= day) and (end is None or day <= end)):
+            if _covers(start, end, obs):
                 return when
         return None
+
+    def received_at(self, obs: Observation, held: list[dict[str, str]] | None
+                    ) -> tuple[dt.datetime, dt.datetime | None] | None:
+        """For a received copy: when its value of ``obs`` came, as an update would have dated it, and the latest good
+        read of the same data before that (``prior``); ``None`` if what the store holds is newer.
+
+        A new value of a key is first seen at the first receipt of these bytes. A value that differs from the store's
+        latest vintage is older than it (``None``) if that vintage was first seen after the last receipt, or the
+        store read the same data again since; else it came with the first receipt after both that vintage and the
+        store's last read of the same data before the last receipt (each later read showed the store's value)."""
+        covering = [(row, when) for row, start, end, when in self.logged if _covers(start, end, obs)]
+        last, latest = self.received[-1]
+        first = self.received[0]
+        if held and _identity(held[-1]) != _identity(obs.as_dict()):
+            if held[-1]["first_seen"] > _ist(latest) or any(row > last for row, _ in covering):
+                return None
+            floor = max((row for row, _ in covering if row < last), default=-1)
+            first = next(r for r in self.received if r[0] > floor and _ist(r[1]) >= held[-1]["first_seen"])
+        return first[1], max((when for row, when in covering if row < first[0]), default=None)
+
+
+def _covers(start: dt.date | None, end: dt.date | None, obs: Observation) -> bool:
+    """Whether a read with this date window (``None``: open) covered ``obs``: always for a period that is not a day."""
+    day = dt.date.fromisoformat(obs.period) if obs.period_type == "day" else None
+    return day is None or ((start is None or start <= day) and (end is None or day <= end))
 
 
 def _scope(url: str) -> tuple[str, dt.date | None, dt.date | None]:
@@ -1099,6 +1129,7 @@ class _Absorbed:
     unchanged: int = 0
     out_of_scope: int = 0
     older: int = 0  # values equal to an earlier vintage, seen again by an ingest: not taken as a change back
+    superseded: int = 0  # values of a received copy older than what the store holds or read since: not taken
     conflicts: list[str] = field(default_factory=list)
     sources: set[str] = field(default_factory=set)
 
@@ -1124,9 +1155,13 @@ def _absorb(data: _Data, answers: list[_Answer], *, settings: Settings, live: bo
     before the vintage it replaces; ``prior_seen`` is the latest earlier read that would have held it (``_Answer
     .prior``). ``live``: the answers were fetched now (an update). An ingest (saved answers of unknown age) does not
     take a value equal to an earlier, superseded vintage as a change back: it is counted in ``older``, nothing added.
+    A copy of an answer the store received (``_Answer.received``) is of known age and dated value by value as the
+    update would have dated it (``_Answer.received_at``): a value older than what the store holds is not taken
+    (``superseded``), and a change back is taken like any change.
     """
     out = _Absorbed()
     incoming: dict[tuple[str, str], list] = {}  # key -> [observation, first answer with it, last answer with it]
+    dated: dict[tuple[int, tuple[str, str]], tuple[dt.datetime, dt.datetime | None]] = {}  # received copies' values
     facts_by_series: dict[str, tuple[Observation, int]] = {}
     releases: dict[str, str] = {}
     for i, answer in enumerate(answers):
@@ -1136,6 +1171,12 @@ def _absorb(data: _Data, answers: list[_Answer], *, settings: Settings, live: bo
                 out.out_of_scope += 1
                 continue
             answer.counts["kept"] += 1
+            if answer.received:
+                when = answer.received_at(obs, data.vintages.get(obs.key))
+                if when is None:
+                    out.superseded += 1
+                    continue
+                dated[(i, obs.key)] = when
             held = incoming.get(obs.key)
             if held is None or _identity(held[0].as_dict()) != _identity(obs.as_dict()):
                 if held is not None:
@@ -1163,12 +1204,12 @@ def _absorb(data: _Data, answers: list[_Answer], *, settings: Settings, live: bo
         if held and _identity(held[-1]) == _identity(values):
             out.unchanged += 1
             continue
-        if not live and any(_identity(v) == _identity(values) for v in held[:-1]):
+        if not live and not answer.received and any(_identity(v) == _identity(values) for v in held[:-1]):
             out.older += 1
             continue
         conflict = next((c for c in out.conflicts if c.startswith(f"{key[0]} {key[1]}:")), "")
-        seen_text = max(_ist(answer.seen), held[-1]["first_seen"]) if held else _ist(answer.seen)
-        prior = answer.prior(obs)
+        seen, prior = dated.get((first, key)) or (answer.seen, answer.prior(obs))
+        seen_text = max(_ist(seen), held[-1]["first_seen"]) if held else _ist(seen)
         facts = {"series_id": key[0], "period": key[1], "vintage": str(len(held) + 1), "value": obs.value,
                  "unit": obs.unit, "status": obs.status, "revision": obs.revision, "footnote": obs.footnote,
                  "imputation": obs.imputation, "first_seen": seen_text,
@@ -1816,7 +1857,7 @@ def _update_source(run: _Run, source: str, retry_failed: bool) -> SourceResult:
             retry = {k: v for k, v in item["request"].items() if k != "tries"}
             if retry["url"] not in {d["url"] for d in target}:
                 target.append(retry)
-            src["validators"].pop(retry["url"], None)  # asked again whole, not "if changed"
+            _ask_whole(src["validators"], retry["url"])
         src["failed"] = []
     recent = recent_requests(source, run.now, settings, _held_latest(data))
     recent_urls = {r.url for r, _ in recent}
@@ -1893,9 +1934,23 @@ def _ist_naive(when: dt.datetime) -> dt.datetime:
     return when.astimezone(IST).replace(tzinfo=None)
 
 
+def _ask_whole(validators: dict[str, dict], url: str) -> None:
+    """Make the next request of ``url`` unconditional (its etag and Last-Modified forgotten) and keep ``last_ok``,
+    the store's record of its last good read of ``url``: that read bounds the time of what a later answer brings
+    (``_reads_before``), so a refused answer or a retry must not erase it."""
+    held = validators.get(url)
+    if held is None:
+        return
+    if held.get("last_ok"):
+        validators[url] = {"etag": "", "last_modified": "", "last_ok": held["last_ok"]}
+    else:
+        del validators[url]
+
+
 def _reads_before(validators: Mapping[str, Mapping]) -> dict[str, list]:
     """The store's earlier reads by what they cover (``_scope``): ``(start, end, time)`` (India time), newest first.
-    A URL's ``last_ok`` is the latest time its last good answer can have come."""
+    A URL's ``last_ok`` is the latest time its last good answer can have come (kept when a refused answer or a retry
+    makes the next request unconditional: ``_ask_whole``)."""
     out: dict[str, list] = defaultdict(list)
     for url, v in validators.items():
         when = _from_utc(v.get("last_ok"), "validators")
@@ -1963,13 +2018,15 @@ def _finish_source(run: _Run, source: str, src: dict, backfill: dict | None, exc
             if reason:
                 row["message"] = f"refused: {reason}"
                 attention.append(f"{url}: the answer was refused: {reason}" + (f" (kept as {raw})" if raw else ""))
-                validators.pop(url, None)  # the next request asks for it whole, not "if changed"
+                # its own validator is never kept; the next request asks for it whole, not "if changed", and the
+                # record of the last good read of this URL (last_ok) stays: it bounds what a later answer brings
+                _ask_whole(validators, url)
                 refused_urls.add(url)
                 failed.append({"time": utc_text(e.time), "reason": reason, "raw": raw, "origin": origin,
                                "request": _request_dict(e.request, role, extra)})
                 if not isinstance(result, str) and "size changed" in reason:  # read the query again from page 1
                     first = mospi.page_request(e.request, 1)
-                    validators.pop(first.url, None)
+                    _ask_whole(validators, first.url)
                     target = front if origin == "history" else pending
                     if first.url not in {d["url"] for d in target}:
                         target.append(_request_dict(first, extra.get("parent_role") or "all"))
@@ -2475,6 +2532,8 @@ class IngestReport:
     unchanged: int = 0
     out_of_scope: int = 0
     older: int = 0
+    received: int = 0  # inputs that are copies of answers the store received (dated by fetches.csv)
+    superseded: int = 0  # their values older than what the store holds or read since (not taken)
     refused: list[tuple[str, str]] = field(default_factory=list)
     unreadable: list[tuple[str, str]] = field(default_factory=list)
     other: list[tuple[str, str]] = field(default_factory=list)
@@ -2486,6 +2545,9 @@ class IngestReport:
     def summary(self) -> str:
         parts = [f"{_n(self.inputs, 'input')}: {self.read} read, {len(self.refused)} refused, "
                  f"{len(self.unreadable)} not recognised"]
+        if self.received:
+            parts.append(f"{self.received} of them {'a copy' if self.received == 1 else 'copies'} of the store's own "
+                         "answers (dated by its request log)")
         if self.other:
             parts.append(f"{len(self.other)} not data")
         if self.duplicates:
@@ -2494,6 +2556,8 @@ class IngestReport:
                      f"{self.out_of_scope:,} not kept (out of scope)")
         if self.older:
             parts.append(f"{self.older:,} equal to an earlier vintage (not taken as a change back)")
+        if self.superseded:
+            parts.append(f"{self.superseded:,} older than what the store holds or read since (not taken)")
         tail = f"; {_n(len(self.written), 'file')} written" if self.written else "; no file changed"
         return ", ".join(parts) + tail
 
@@ -2524,6 +2588,13 @@ def ingest(store: str | Path, sources: Iterable, *, now: dt.datetime, settings: 
     URL of the store's own request (its raw copy), else as ``cpi_series`` (``Current`` or ``Back``), else refused.
     ``release_dates`` and ``index_events`` are tables kept by hand, checked and copied into the store; with no
     inputs the ingest only rebuilds the tables (after a new table or an update of this package).
+
+    A copy of an answer the store received itself (the bytes of a raw copy that ``fetches.csv`` logs as saved by a
+    request, its file in ``raw/`` compared byte for byte; a refused answer, say, read again after an update of this
+    package) is dated as an update would have dated it: first seen at the ``latest`` of the request that first
+    saved it, bounded by the store's reads of the same data logged before that request (``prior_seen``); a value of
+    it older than what the store holds (a vintage first seen after it, or a read of the same data since) is not
+    taken. These copies are read first, in the order the store received them, then the other inputs.
     """
     now = _check_now(now)
     settings = settings or Settings()
@@ -2543,8 +2614,18 @@ def ingest(store: str | Path, sources: Iterable, *, now: dt.datetime, settings: 
         _stage_tables(data, tx, release_bytes, events_bytes)
         answers, digests, staged = [], set(), {}
         fetched = _fetched_urls(data)
-        for name, body in sorted(items, key=lambda item: (item[0], _sha(item[1]))):
+        received = _received_copies(data)
+        logged = _logged_reads(data) if received else {}
+        inputs = []
+        for name, body in items:
             digest = _sha(body)
+            rows = received.get(digest[:12])
+            if rows is not None and not _same_bytes(paths.root / data.fetches[rows[0]]["raw"], body):
+                rows = None
+            inputs.append((rows, name, digest, body))
+        # the store's own answers first, in the order it last received them, then the others by name and content
+        inputs.sort(key=lambda e: (e[0] is None, e[0][-1] if e[0] is not None else 0, e[1], e[2]))
+        for rows, name, digest, body in inputs:
             if digest in digests:
                 report.duplicates += 1
                 continue
@@ -2572,6 +2653,10 @@ def ingest(store: str | Path, sources: Iterable, *, now: dt.datetime, settings: 
                 report.refused.append((name, str(exc)))
                 continue
             report.read += 1
+            if rows is not None and all(data.fetches[r]["source"] == result.source for r in rows):
+                answers.append(_received_answer(data, rows, result, name, logged))
+                report.received += 1
+                continue
             raw = ""
             if settings.keeps_raw(result.source):
                 raw = _raw_path_of(data, digest) or staged.get(digest, "")
@@ -2584,6 +2669,7 @@ def ingest(store: str | Path, sources: Iterable, *, now: dt.datetime, settings: 
         absorbed = _absorb(data, answers, settings=settings, live=False)
         report.new, report.changed, report.unchanged = absorbed.new, absorbed.changed, absorbed.unchanged
         report.out_of_scope, report.older, report.conflicts = absorbed.out_of_scope, absorbed.older, absorbed.conflicts
+        report.superseded = absorbed.superseded
         derived_before = json.dumps(data.state.get("derived"), sort_keys=True)
         report.derive_error = _stage_all(data, tx, now)
         dated = bool(absorbed.new or absorbed.changed)  # values first seen now: the store's clock is now at least
@@ -2597,13 +2683,59 @@ def ingest(store: str | Path, sources: Iterable, *, now: dt.datetime, settings: 
     return report
 
 
+def _raw_digest(raw: str) -> str:
+    """The 12 hex digits of SHA-256 a raw copy's name carries (``raw/<source>/<UTC time>_<digits>.<ext>``)."""
+    return raw.rsplit("_", 1)[-1].split(".")[0]
+
+
 def _fetched_urls(data: _Data) -> dict[str, str]:
     """The URL each raw copy of the store answered (by the 12 hex digits of its SHA-256), from ``fetches.csv``."""
     out = {}
     for row in data.fetches:
         if row.get("raw"):
-            out[row["raw"].rsplit("_", 1)[-1].split(".")[0]] = row["url"]
+            out[_raw_digest(row["raw"])] = row["url"]
     return out
+
+
+def _received_copies(data: _Data) -> dict[str, list[int]]:
+    """Per raw copy of an answer to a request (by the 12 hex digits of its SHA-256), the rows of ``fetches.csv``
+    that received those bytes, in the log's order (the same bytes are saved once): each by its ``latest``."""
+    out: dict[str, list[int]] = defaultdict(list)
+    for i, row in enumerate(data.fetches):
+        if row["raw"] and row["outcome"] == "ok" and row["latest"]:
+            out[_raw_digest(row["raw"])].append(i)
+    return dict(out)
+
+
+def _same_bytes(path: Path, body: bytes) -> bool:
+    try:
+        return path.read_bytes() == body
+    except OSError:
+        return False
+
+
+def _logged_reads(data: _Data) -> dict[str, list[tuple[int, dt.date | None, dt.date | None, dt.datetime]]]:
+    """The store's good reads in ``fetches.csv`` by what they cover (``_scope``): ``(row, start, end, time)``, the
+    time the latest its answer can have come (India time, without a zone), in the log's order. A good read is an
+    answer kept (``ok`` and not refused) or a ``not_modified`` (the same content as the last one kept)."""
+    out: dict[str, list] = defaultdict(list)
+    for i, row in enumerate(data.fetches):
+        if row["outcome"] == "not_modified" or (row["outcome"] == "ok" and not row["message"].startswith("refused")):
+            when = _from_utc(row["latest"] or row["time"], f"{data.paths.fetches}, line {i + 2}: latest")
+            if when is not None:
+                key, start, end = _scope(row["url"])
+                out[key].append((i, start, end, _ist_naive(when)))
+    return out
+
+
+def _received_answer(data: _Data, rows: list[int], result: ParseResult, label: str,
+                     logged: Mapping[str, list[tuple[int, dt.date | None, dt.date | None, dt.datetime]]]) -> _Answer:
+    """An ingested copy of the answer the store received at ``rows`` of ``fetches.csv``, its values to be dated as
+    the update would have dated them (``_Answer.received_at``), with the store's good reads of the same data."""
+    fetch = data.fetches[rows[0]]
+    times = [(r, _from_utc(data.fetches[r]["latest"], f"{data.paths.fetches}, line {r + 2}: latest")) for r in rows]
+    return _Answer(fetch["source"], fetch["raw"], result, times[0][1], fetch["url"], label, received=times,
+                   logged=logged.get(_scope(fetch["url"])[0], []))
 
 
 def _series_param(url: str) -> str | None:

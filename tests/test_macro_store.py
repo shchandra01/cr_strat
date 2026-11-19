@@ -1077,6 +1077,132 @@ def test_a_refused_answer_keeps_no_validator_so_the_retry_reads_it_whole(tmp_pat
     assert _state(store)["sources"]["h10"]["failed"] == []
 
 
+def test_a_refused_answer_keeps_the_time_of_the_last_good_read_so_a_late_value_is_not_dated_before_it(tmp_path):
+    # H.10's rate of Fri 13 Nov 2026 is due by 16:15 New York time on Tue 17 Nov (02:45 on the 18th in India): the
+    # page read that evening still ends at 12 Nov, the next answer is cut short (refused), the third holds 13 Nov
+    store, off = tmp_path / "s", st.Settings(backfill=False)
+    rows = [("11-NOV-26", "94.1500"), ("12-NOV-26", "94.2000")]
+    after = fx.h10_page(rows + [("13-NOV-26", "94.2400")], release="Wednesday, November 18, 2026")
+    server = Server(("dat00_in", [ok(fx.h10_page(rows, release="Monday, November 16, 2026"),
+                                     **{"last-modified": "Tue, 17 Nov 2026 21:15:00 GMT"}),
+                                  ok(after[:-40], **{"last-modified": "Wed, 18 Nov 2026 13:00:00 GMT"}),
+                                  ok(after, **{"last-modified": "Wed, 18 Nov 2026 21:15:00 GMT"})]))
+    run(store, server, when=dt.datetime(2026, 11, 18, 1, 0, tzinfo=UTC), sources=["h10"], settings=off)
+    cut = run(store, server, when=dt.datetime(2026, 11, 18, 14, 0, tzinfo=UTC), sources=["h10"], settings=off)
+    (held,) = _state(store)["sources"]["h10"]["validators"].values()
+    assert cut.exit_code == 4 and held == {"etag": "", "last_modified": "", "last_ok": "2026-11-18T01:01:00Z"}
+    run(store, server, when=dt.datetime(2026, 11, 19, 1, 0, tzinfo=UTC), sources=["h10"], settings=off)
+    assert "If-Modified-Since" not in server.requests[-1][1]  # asked whole after the refusal
+    (v,) = [r for r in _vintages(store, "h10", "usdinr_h10_noon") if r["period"] == "2026-11-13"]
+    assert (v["prior_seen"], v["public_from"], v["public_from_basis"]) == (
+        "2026-11-18T06:31:00", "2026-11-19T06:31:00", "first_seen")  # the read before the refused one lacked it
+    assert st.as_of(store, "usdinr_h10_noon", ist(2026, 11, 18, 12, 0))["period"].max() == "2026-11-12"
+
+
+def test_a_refused_mospi_probe_keeps_the_time_of_its_last_good_read_for_the_month_it_brings(tmp_path, monkeypatch):
+    # CPI's November is planned for 14 Dec 2026 16:00 (the 12th is a Saturday): the probe answered 304 at 16:05
+    # without it, was refused the next morning and brought November that afternoon, dated by that sighting
+    store, off = tmp_path / "s", st.Settings(backfill=False)
+    real = st.ms.parse
+    refuse = {"on": False}
+    monkeypatch.setattr(st.ms, "parse", lambda request, body, name=None: (_ for _ in ()).throw(
+        st.SourceError("a layout not sampled (simulated)")) if refuse["on"] and "division_code=0" in request.url
+        else real(request, body, name))
+    planned = dt.datetime(2026, 12, 14, 10, 30, tzinfo=UTC)  # 16:00 in India
+    run(store, mospi_server(), when=planned - 6 * HOUR, sources=["mospi"], settings=off)
+    run(store, mospi_server(), when=planned + 5 * MINUTE, sources=["mospi"], settings=off)  # 304: no November
+    refuse["on"] = True
+    refused = run(store, mospi_server(etag='W/"p1b"'), when=planned + 18 * HOUR, sources=["mospi"], settings=off)
+    assert refused.exit_code == 4
+    refuse["on"] = False
+    server = mospi_server(etag='W/"p2"', november=True)
+    run(store, server, when=planned + 24 * HOUR, sources=["mospi"], settings=off)
+    assert "If-None-Match" not in [h for u, h in server.requests if "division_code=0" in u][0]  # asked whole
+    (nov,) = [v for v in _vintages(store, "mospi", "cpi_2024_all_india_combined_general") if v["period"] == "2026-11"]
+    assert (nov["prior_seen"], nov["public_from_basis"], nov["public_from"]) == (
+        "2026-12-14T16:06:00", "first_seen", nov["first_seen"])  # the 304 at 16:05, before the refused answer
+    assert "2026-11" not in set(st.as_of(store, "cpi_2024_all_india_combined_general",
+                                         ist(2026, 12, 14, 20, 0))["period"])
+
+
+def _lagging_cpi(ready: dict):
+    """CPI answers whose October tables lack October until ``ready["on"]`` (the probe shows it from the start)."""
+    def cpi(url, headers):
+        if "division_code=0" in url:
+            if headers.get("If-None-Match") == 'W/"p"':
+                return FeedResponse(304, {}, b"")
+            rows = [fx.cpi24(2026, m, s, index="110.00", inflation="5.00") for m in ("October", "September")
+                    for s in ("Rural", "Urban", "Combined")]
+            return ok(fx.mospi_answer(rows, per=100), etag='W/"p"')
+        month = "October" if "month_code=10" in url else "September"
+        if month == "October" and not ready["on"]:
+            return ok(fx.NO_DATA, etag='W/"empty"')
+        return ok(fx.mospi_answer(cpi_month(month), per=100), etag=f'W/"{month}{ready["on"]}"')
+    return cpi
+
+
+def test_a_retried_request_is_asked_whole_and_keeps_the_time_of_its_last_good_read(tmp_path):
+    # October's CPI tables lag their headline: six reads, one a day, lack the month and the tables are given up;
+    # --retry-failed asks them again whole and they hold it: dated by that sighting, not by the release of 12 Nov
+    store, off, ready = tmp_path / "s", st.Settings(backfill=False), {"on": False}
+    server = mospi_server(getCPIData=_lagging_cpi(ready))
+    start = dt.datetime(2026, 11, 12, 10, 40, tzinfo=UTC)  # 16:10 in India, after the release at 16:00
+    for day in range(st.MAX_LAG_TRIES):
+        run(store, server, when=start + dt.timedelta(days=day), sources=["mospi"], settings=off)
+    src = _state(store)["sources"]["mospi"]
+    url = next(f["request"]["url"] for f in src["failed"] if "month_code=10&" in f["request"]["url"]
+               and "sector_code=1" in f["request"]["url"])  # the first table to hold the combined food index
+    assert src["validators"][url]["last_ok"] == "2026-11-17T10:48:00Z"  # its sixth read, without October
+    ready["on"] = True
+    sent = len(server.requests)
+    run(store, server, when=start + dt.timedelta(days=7), sources=["mospi"], settings=off, retry_failed=True)
+    assert "If-None-Match" not in [h for u, h in server.requests[sent:] if u == url][0]  # asked whole
+    (food,) = [v for v in _vintages(store, "mospi", "cpi_2024_all_india_combined_g01_1") if v["period"] == "2026-10"]
+    assert (food["prior_seen"], food["public_from_basis"], food["public_from"]) == (
+        "2026-11-17T16:18:00", "first_seen", food["first_seen"])  # that read, in India time
+    assert _state(store)["sources"]["mospi"]["failed"] == []
+
+
+def test_a_query_asked_again_from_page_1_keeps_the_time_of_page_1s_last_read(tmp_path):
+    # a release reaches October's tables between their pages 1 and 2: page 2 does not fit its query, so page 1 is
+    # asked again whole the next run; the row it then brings is dated by that sighting, not by the release
+    store, off = tmp_path / "s", st.Settings(backfill=False)
+    phase = {"probe": 'W/"a"', "page1": False, "page2": False}  # False: six rows; True: a fuel row added on top
+
+    def cpi(url, headers):
+        if "division_code=0" in url:
+            if headers.get("If-None-Match") == phase["probe"]:
+                return FeedResponse(304, {}, b"")
+            value = "110.05" if phase["probe"] == 'W/"a"' else "110.10"
+            return ok(cpi_answer(cpi_month("October", combined=value)), etag=phase["probe"])
+        month = _MONTHS[int(url.split("month_code=")[1].split("&")[0])]
+        page = int(url.split("page=")[1].split("&")[0])
+        rows = cpi_month(month)
+        if phase["page1" if page == 1 else "page2"] and "sector_code=3" in url:  # a group of the combined index
+            rows = [fx.cpi24(2026, month, "Combined", division="Housing, water, electricity, gas and other fuels",
+                             group="Electricity, gas and other fuels", code="04.5", index="101.10", inflation="1.20"),
+                    *rows]
+        return ok(fx.mospi_answer(rows[3 * (page - 1):3 * page], page=page, per=3, total=len(rows)),
+                  etag=f'W/"{month}{page}-{len(rows)}"')  # (a fake that never answers 304)
+    server = mospi_server(getCPIData=cpi)
+    start = dt.datetime(2026, 11, 13, 4, 0, tzinfo=UTC)  # 09:30 in India, the day after October's release
+    run(store, server, when=start, sources=["mospi"], settings=off)
+    phase.update(probe='W/"b"', page2=True)  # a revision changes the probe; the tables change between their pages
+    second = run(store, server, when=start + HOUR, sources=["mospi"], settings=off)
+    assert any("size changed" in a for a in second.sources[0].attention)
+    page1 = next(p["url"] for p in _state(store)["sources"]["mospi"]["pending"]
+                 if "month_code=10&" in p["url"] and "sector_code=3" in p["url"])
+    assert _state(store)["sources"]["mospi"]["validators"][page1] == {
+        "etag": "", "last_modified": "", "last_ok": "2026-11-13T05:10:20Z"}  # asked whole, its read of this run kept
+    phase["page1"] = True
+    sent = len(server.requests)
+    run(store, server, when=start + 2 * HOUR, sources=["mospi"], settings=off)
+    assert "If-None-Match" not in [h for u, h in server.requests[sent:] if u == page1][0]
+    (fuel,) = [v for v in _vintages(store, "mospi", "cpi_2024_all_india_combined_g04_5") if v["period"] == "2026-10"]
+    assert (fuel["prior_seen"], fuel["public_from_basis"], fuel["public_from"]) == (
+        "2026-11-13T10:40:20", "first_seen", fuel["first_seen"])  # page 1's read of the second run lacked it
+
+
 def test_a_refused_mospi_probe_is_asked_again_whole_and_brings_its_tables(tmp_path, monkeypatch):
     store, off = tmp_path / "s", st.Settings(backfill=False)
     server = mospi_server()
@@ -1146,6 +1272,94 @@ def test_an_ingest_orders_inputs_by_their_full_names_and_names_them_in_its_confl
     assert (sofr["value"], sofr["revision"]) == ("3.95", "r")  # the one saved later, by its folder
     conflict = next(c for c in report.conflicts if c.startswith("sofr 2026-11-16"))
     assert "2026-11-17/secured.json" in conflict and "2026-11-19/secured.json" in conflict
+
+
+H10_START = dt.datetime(2026, 11, 18, 1, 0, tzinfo=UTC)  # 20:00 New York time on Tue 17 Nov, 06:30 in India
+H10_ROWS = [("11-NOV-26", "94.1500"), ("12-NOV-26", "94.2000")]
+
+
+def _h10(*extra: tuple[str, str]) -> bytes:
+    return fx.h10_page(H10_ROWS + list(extra), release="Wednesday, November 18, 2026")
+
+
+def _h10_runs(store: Path, monkeypatch, pages: list[bytes], refused: set[int] = frozenset()) -> list[str]:
+    """One H.10 update per page, a day apart from ``H10_START``; the parser refuses the runs numbered in ``refused``
+    (a layout it does not know, simulated). The raw copy each run kept, in order."""
+    real = st.ms.parse
+    on = {"refuse": False}
+    monkeypatch.setattr(st.ms, "parse", lambda request, body, name=None: (_ for _ in ()).throw(
+        st.SourceError("a layout not sampled (simulated)")) if on["refuse"] else real(request, body, name))
+    server, raws = Server(("dat00_in", [ok(p) for p in pages])), []
+    for n in range(len(pages)):
+        on["refuse"] = n in refused
+        run(store, server, when=H10_START + dt.timedelta(days=n), sources=["h10"], settings=st.Settings(backfill=False))
+        raws.append(_rows(store / "fetches.csv")[-1]["raw"])
+    monkeypatch.setattr(st.ms, "parse", real)  # the package fixed
+    return raws
+
+
+def test_a_refused_answers_raw_copy_ingested_later_is_dated_as_its_update_would_have_dated_it(tmp_path,
+                                                                                              monkeypatch):
+    # data/README's repair: ingest the raw copy of a refused answer after an update of this package. H.10's 13 Nov
+    # is due at 02:45 on 18 Nov in India; the read at 06:31 lacked it, the read a day later held it but was refused
+    pages = [_h10(), _h10(("13-NOV-26", "94.2400"))]
+    _h10_runs(tmp_path / "control", monkeypatch, pages)  # the same reads, the second one parsed
+    for name in ("s", "t", "u"):
+        raws = _h10_runs(tmp_path / name, monkeypatch, pages, refused={1})
+    later = H10_START + dt.timedelta(days=1, hours=13)
+    copy = _write(tmp_path / "saved.htm", (tmp_path / "t" / raws[1]).read_bytes())  # the raw file copied elsewhere
+    other = pages[1].replace(b"</body>", b" </body>")  # the same page saved another way: other bytes
+    for name, inputs in (("s", [tmp_path / "s" / raws[1]]), ("t", [copy]), ("u", [("u.htm", other)])):
+        report = st.ingest(tmp_path / name, inputs, now=later)
+        assert (report.received, report.new) == ((name != "u") * 1, 1)
+    for name in ("s", "t"):
+        (v,) = [r for r in _vintages(tmp_path / name, "h10", "usdinr_h10_noon") if r["period"] == "2026-11-13"]
+        assert (v["first_seen"], v["prior_seen"], v["public_from"], v["public_from_basis"]) == (
+            "2026-11-19T06:31:00", "2026-11-18T06:31:00", "2026-11-19T06:31:00", "first_seen")
+        for table in ("observations/h10.csv", "series.csv", "derived/global_daily.csv"):
+            assert (tmp_path / name / table).read_bytes() == (tmp_path / "control" / table).read_bytes(), table
+    (v,) = [r for r in _vintages(tmp_path / "u", "h10", "usdinr_h10_noon") if r["period"] == "2026-11-13"]
+    assert (v["first_seen"], v["prior_seen"]) == ("2026-11-19T19:30:00", "")  # not the store's own: dated by the ingest
+
+
+def test_raw_copies_are_read_in_the_order_received_and_never_over_a_newer_vintage(tmp_path, monkeypatch):
+    # two answers in a row refused (13 Nov 94.2400, then 94.2500), their raw copies saved under names that sort the
+    # other way: the later one received wins; in a second store a parsed read then has 94.2600: nothing older taken
+    pages = [_h10(), _h10(("13-NOV-26", "94.2400")), _h10(("13-NOV-26", "94.2500")), _h10(("13-NOV-26", "94.2600"))]
+    first, second = tmp_path / "s", tmp_path / "t"
+    raws = _h10_runs(first, monkeypatch, pages[:3], refused={1, 2})
+    copies = [("b_first.htm", (first / raws[1]).read_bytes()), ("a_second.htm", (first / raws[2]).read_bytes())]
+    report = st.ingest(first, copies, now=H10_START + dt.timedelta(days=3))
+    (v,) = [r for r in _vintages(first, "h10", "usdinr_h10_noon") if r["period"] == "2026-11-13"]
+    assert (v["value"], v["first_seen"], v["prior_seen"]) == ("94.2500", "2026-11-20T06:31:00", "2026-11-18T06:31:00")
+    assert report.conflicts == ["usdinr_h10_noon 2026-11-13: 94.2400 in b_first.htm, 94.2500 in a_second.htm (the "
+                                "later kept)"]
+    _h10_runs(second, monkeypatch, pages, refused={1, 2})
+    again = st.ingest(second, copies, now=H10_START + dt.timedelta(days=4))
+    assert (again.received, again.new, again.changed, again.superseded) == (2, 0, 0, 2)
+    assert [v["value"] for v in _vintages(second, "h10", "usdinr_h10_noon") if v["period"] == "2026-11-13"] == [
+        "94.2600"]
+    assert "2 older than what the store holds or read since (not taken)" in again.summary()
+
+
+def test_a_raw_copy_is_not_taken_over_a_later_read_and_brings_a_change_back_at_its_own_time(tmp_path, monkeypatch):
+    # 13 Nov was 94.2400; a refused answer had 94.2500, the read after it 94.2400 again: the copy is older than that
+    # read. In a second store 94.2400 became 94.2500, then a refused answer (the last read) went back to 94.2400:
+    # the change back is taken as the update would have taken it, at that answer's time
+    first, second = tmp_path / "s", tmp_path / "t"
+    v1, v2 = ("13-NOV-26", "94.2400"), ("13-NOV-26", "94.2500")
+    raws = _h10_runs(first, monkeypatch, [_h10(v1), _h10(v2), _h10(v1)], refused={1})
+    report = st.ingest(first, [first / raws[1]], now=H10_START + dt.timedelta(days=3))
+    assert (report.superseded, report.changed) == (1, 0)
+    assert [v["value"] for v in _vintages(first, "h10", "usdinr_h10_noon") if v["period"] == "2026-11-13"] == [
+        "94.2400"]
+    raws = _h10_runs(second, monkeypatch, [_h10(v1), _h10(v2), _h10(v1)], refused={2})
+    report = st.ingest(second, [second / raws[2]], now=H10_START + dt.timedelta(days=3))
+    assert (report.older, report.changed) == (0, 1)
+    values = [(v["value"], v["first_seen"]) for v in _vintages(second, "h10", "usdinr_h10_noon")
+              if v["period"] == "2026-11-13"]
+    assert values == [("94.2400", "2026-11-18T06:31:00"), ("94.2500", "2026-11-19T06:31:00"),
+                      ("94.2400", "2026-11-20T06:31:00")]
 
 
 def test_a_clock_behind_the_store_is_refused_and_vintages_never_go_back_in_time(tmp_path):
