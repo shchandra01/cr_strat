@@ -13,7 +13,8 @@ from pathlib import Path
 
 import pandas as pd
 
-from cr_strat import macro_store, rbi_store
+from cr_strat import event_ledger, macro_store, rbi_store
+from cr_strat import returns as return_engine
 from cr_strat.amfi_debt_trades import build_mf_trades, mapping_report, to_price_trades
 from cr_strat.asset_swaps import asset_swap_table, fill_from_master
 from cr_strat.auctions import (
@@ -24,12 +25,15 @@ from cr_strat.auctions import (
     load_fimmda_sdl,
     load_handbook_auctions,
     normalise_switches,
+    read_auctions,
     read_release_tables,
+    read_switches,
     settlement_evidence,
 )
 from cr_strat.bonds import FixedRateBond, ZeroCouponBond
 from cr_strat.calendars import mumbai_settlement_calendar
 from cr_strat.conventions import CONVENTIONS, FINAL_PERIOD_RULES, as_date
+from cr_strat.costs import read_cost_table
 from cr_strat.cra_disclosures import disclosure_summary, load_cra_disclosures, unmapped_issuers
 from cr_strat.curvefit import (
     CONTROL_DRIVERS,
@@ -658,6 +662,165 @@ def _outstanding(args: argparse.Namespace) -> int:
     return 0
 
 
+def _clock_arg(value: str, flag: str) -> dt.time:
+    """``HH:MM`` as a time of day, with errors naming the flag."""
+    try:
+        return dt.datetime.strptime(value.strip(), "%H:%M").time()
+    except (ValueError, AttributeError):
+        raise ValueError(f"{flag}: {value!r} is not a time of day like 20:00") from None
+
+
+def _release_index_csv(directory: str) -> pd.DataFrame | None:
+    """The release index ``cr-strat rbi-releases`` writes beside its tables (``releases.csv``), typed; or None."""
+    path = Path(directory) / "releases.csv"
+    if not path.exists():
+        return None
+    frame = pd.read_csv(path, dtype=str, keep_default_na=False).replace({"": None})
+    frame["release_id"] = pd.to_numeric(frame["release_id"]).astype("Int64")
+    for col in ("release_date", "published"):
+        if col in frame:
+            frame[col] = pd.to_datetime(frame[col])
+    return frame
+
+
+def _event_ledger(args: argparse.Namespace) -> int:
+    """The S4 event ledger: events with their public times, supply by period, checks, metrics, windows."""
+    try:
+        for flag in ("auctions", "ledger", "store", "releases", "master", "switches", "snapshot", "mpc",
+                     "policy_rates", "macro_releases", "index_events", "macro_store", "panel", "residuals",
+                     "calendar_lines"):
+            value = getattr(args, flag)
+            if value and not Path(value).exists():
+                raise FileNotFoundError(f"--{flag.replace('_', '-')}: {value} not found")
+        for page in args.handbook:
+            if not Path(page).exists():
+                raise FileNotFoundError(f"--handbook: {page} not found")
+        if bool(args.auctions) != bool(args.ledger):
+            raise ValueError("--auctions and --ledger go together: the ledger built from that auction table")
+        settings = event_ledger.EventSettings(
+            announcement_rule=args.announcement_rule, result_rule=args.result_rule,
+            decision_time=_clock_arg(args.decision_time, "--decision-time"), period=args.period,
+            bid_cover=args.bid_cover, stock_dv01_basis=args.stock_dv01_basis)
+        start, end = _date_arg(args.start, "--start"), _date_arg(args.end, "--end")
+        macro_from, macro_to = _date_arg(args.macro_from, "--macro-from"), _date_arg(args.macro_to, "--macro-to")
+        calendar = mumbai_settlement_calendar()
+        auctions = read_auctions(args.auctions) if args.auctions else None
+        ledger = read_ledger(args.ledger) if args.ledger else None
+        sources = [event_ledger.read_store_tables(args.store)] if args.store else []
+        if args.releases:  # joined to the store's tables, the store's copy of a release both hold kept
+            extra = read_release_tables(args.releases)
+            index = _release_index_csv(args.releases)
+            if index is not None:
+                extra["releases"] = index
+            sources.append(extra)
+        tables = event_ledger.merge_tables(*sources)
+        handbook = load_handbook_auctions(args.handbook) if args.handbook else None
+        master = read_master(args.master) if args.master else None
+        switches = read_switches(args.switches) if args.switches else None
+        snapshot = read_snapshots(args.snapshot) if args.snapshot else None
+        meetings = None if args.no_mpc else load_mpc_calendar(args.mpc or DEFAULT_MPC_CSV)
+        if meetings is not None and args.mpc:  # the file's own decision times, which load_mpc_calendar leaves out
+            meetings = event_ledger.attach_decision_times(meetings, args.mpc)
+        policy = _read_csv_text(args.policy_rates) if args.policy_rates else None
+        index_events = None
+        if args.index_events:
+            index_events = args.index_events
+        elif args.macro_store:
+            index_events = macro_store.read_table(args.macro_store, "index_events")
+        macro_range = (macro_from, macro_to) if macro_from or macro_to else None
+        calendar_lines = event_ledger.read_calendar_lines(args.calendar_lines) if args.calendar_lines else None
+        every = event_ledger.collect_events(
+            auctions=auctions, ledger=ledger, tables=tables, handbook=handbook, master=master, switches=switches,
+            meetings=meetings, policy=policy, macro_releases=args.macro_releases, macro_range=macro_range,
+            macro=args.macro or macro_range is not None, index_events=index_events, calendar_lines=calendar_lines,
+            calendar=calendar, settings=settings)
+        # --start and --end choose the events written; the checks, the yields behind the stock's DV01, the trailing
+        # DV01 of forward supply and the overlaps read every event of the inputs, so the range's edges see as much.
+        in_range = pd.Series(True, index=every.index)
+        if start is not None:
+            in_range &= every["event_date"] >= pd.Timestamp(start)
+        if end is not None:
+            in_range &= every["event_date"] <= pd.Timestamp(end)
+        events = every[in_range].reset_index(drop=True)
+        if not len(events):
+            print("no events in the inputs given" if not len(every) else
+                  f"no events dated {args.start or 'any time'} to {args.end or 'any time'} ({len(every)} outside)")
+            return 1
+        supply = event_ledger.supply_table(every, ledger=ledger, snapshot=snapshot, settings=settings, start=start,
+                                           end=end)
+        metrics = event_ledger.auction_metrics(
+            events, panel=_read_csv_text(args.panel) if args.panel and "yield_pct" in args.panel_columns.split(",")
+            else None, residuals=_read_csv_text(args.residuals) if args.residuals else None, calendar=calendar,
+            settings=settings)
+        if args.forward_dates:
+            dates = [_date_arg(d, "--forward-dates") for d in args.forward_dates.split(",") if d.strip()]
+        else:  # each Friday from the first calendar's release to the last planned week, within --start and --end
+            lines = every[every["kind"].isin(event_ledger.CALENDAR_KINDS)]
+            dates = list(pd.date_range(lines["announcement_public_from"].min().normalize(),
+                                       lines["period_end"].max(), freq="W-FRI").date) if len(lines) else []
+            dates = [d for d in dates if (start is None or d >= start) and (end is None or d <= end)]
+        forward = event_ledger.forward_supply(every, dates, horizon_weeks=args.horizon_weeks,
+                                              coverage_table=coverage(ledger) if ledger is not None else None,
+                                              settings=settings)
+        windows = event_ledger.event_windows(every, calendar=calendar, pre=args.pre, post=args.post,
+                                             anchor=args.anchor, project_calendar=args.project_calendar,
+                                             settings=settings)
+        overlap = event_ledger.overlaps(windows)
+        exclude = tuple(k for k in args.exclude_kinds.split(",") if k)
+        unknown = sorted(set(exclude) - set(event_ledger.EVENT_KINDS))
+        if unknown:
+            raise ValueError(f"--exclude-kinds: {unknown} are not event kinds ({', '.join(event_ledger.EVENT_KINDS)})")
+        radius = min(3, args.pre, args.post) if args.radius is None else args.radius
+        isolated = event_ledger.isolate(windows, overlap, exclude_kinds=exclude, radius=radius)
+        ids = set(events["event_id"])
+        skipped = {k: sum(1 for e in v if e in ids) for k, v in windows.attrs["skipped_ids"].items()}
+        windows, overlap, isolated = (f[f["event_id"].isin(ids)].reset_index(drop=True)
+                                      for f in (windows, overlap, isolated))
+        paths = None
+        if args.panel:
+            paths = event_ledger.attach_panel(
+                windows, _read_csv_text(args.panel).replace({"": None}), columns=args.panel_columns.split(","),
+                key=args.panel_key or None, window_key=args.window_key, tolerance=args.tolerance,
+                panel_dates=args.panel_dates, calendar=calendar, project_calendar=args.project_calendar)
+        gaps = event_ledger.input_gaps(events, ledger=ledger, tables=tables, meetings=meetings,
+                                       index_events_given=index_events is not None)
+    except (ValueError, TypeError, OSError, KeyError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    out = Path(args.out_dir)
+    times = (*event_ledger.TIME_FIELDS, "as_of", "planned_public_from", "announced_public_from",
+             "realised_public_from", "anchor_public_from")
+    files = {"events.csv": events, f"supply_{'weekly' if args.period.endswith('week') else 'monthly'}.csv": supply,
+             "auction_metrics.csv": metrics, "forward_supply.csv": forward, "windows.csv": windows,
+             "overlaps.csv": overlap, "isolated.csv": isolated, "gaps.csv": gaps}
+    if ledger is not None:  # identities of the whole inputs, whatever --start and --end
+        files["supply_monthly_check.csv"] = event_ledger.check_supply(every, ledger)
+        files["ledger_join_check.csv"] = event_ledger.check_ledger_join(every, ledger)
+    if paths is not None:
+        files["event_paths.csv"] = paths
+    for name, frame in files.items():
+        path = (event_ledger.write_events(frame, out / name) if name == "events.csv"
+                else event_ledger.write_table(frame, out / name, times=times))
+        print(f"wrote {len(frame):>7} rows  {path}")
+    counts = events["kind"].value_counts()
+    print("events: " + ", ".join(f"{k} {counts[k]}" for k in event_ledger.EVENT_KINDS if k in counts))
+    if ledger is not None:
+        e1, e2 = files["supply_monthly_check.csv"], files["ledger_join_check.csv"]
+        print(f"supply check (E1, all inputs): {int((e1['status'] != 'ok').sum())} of {len(e1)} cells differ; "
+              f"ledger join (E2): {int((e2['status'] != 'ok').sum())} of {len(e2)} auction ids not one to one")
+    print(f"windows: {windows['event_id'].nunique() if len(windows) else 0} events; skipped "
+          f"{skipped.get('no_anchor', 0)} without the anchor's time, {skipped.get('beyond_calendar', 0)} beyond the "
+          "calendar's years (--project-calendar to project them)")
+    if paths is not None:
+        matched = paths["panel_match"].value_counts()
+        print("panel: " + ", ".join(f"{k} {matched[k]}" for k in ("exact", "nearest", "missing", "no_key")
+                                    if k in matched))
+    notes = out / "notes.txt"
+    notes.write_text("".join(f"{r.source}: {r.detail}\n" for r in gaps.itertuples()), encoding="utf-8")
+    print(f"wrote {len(gaps):>7} lines {notes} (what the inputs lack)")
+    return 0
+
+
 def _parse_ratings(args: argparse.Namespace) -> int:
     df = pd.read_csv(args.input, dtype=str)
     keep = [c for c in (args.keep or "").split(",") if c]
@@ -774,6 +937,15 @@ def _curve_fit(args: argparse.Namespace) -> int:
         pairs = None
         if args.pair:
             pairs = bond_pairs(residuals, [tuple(text.split(",")) for text in args.pair])
+        nss_table = None
+        if args.nss_params:
+            if args.method != "nss":
+                raise ValueError("--nss-params writes NSS parameters: fit with --method nss (a spline has none)")
+            mark_day = _date_arg(args.trade_date, "--trade-date") if args.trade_date else \
+                mumbai_settlement_calendar().add_business_days(settlement, -1)
+            row = return_engine.nss_params_row(result.curve, mark_day, name=args.curve_name,
+                                               public_from=args.public_from)
+            nss_table = return_engine.append_nss_params(args.nss_params, row)
         drivers = controlled = None
         if args.master or args.ledger:
             ledger = read_ledger(args.ledger) if args.ledger else None
@@ -806,6 +978,10 @@ def _curve_fit(args: argparse.Namespace) -> int:
         _write(controlled, out / "controls.csv")
     if appended is not None:
         _write(appended, Path(args.append_history))
+    if nss_table is not None:
+        _write(nss_table, Path(args.nss_params))
+        if not args.trade_date:
+            print("note: the NSS row's date is the business day before --settlement (T+1); give --trade-date if not")
     diagnostics = {"primary": result.diagnostics, "check": check.diagnostics if check is not None else None}
     path = out / "diagnostics.json"
     path.write_text(json.dumps(diagnostics, indent=2, allow_nan=False) + "\n")
@@ -1066,6 +1242,109 @@ def _repo_carry(args: argparse.Namespace) -> int:
     return 0 if len(failed) < len(result) else 1
 
 
+def _ois_curves_from_quotes(path: str, calendar) -> dict:
+    """One OIS curve per date of a long quotes file (``date``, ``tenor``, ``rate_pct``, ``overnight_pct``, optional
+    ``public_from``; all-blank rows dropped), each bootstrapped on its date from that day's overnight fixing."""
+    table = _read_csv_text(path)
+    table.columns = [str(c).strip().lower() for c in table.columns]
+    missing = [c for c in ("date", "tenor", "rate_pct", "overnight_pct") if c not in table]
+    if missing:
+        raise ValueError(f"the OIS quotes file {path} lacks {missing} (columns: date, tenor, rate_pct, overnight_pct, "
+                         "optional public_from)")
+    table = table[~table.apply(lambda row: all(not str(v).strip() for v in row), axis=1)] if len(table) else table
+    out = {}
+    for text, group in table.groupby("date", sort=True):
+        day = _date_arg(text, f"the OIS quotes file's date {text!r}")
+        nights = {str(v).strip() for v in group["overnight_pct"]}
+        if len(nights) != 1:
+            raise ValueError(f"the OIS quotes file gives {day} several overnight fixings: {sorted(nights)}")
+        try:
+            overnight = float(nights.pop())
+        except ValueError:
+            raise ValueError(f"the OIS quotes file's overnight_pct for {day} is not a number") from None
+        curve = bootstrap_ois(group[["tenor", "rate_pct"]], day, overnight, calendar=calendar,
+                              source=f"{Path(path).name} {day}")
+        public = None
+        if "public_from" in group and str(group["public_from"].iloc[0]).strip():
+            public = _time_arg(str(group["public_from"].iloc[0]), f"the OIS quotes file's public_from for {day}")
+        out[day] = return_engine.CurveEntry(curve, public)
+    return out
+
+
+def _returns(args: argparse.Namespace) -> int:
+    """Daily NAV, positions, P&L attribution and performance of a book of trades (the return engine)."""
+    try:
+        for flag in ("trades", "swaps", "flows", "marks", "nss_params", "ois_quotes", "fixings", "haircuts", "costs",
+                     "master", "liquidity", "residual_history"):
+            value = getattr(args, flag)
+            if value and not Path(value).exists():
+                raise FileNotFoundError(f"--{flag.replace('_', '-')}: {value} not found")
+        start, end = _date_arg(args.start, "--start"), _date_arg(args.end, "--end")
+        calendar = mumbai_settlement_calendar()
+        calendar = calendar.lenient() if args.project_calendar else calendar
+        funding_tables = {}
+        if args.store:
+            daily = rbi_store.read_table(args.store, "money_market_daily")
+            for source in sorted({args.funding_source, args.excess_source, "triparty"}):
+                try:
+                    funding_tables[source] = funding_rates(daily, source)
+                except ValueError as exc:
+                    print(f"note: no {source} rates from the store ({exc})")
+        fixings, times = ({}, None)
+        if args.fixings:
+            series, times = _read_fixings(args.fixings)
+            fixings = {d: float(v) for d, v in series.items()}
+        master = read_master(args.master) if args.master else None
+        market = return_engine.MarketData(
+            marks=_read_csv_text(args.marks),
+            curves=return_engine.read_nss_params(args.nss_params, calendar=calendar) if args.nss_params else {},
+            ois_curves=_ois_curves_from_quotes(args.ois_quotes, calendar) if args.ois_quotes else {},
+            fixings=fixings, fixing_times=times, funding=funding_tables,
+            haircuts=read_haircuts(args.haircuts) if args.haircuts else None,
+            liquidity=_read_csv_text(args.liquidity) if args.liquidity else None, master=master,
+            residual_history=_read_csv_text(args.residual_history) if args.residual_history else None)
+        policy = return_engine.FundingPolicy(
+            segment=args.funding_source, excess_segment=args.excess_source, spread_bp=args.funding_spread_bp,
+            sizing=args.sizing, margin_pct=args.margin_pct, idle_cash_rate_pct=args.idle_rate_pct,
+            on_shortfall="overdraft" if args.overdraft_rate_pct is not None else "raise",
+            overdraft_rate_pct=args.overdraft_rate_pct, projection="last" if args.project_funding else None,
+            rate_basis=args.rate_basis)
+        reference = dict(return_engine.DEFAULT_REFERENCE)
+        for item in args.reference or []:
+            kind, sep, curve_name = item.partition("=")
+            if not sep or not kind.strip() or not curve_name.strip():
+                raise ValueError(f"--reference {item!r}: give KIND=CURVE, e.g. sdl=sdl")
+            reference[kind.strip().lower()] = curve_name.strip()
+        unused = sorted(set(market.curves) - set(reference.values()))
+        settings = return_engine.EngineSettings(
+            access=return_engine.access_policy(args.access), project_calendar=args.project_calendar,
+            allow_t0=args.allow_t0, funding=policy,
+            attribution=return_engine.AttributionSettings(factor_basis=args.factor_basis, basis=args.basis,
+                                                          reference=tuple(sorted(reference.items()))),
+            costs=read_cost_table(overrides=args.costs) if args.costs else None)
+        result = return_engine.run_book(args.trades or None, args.swaps or None, args.flows or None, market=market,
+                                        settings=settings, start=start, end=end)
+        written = return_engine.write_result(result, Path(args.out_dir))
+    except (ValueError, TypeError, OSError, KeyError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    for path in written:
+        print(f"wrote {path}")
+    for name in unused:
+        print(f"note: the curve {name!r} in --nss-params is the reference of no kind (pass --reference KIND={name})")
+    breaches = result.checks[(result.checks["check"] == "identity") & (result.checks["status"] != "ok")]
+    flagged = result.checks[result.checks["status"] == "flag"]
+    for rec in result.performance.to_dict("records"):
+        print(f"book {rec['book']}: {rec['business_days']} day(s), TWR {rec['twr']:.6%}, P&L Rs {rec['pnl']:,.2f}, "
+              f"costs Rs {rec['costs']:,.2f}")
+    print(f"identity breaches: {len(breaches)}; flags: {len(flagged)} "
+          f"({', '.join(sorted(set(flagged['check']))) or 'none'})")
+    for note in result.notes:
+        print(f"note: {note}")
+    _calendar_warning(bool(result.nav["calendar_projected"].any()) if len(result.nav) else False)
+    return 0 if len(result.positions) else 1  # 1: nothing could be valued
+
+
 def _add_peer_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--match-on", default="instrument_class,rating_bucket,tenor_bucket",
                    help="peer-group columns; add 'sector' if the security master has it")
@@ -1232,6 +1511,13 @@ def main(argv: list[str] | None = None) -> int:
                    help="ISINs of a DV01-neutral pair (repeatable), e.g. the 10-year against a 40-year; pairs.csv")
     p.add_argument("--ledger", help="issuance ledger CSV (cr-strat auctions): reissues and outstanding stock as of the "
                                     "settlement date, joined to each residual in drivers.csv")
+    p.add_argument("--nss-params", metavar="CSV",
+                   help="add (or replace) this day's NSS parameters in this table, the layout cr-strat returns "
+                        "--nss-params reads (date, settlement_date, beta0..tau2, t_min, t_max, curve, public_from)")
+    p.add_argument("--trade-date", help="the prices' trade date for --nss-params (default: the business day before "
+                                        "--settlement)")
+    p.add_argument("--curve-name", default="gsec", help="the curve's name in --nss-params (gsec; sdl for an SDL curve)")
+    p.add_argument("--public-from", help="when the fit was public, for --nss-params (blank: the marks' default time)")
     p.add_argument("--control", metavar="DRIVERS",
                    help="regress the day's --residual on these drivers of drivers.csv, comma-separated, e.g. "
                         f"{','.join(CONTROL_DRIVERS)} (UNVERIFIED form): resid_ctrl_bp and controls.csv")
@@ -1320,6 +1606,54 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--no-pull-to-par", action="store_true", help="leave the pull to par out of the carry")
     p.add_argument("--out", required=True)
     p.set_defaults(func=_repo_carry)
+
+    p = sub.add_parser("returns", help="daily NAV, positions, P&L attribution and performance of a book of bond and "
+                                       "OIS trades, funded in repo at an RBI store's rates (docs/analytics.md)")
+    p.add_argument("--trades", help="bond trades CSV (trade_id, book, isin, side, face, trade_date; price or "
+                                    "yield_pct, kind, coupon_pct, maturity_date, settlement_date, venue, mid_price, "
+                                    "liquidity, broker, special_repo_pct ...: returns.TRADE_COLUMNS)")
+    p.add_argument("--swaps", help="OIS trades CSV (trade_id, book, trade_date, months, notional, pay_fixed, "
+                                   "fixed_rate_pct, mid_rate_pct, effective, purpose)")
+    p.add_argument("--flows", help="capital flows CSV (date, book, amount in rupees; start of the day)")
+    p.add_argument("--marks", required=True,
+                   help="marks CSV (date, isin, clean_price or yield_pct for the standard settlement, source traded "
+                        "or valuation, vwap, last_price, settlement_date, public_from): licensed prices, never shipped")
+    p.add_argument("--nss-params", help="NSS curves CSV (date, beta0..beta3, tau1, tau2, t_min, t_max, "
+                                        "settlement_date, curve, public_from)")
+    p.add_argument("--ois-quotes", help="OIS quotes CSV (date, tenor, rate_pct, overnight_pct, public_from), "
+                                        "bootstrapped per date")
+    p.add_argument("--fixings", help="overnight MIBOR CSV (date, rate_pct, optional public_from)")
+    p.add_argument("--store", help="RBI store whose derived/money_market_daily.csv gives the funding rates")
+    p.add_argument("--haircuts", help="haircut table kept by you (funding.read_haircuts)")
+    p.add_argument("--costs", help="your cost table, overriding the defaults (costs.COST_COLUMNS)")
+    p.add_argument("--master", help="security master CSV filling kind, coupon and dates by ISIN")
+    p.add_argument("--liquidity", help="CCIL liquidity classes kept by you (effective_date, isin, liquidity)")
+    p.add_argument("--residual-history", help="curvefit residual history (for model marks)")
+    p.add_argument("--access", required=True, choices=sorted(return_engine.ACCESS_PRESETS),
+                   help="the fund's access preset: decides repo, shorts and OIS (no default)")
+    p.add_argument("--start", help="first day, YYYY-MM-DD (default: the first trade or flow)")
+    p.add_argument("--end", required=True, help="last day, YYYY-MM-DD")
+    p.add_argument("--funding-source", choices=FUNDING_SOURCES, default="triparty")
+    p.add_argument("--excess-source", choices=FUNDING_SOURCES, default="market_repo")
+    p.add_argument("--funding-spread-bp", type=float, default=0.0)
+    p.add_argument("--sizing", choices=return_engine.SIZINGS, default="cash_need")
+    p.add_argument("--margin-pct", type=float, help="TREPS initial margin, percent (default: the cost table's)")
+    p.add_argument("--idle-rate-pct", type=float, default=0.0, help="interest on idle cash (UNVERIFIED default 0)")
+    p.add_argument("--overdraft-rate-pct", type=float, help="fund a shortfall at this rate instead of refusing it")
+    p.add_argument("--project-funding", action="store_true", help="hold the last funding rate past the table's end")
+    p.add_argument("--project-calendar", action="store_true",
+                   help="treat weekdays of years without a holiday list (2027 on) as business days")
+    p.add_argument("--allow-t0", action="store_true", help="accept T+0 G-sec, SDL and T-bill trades")
+    p.add_argument("--factor-basis", choices=return_engine.FACTOR_BASES, default="legendre3")
+    p.add_argument("--basis", choices=return_engine.PNL_BASES, default="actual")
+    p.add_argument("--reference", action="append", metavar="KIND=CURVE",
+                   help="attribute a kind against a curve of --nss-params by its name (repeatable; e.g. sdl=sdl for "
+                        "S6; default every G-sec, bill, STRIPS and SDL against gsec, CP and CD against ois)")
+    p.add_argument("--rate-basis", choices=return_engine.RATE_BASES, default="deal_day",
+                   help="repo interest: the deal day's rate for every night (default) or each calendar day's latest "
+                        "dealing rate, as repo-carry")
+    p.add_argument("--out-dir", required=True)
+    p.set_defaults(func=_returns)
 
     p = sub.add_parser("rbi-releases", help="auctions, liquidity operations, money-market rates and calendars from "
                                             "saved RBI pages and RSS feeds")
@@ -1469,6 +1803,62 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--by-bucket", action="store_true", help="also write totals by kind and tenor bucket")
     p.add_argument("--out", required=True)
     p.set_defaults(func=_outstanding)
+
+    p = sub.add_parser("event-ledger", help="the S4 event ledger: auctions, switches, OMOs, liquidity operations, "
+                                            "calendars, MPC and macro releases with their public times; DV01 "
+                                            "supply by week and bucket; event windows (docs/analytics.md)")
+    p.add_argument("--auctions", help="auctions.csv written by the auctions command")
+    p.add_argument("--ledger", help="ledger.csv written by the same auctions run")
+    p.add_argument("--store", help="RBI store directory (release tables, derived tables, releases, gaps)")
+    p.add_argument("--releases", help="directory of CSVs written by rbi-releases (result and announcement tables)")
+    p.add_argument("--handbook", nargs="*", default=[], help="saved RBI Handbook Table 221 pages (bids, devolvement)")
+    p.add_argument("--master", help="security master CSV (ISINs of auctions known only from an announcement)")
+    p.add_argument("--switches", help="switches.csv written by the auctions command (destination cut-offs)")
+    p.add_argument("--snapshot", help="RBI GoI-outstanding snapshot(s) for the stock (CSV or saved page)")
+    p.add_argument("--calendar-lines", help="issuance calendar lines kept by you, the T-bill calendar's above all "
+                                            "(event_ledger.CALENDAR_LINE_COLUMNS), added to the store's")
+    p.add_argument("--mpc", help="MPC meetings file (policy_path's layout, plus an optional decision_time column, "
+                                 "HH:MM; default: the shipped FY2026-27 file)")
+    p.add_argument("--no-mpc", action="store_true", help="leave MPC meetings out")
+    p.add_argument("--policy-rates", help="policy-rate table (effective_date, repo_pct, ...) for the MPC rows")
+    p.add_argument("--macro", action="store_true", help="add MoSPI's releases from the shipped release table")
+    p.add_argument("--macro-releases", help="your release-date table (mospi's layout), over the shipped one")
+    p.add_argument("--macro-from", help="with --macro-to: every MoSPI release in the span, by rule beyond the table")
+    p.add_argument("--macro-to", help="last day for --macro-from")
+    p.add_argument("--index-events", help="index-event table kept by you (global_sources' layout)")
+    p.add_argument("--macro-store", help="macro store whose derived index_events table to use")
+    p.add_argument("--panel", help="a later (date, isin) price panel for the event paths: marks, price_panel rows, "
+                                   "or curvefit's residual history (licensed prices: never shipped)")
+    p.add_argument("--panel-columns", default="yield_pct", help="comma-separated panel columns to attach")
+    p.add_argument("--panel-key", default="isin", help="the panel's key column ('' for one row per date)")
+    p.add_argument("--window-key", default="isin", choices=["isin", "key"], help="the window column it matches")
+    p.add_argument("--panel-dates", choices=event_ledger.PANEL_DATES, default="trade",
+                   help="settlement: the panel is dated by settlement (curvefit's residual history)")
+    p.add_argument("--tolerance", type=int, default=0, help="business days a nearest panel row may stand in")
+    p.add_argument("--residuals", help="curvefit residual history for the auctions' pre and recovery moves")
+    p.add_argument("--period", choices=event_ledger.PERIODS, default="auction_week")
+    p.add_argument("--anchor", choices=event_ledger.ANCHORS, default="result")
+    p.add_argument("--pre", type=int, default=5, help="business days before day 0")
+    p.add_argument("--post", type=int, default=10, help="business days after day 0")
+    p.add_argument("--radius", type=int, help="business days within which another event's day 0 breaks an event's "
+                                              "isolation (default 3, or less to fit --pre and --post)")
+    p.add_argument("--exclude-kinds", default="vrr,vrrr,macro_release,redemption",
+                   help="kinds that do not break an event's isolation (comma-separated)")
+    p.add_argument("--announcement-rule", choices=event_ledger.ANNOUNCEMENT_RULES, default="conservative")
+    p.add_argument("--result-rule", choices=event_ledger.RESULT_RULES, default="observed_or_end_of_day")
+    p.add_argument("--decision-time", default="20:00", help="HH:MM, India time (UNVERIFIED default 20:00)")
+    p.add_argument("--bid-cover", choices=event_ledger.BID_COVER_BASES, default="competitive")
+    p.add_argument("--stock-dv01-basis", choices=event_ledger.STOCK_DV01_BASES, default="last_cutoff")
+    p.add_argument("--forward-dates", help="comma-separated dates for forward_supply (default: each Friday of "
+                                           "the calendars' span)")
+    p.add_argument("--horizon-weeks", type=int, default=4)
+    p.add_argument("--start", help="first event date written, YYYY-MM-DD (the checks, the stock's yields, forward "
+                                   "supply's trailing DV01 and the overlaps still read every event)")
+    p.add_argument("--end", help="last event date written, YYYY-MM-DD")
+    p.add_argument("--project-calendar", action="store_true",
+                   help="windows past 2026: weekdays as business days (no holiday list yet), flagged")
+    p.add_argument("--out-dir", required=True)
+    p.set_defaults(func=_event_ledger)
 
     p = sub.add_parser("parse-ratings", help="split and parse rating strings in a CSV column, for auditing a source")
     p.add_argument("input")

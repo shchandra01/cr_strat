@@ -631,8 +631,36 @@ caps and the carry of a bond or asset swap, long or short, in
 [`funding.py`](../src/cr_strat/funding.py), `cr-strat repo-carry`; all
 described in [`analytics.md`](analytics.md); they wait for FBIL's MIBOR and
 MIBOR-OIS, longer OIS quotes and the price panel); a return engine with
-roll-down and costs (carry, funding and haircuts are in `funding.py`); S2 on
-the existing trade and price-panel code; the event ledger for S4; the state
+roll-down and costs (built ahead of licensed marks and tested on synthetic
+curves only: bond and OIS books held from settlement with forwards before it,
+marks used only from when they were public with stale and model fall-backs,
+overnight TREPS and market repo funding at the RBI store's rates within the
+user's haircuts, CCIL's caps and the TREPS margin, costs from a dated table of
+bid-offer, CCIL charges, GST and stamp duty with each rule's status, access
+presets for the fund's legal form, a back-test loop deciding at 20:00 on a
+snapshot of what was public then (marks, curves, funding rates and fixings,
+and through its accessors the event ledger, the auction table, the RBI
+store's tables, macro series, the MPC calendar, the residual history and the
+security master's fixed terms, each cut at its own time), and each day's P&L
+split into carry, roll-down, curve factors,
+rich/cheap, convexity, trading, costs, funding and OIS lines that sum to the
+NAV change, in [`returns.py`](../src/cr_strat/returns.py) and
+[`costs.py`](../src/cr_strat/costs.py), `cr-strat returns`, described in
+[`analytics.md`](analytics.md); it values only what `bonds` prices, so
+corporate bonds wait for a pricer; it waits for licensed marks, MIBOR and OIS
+quotes); S2 on
+the existing trade and price-panel code (the return engine covers its CP and
+CD); the event ledger for S4 (built on the
+free auction files and the RBI store, tested on synthetic data: every auction,
+switch, buyback, redemption, open market and liquidity operation, calendar
+line, MPC meeting and macro release with the time from which it was public and
+whether that time is a print or a rule, DV01 supply by auction week and tenor
+bucket against the stock, auction metrics, forward supply against what came,
+and business-day event windows with overlaps, in
+[`event_ledger.py`](../src/cr_strat/event_ledger.py), `cr-strat event-ledger`,
+described in [`analytics.md`](analytics.md); the price responses around events
+wait for the price panel, and trading by participant category, CCIL's licensed
+data, is not built); the state
 panel for S6; implied policy paths for S7 (built on synthetic quotes: the MPC
 dates of FY2026-27 as package data with the day each became public, a step
 model of overnight MIBOR and the back-out of the level after each meeting

@@ -75,6 +75,7 @@ cr-strat event-prices --events data/out/rating_events.csv --panel data/out/price
 cr-strat bond-price --coupon 6.94 --maturity 2036-05-11 --settlement 2026-11-16 --price 97.43
 cr-strat curve-fit --prices data/raw/prices_20261116.csv --master data/out/sovereign_master.csv \
     --settlement 2026-11-16 --out-dir data/out/curve_20261116   # needs licensed traded prices (docs/analytics.md)
+cr-strat curve-fit ... --nss-params data/out/nss_params.csv --public-from 2026-11-13T19:00   # the table returns reads
 cr-strat ois-curve --quotes data/raw/ois_20261119.csv --trade-date 2026-11-19 --overnight 5.60 \
     --project-calendar --out-dir data/out/ois_20261119          # OIS quotes are licensed (FBIL): docs/analytics.md
 cr-strat asset-swaps --quotes data/raw/ois_20261119.csv --trade-date 2026-11-19 --overnight 5.60 \
@@ -85,6 +86,10 @@ cr-strat repo-carry --store data/rbi_store --bonds data/raw/positions.csv --hair
 cr-strat policy-path --quotes data/raw/ois_20261119.csv --trade-date 2026-11-19 \
     --policy-rates data/raw/policy_rates.csv --store data/rbi_store --project --project-calendar \
     --out-dir data/out/policy_20261119
+cr-strat returns --trades data/raw/trades.csv --flows data/raw/flows.csv --marks data/raw/marks.csv \
+    --nss-params data/out/nss_params.csv --store data/rbi_store --haircuts data/raw/haircuts.csv \
+    --access nbfc_non_pd --end 2026-12-14 --project-funding --out-dir data/out/returns  # marks are licensed
+    # --reference sdl=sdl: SDLs against an SDL curve of --nss-params; --rate-basis calendar_day: repo-carry's basis
 
 cr-strat rbi-releases data/raw/rbi/releases/*.html data/raw/rbi/feeds/*.xml --out-dir data/out/rbi
 cr-strat rbi-store-poll --store data/rbi_store            # one request at most; run it from cron (data/README.md)
@@ -100,6 +105,10 @@ cr-strat auctions --fimmda-gsec data/raw/fimmda/Gsec_Auction_data_*.xlsx --fimmd
     --snapshots data/out/goi_outstanding.csv --out-dir data/out/ledger
 cr-strat outstanding --ledger data/out/ledger/ledger.csv --date 2024-03-31 \
     --snapshot data/out/goi_outstanding.csv --out data/out/outstanding_20240331.csv
+cr-strat event-ledger --auctions data/out/ledger/auctions.csv --ledger data/out/ledger/ledger.csv \
+    --store data/rbi_store --switches data/out/ledger/switches.csv --snapshot data/out/goi_outstanding.csv \
+    --master data/out/sovereign_master.csv --macro --out-dir data/out/events   # S4: docs/analytics.md
+    # --calendar-lines data/raw/tbill_calendar_lines.csv: the T-bill calendar's weekly lines, typed in
 ```
 
 `event_prices.csv` and `event_ownership.csv` share `event_id`; joining them gives
@@ -121,10 +130,12 @@ the pressure variable and the price response for each event.
 | `conventions` | Day counts (30E/360 for G-secs and SDLs, 30/360 US, Act/365F, Act/Act ICMA), yield-basis conversions, and each instrument type's conventions with their sources |
 | `calendars` | Mumbai settlement calendar from the holiday list shipped in the package (`src/cr_strat/data/`): business days, date rolls, T+n settlement dates from an instrument's conventions; refuses years not declared complete |
 | `bonds` | G-sec, SDL, STRIPS, T-bill, CMB, CP and CD pricing: coupon schedules, accrued interest, price and yield, duration, DV01, convexity |
-| `curvefit` | Zero curves fitted to one day's G-sec and T-bill prices or yields (Nelson-Siegel-Svensson by multi-start Levenberg-Marquardt; a penalised B-spline of the forward curve as cross-check), every bond priced through `bonds`; rich/cheap residuals in bp and price, in the fit and out of sample (each bond against the curve refitted without it), with each bond's leverage; z-scores against a daily residual history it keeps; each residual's free drivers (coupon, age, FAR, reissues, stock as of the day) with an optional regression on them; butterflies, DV01-neutral pairs, par-curve spreads; a model-risk flag where the two curves refitted without a bond differ at its maturity (on a day with suspect bonds, also when fitted without them); `cr-strat curve-fit` for a generic price file ([`docs/analytics.md`](docs/analytics.md)) |
+| `curvefit` | Zero curves fitted to one day's G-sec and T-bill prices or yields (Nelson-Siegel-Svensson by multi-start Levenberg-Marquardt; a penalised B-spline of the forward curve as cross-check), every bond priced through `bonds`; rich/cheap residuals in bp and price, in the fit and out of sample (each bond against the curve refitted without it), with each bond's leverage; z-scores against a daily residual history it keeps; each residual's free drivers (coupon, age, FAR, reissues, stock as of the day) with an optional regression on them; butterflies, DV01-neutral pairs, par-curve spreads; a model-risk flag where the two curves refitted without a bond differ at its maturity (on a day with suspect bonds, also when fitted without them); `cr-strat curve-fit` for a generic price file, with `--nss-params` keeping the day's NSS parameters in the table `cr-strat returns` reads ([`docs/analytics.md`](docs/analytics.md)) |
 | `ois` | MIBOR-OIS (and SORR-OIS) conventions from FIMMDA's handbook with each rule's status, T+1 schedules on the Mumbai calendar, daily compounding of overnight fixings (weekends, holidays, missing days by the handbook's rules) and settlement statements; a discount curve bootstrapped from one day's par quotes (FBIL's 1M-5Y as `fbil` loads them, longer tenors given by the user; flat forwards, no extrapolation unless allowed); par rates, value, PV01 and DV01 of any OIS, accrued interest from fixings; `cr-strat ois-curve` ([`docs/analytics.md`](docs/analytics.md)) |
 | `asset_swaps` | Yield-yield (matched basis), par-par, proceeds and z-spreads of G-secs, SDLs, bills, CP and CD against an OIS curve or any discount curve (a fitted G-sec curve too), from `bonds`' cash flows; the OIS notional matching a bond's DV01; `cr-strat asset-swaps` |
 | `funding` | The RBI store's daily TREPS, market repo and call rates as funding tables (dealing days, corridor and quarter-end flags, only rates public and unrevised by a given time), a dated haircut table kept by the user, CCIL's TREPS concentration caps on SDLs and illiquid G-secs (the rule of June 2026, and the earlier one as summarised, UNVERIFIED), and the carry of a repo-funded bond or asset swap, long or short: coupon income, pull to par, repo interest (with a funding spread), the haircut's cost, the OIS legs period by period on the fixings known at that time; `cr-strat repo-carry` |
+| `costs` | The trading costs of the rates strategies as a dated table (defaults shipped in `src/cr_strat/data/cost_defaults.csv`, each row with its source and status V, P or UNVERIFIED; a user table overrides them): half bid-offer by instrument and CCIL liquidity class, CCIL settlement, repo and TREPS charges, platform and custody fees, brokerage (a brokered trade needs a rate), GST, stamp duty, the TREPS margin; fills at mid plus or minus the half spread |
+| `returns` | The return engine for the instruments `bonds` prices (G-secs, SDLs, bills, STRIPS, CP and CD; not corporate bonds or FRBs): books of bond and OIS trades held from settlement (forwards before it, when-issued trades to the issue date, partial closes, shorts where the access policy allows, redemptions on holidays), valued daily from marks used only from when they were public (stale and model fall-backs flagged), funded overnight in TREPS or market repo at the RBI store's rates within haircuts, CCIL's caps and the TREPS margin, charged `costs`, with each day's NAV change split into accrual, pull to par, roll-down, curve factors, rich/cheap, convexity, trading, costs, funding and OIS lines that sum to it exactly (an explicit unexplained line); performance and risk; a back-test loop deciding at 20:00 on a snapshot of what was public then (marks, curves, funding, fixings, and through its accessors the event ledger, auctions, the RBI store's tables, macro series, the MPC calendar, the residual history and the master's securities and fixed terms, each cut at that time), with auction bids within RBI's limits; access presets for the fund's legal form, the when-issued and hedging-only rules checked every day; `cr-strat returns` ([`docs/analytics.md`](docs/analytics.md)) |
 | `policy_path` | MPC meeting dates shipped as package data (FY2026-27 with the day each became public, years declared complete, the calendar as known on any day, projection on request), a step model of overnight MIBOR as repo plus a spread, the repo-rate level after each meeting decided after the trade date backed out of one day's OIS quotes, starting from the rate known that day, with what the quotes identify; the MIBOR-repo spread from public rates, repo-rate changes matched to decisions; `cr-strat policy-path` |
 | `htmlparse` | Tables, text and links from saved HTML pages with the standard library: nested tables kept apart, colspan and rowspan expanded; strict number and date cells; firewall-page detection |
 | `rbi_releases` | RBI press releases from saved pages and the RSS feed: GoI, T-bill and SDL auction results, underwriting and switch results, auction announcements. A registry of release types; checks that refuse a release rather than misread it |
@@ -140,6 +151,7 @@ the pressure variable and the price response for each event.
 | `sovereign` | Sovereign security names (G-sec, SDL, T-bill, FRB, green bond) parsed to a join key; state codes; RBI's GoI-outstanding and FAR lists; a master with one row per ISIN; name-to-ISIN matching |
 | `auctions` | One table of G-sec, SDL and T-bill auctions from FIMMDA's yearly and SDL workbooks, RBI's Handbook Table 221 and RBI's releases: ISINs, settlement dates, and a check that the cut-off price reproduces the printed yield, which infers settlement and missing maturity dates |
 | `issuance` | Ledger of issues, reissues, switches, buybacks and maturities per ISIN; outstanding stock on any date, backward from RBI's lists or forward, with completeness flags; reconciliation with RBI's list; supply by month and tenor bucket |
+| `event_ledger` | The S4 event ledger: every auction line (joined to the issuance ledger, with RBI's bids, weighted averages and greenshoes, Handbook bids and devolvement, underwriting commissions), switch leg, buyback, redemption, open market and liquidity operation, issuance-calendar line, MPC decision and minutes, MoSPI release and index event, each with the time from which its announcement and its result were public and whether that time is a print or a rule (MPC decisions at their era's time); what was known at any time, with what a result decides (its fields, flags and notes, a new issue's coupon and ISIN) hidden until it was public; DV01 supply (from `bonds` at the cut-off yield) by auction week, kind and tenor bucket against the stock and its DV01 (`issuance.outstanding_on`'s rules for many dates at once), with the ledger identities checked; bid-cover, tails, devolvement; forward supply as the calendars stood on a date against what came (T-bill calendar lines typed in by the user; blank where no weekly calendar plans a kind); business-day event windows with overlaps, isolated events and a later price panel's path; `cr-strat event-ledger` ([`docs/analytics.md`](docs/analytics.md)) |
 | `price_panel` | ISIN-day yields, spreads, tenor and as-of rating buckets |
 | `event_prices` | Spread paths around each event: pre-event level, first trade after, and anchors at t-60/+10/+60/+120/+250 |
 
@@ -167,8 +179,10 @@ the pressure variable and the price response for each event.
   embedded options yet.
 - **Compounding defaults are assumptions.** Bond yields default to annual
   compounding and the benchmark to semi-annual. Set both to match your sources.
-- **Price paths are in spread terms, not total return.** There is no carry or
-  duration-hedged P&L yet.
+- **Price paths are in spread terms, not total return.** The event paths of
+  `event_prices` have no carry or duration-hedged P&L; the return engine
+  (`returns`) values only what `bonds` prices: G-secs, SDLs, bills, STRIPS,
+  CP and CD, not corporate bonds or FRBs.
 - **Some pricing rules have no primary source yet.** Interest in a G-sec's last
   coupon period, the STRIPS formula and the shut periods are named parameters
   set to the market-standard reading ([`docs/conventions.md`](docs/conventions.md)).
@@ -232,6 +246,38 @@ the pressure variable and the price response for each event.
   quarter-end, special repo or security repo rate has been seen; the call
   rate stands in for MIBOR in demonstrations only. The four asset-swap
   measures differ by up to 2 bp on one bond: S1 must pick one.
+- **The return engine has seen no real price.** Marks, curves, MIBOR fixings and OIS quotes are licensed (CCIL,
+  FBIL), so `returns` is tested on bonds priced off known synthetic curves and demonstrated on a synthetic month funded
+  at the RBI store's four days of rates (13-16 Nov 2026, held flat after): plumbing, not a return. Its conventions
+  without a source are named parameters marked UNVERIFIED: book value as the T+1 clean mark plus accrued interest to
+  the mark date, the constant-curve roll-down, Legendre curve factors at 11 nodes, the missing-mark rules (curve plus
+  last residual, then the last price held, a warning after five business days), overnight funding sized to the cash
+  need in Rs 5 lakh lots with TREPS taken before market repo and its margin as equity, each night of a deal at its
+  deal day's rate, decision and valuation at 20:00 (a decision before the valuation refused), next-day VWAP fills with
+  a five-day wait, competitive auction orders filled up to 10% of the amount accepted, swaps under a hedging-only
+  policy allowed up to 105% of their bonds' DV01. Costs default to CCIL's 2019 schedule (read by an earlier probe),
+  bid-offer by CCIL class from a search summary of CCIL's page, stamp duty from secondary sources, and UNVERIFIED
+  placeholders for SDL, bill, STRIPS, CP, CD and OIS spreads, NDS-OM fees and custody; income tax and TDS are left out.
+  An access preset must be chosen: it decides whether S1 may repo, S3 and S5 may short and S7 may pay OIS for a view.
+  For a fund trading only its own money without registering (an Unregistered Type I NBFC), the conservative preset is
+  `unregulated_company`, with no repo, no shorts and OIS for hedging only, since RBI counts any outside liability as
+  public funds; `nbfc_non_pd` assumes an RBI-registered NBFC ([`docs/analytics.md`](docs/analytics.md), Which access
+  preset fits the fund; a question for counsel).
+  Not built: corporate bonds and FRBs, CSA or margin on OIS, security-wise repo rates, a key-rate DV01 table, the
+  universe from the issuance ledger, an auction's own allotment beyond RBI's bid limits, back-tests from the command
+  line, spline curves through the command line (docs/analytics.md lists what each strategy needs before real use).
+- **The event ledger has seen no price.** Its supply, metrics and windows run on the free auction files and the RBI
+  store's four days of Nov 2026; concessions, residual moves and event paths need a licensed price panel and are tested
+  on synthetic ones only. It inherits the issuance ledger's gaps (below): no G-sec auctions from 17 Feb 2024 to 3 Apr
+  2025 or 26 Jun to 12 Nov 2026, no SDLs from 29 Jan 2025 to 8 Nov 2026, T-bills, switches and buybacks only from the
+  store, so the stock is never complete and no share of supply in it is shown on the free data. Times before the store's
+  first poll are rules, marked in each row: results at the end of the auction day, announcements at 18:00 the business
+  day before (UNVERIFIED), MPC decisions at their era's time (from search summaries; December 2019 to 2023 not found,
+  taken as 14:30) and minutes 14 days later; RBI's fixed result times are an option read through search summaries. Its
+  readings (bid-cover on competitive bids, a switch's source leg at its last known yield, the stock's DV01 at its last
+  cut-off, day 0 at a 20:00 decision) are named parameters, UNVERIFIED. FRBs have no DV01, the state calendar has
+  quarter totals only, RBI's T-bill calendar has no parser (its lines can be typed in), MPC meetings ship for FY2026-27
+  only, and trading by participant category (CCIL, licensed) is not built.
 - **The issuance ledger has gaps.** The saved FIMMDA files hold no FY2024-25
   G-sec auctions and stop in May 2026, the Handbook edition in June 2026, the
   SDL file in January 2025; no history of switches or buybacks exists. The

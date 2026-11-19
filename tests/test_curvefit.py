@@ -1090,3 +1090,22 @@ def test_cli_curve_fit_writes_drivers_and_controls(tmp_path, capsys, isin):
     assert main([a for a in args if a not in ("--ledger", str(tmp_path / "ledger.csv"), "--master",
                                               str(tmp_path / "master.csv"))]) == 2
     assert "--control needs the drivers" in capsys.readouterr().err
+
+
+def test_cli_curve_fit_writes_the_nss_parameters_cr_strat_returns_reads(tmp_path, capsys):
+    from cr_strat import returns as rt
+    pd.concat([gsec_frame(), bill_rows()], ignore_index=True).to_csv(tmp_path / "prices.csv", index=False)
+    table = tmp_path / "nss_params.csv"
+    args = ["curve-fit", "--prices", str(tmp_path / "prices.csv"), "--settlement", "2026-11-16", "--check", "none",
+            "--no-leave-one-out", "--nss-params", str(table), "--out-dir", str(tmp_path / "out")]
+    assert main(args) == 0
+    assert "the business day before --settlement" in capsys.readouterr().out
+    assert main([*args, "--trade-date", "2026-11-13", "--public-from", "2026-11-13T18:30:00"]) == 0  # a refit
+    written = pd.read_csv(table, dtype=str, keep_default_na=False)
+    assert len(written) == 1 and written["date"].iloc[0] == "2026-11-13"
+    entry = rt.read_nss_params(table)["gsec"][date(2026, 11, 13)]
+    fitted = json.loads((tmp_path / "out" / "diagnostics.json").read_text())["primary"]
+    assert entry.curve.valuation_date == date(2026, 11, 16) and entry.public_from.hour == 18
+    assert fitted["method"] == "nss" and len(entry.curve.params) == 6
+    assert main([*args[:-2], "--method", "pspline", "--out-dir", str(tmp_path / "x")]) == 2
+    assert "--nss-params writes NSS parameters" in capsys.readouterr().err

@@ -293,7 +293,8 @@ def fixing_times_from(funding: pd.DataFrame) -> dict[date, datetime | None]:
 
 def read_haircuts(table) -> pd.DataFrame:
     """A haircut table kept by the user, checked (``HAIRCUT_COLUMNS``; ``isin``, ``kind``, the bucket bounds and
-    ``liquidity`` may be blank). ``table`` is a DataFrame or a CSV path."""
+    ``liquidity`` may be blank). ``table`` is a DataFrame or a CSV path; rows whose every cell is blank (a
+    spreadsheet's trailing ``,,,`` lines) are dropped, the line numbers of messages still counting them."""
     frame = pd.read_csv(table, dtype=str, keep_default_na=False) if not isinstance(table, pd.DataFrame) else table
     frame = frame.copy()
     frame.columns = [str(c).strip().lower() for c in frame.columns]
@@ -302,6 +303,8 @@ def read_haircuts(table) -> pd.DataFrame:
         raise ValueError(f"the haircut table lacks {missing} (columns: {', '.join(HAIRCUT_COLUMNS)})")
     rows = []
     for n, rec in enumerate(frame.to_dict("records"), start=2):
+        if all(_blank(v) for v in rec.values()):
+            continue
         where = f"haircut table line {n}"
         try:
             effective = as_date(rec["effective_date"])
