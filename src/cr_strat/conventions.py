@@ -13,8 +13,15 @@ The short version:
 * ``days_30_360_us`` (30/360 US with the end-of-February rules, close to
   Excel's basis 0) is kept because RBI's G-sec primer reportedly uses basis 0.
   The handbook's table rules it out for G-secs.
-* Actual/365 fixed and Actual/Actual (ICMA) are here for corporate bonds,
-  which are not built yet.
+* Actual/365 fixed and Actual/Actual (ICMA) are generic day counts.
+  ``ACT/ACT SEBI`` is the actual/actual of listed corporate bonds
+  (non-convertible debentures) under SEBI's circulars: actual days, a year of
+  365 or 366 days. Which 366-day year applies is a rule of its own
+  (``LEAP_YEAR_RULES``), so ``coupon_period_days`` and ``year_fraction``
+  refuse it and point to ``corporates.year_fraction_sebi``; ``corporates``
+  prices these bonds. ``CorporateConventions`` (``NCD``, ``NCD_2013``,
+  ``NCD_PRE2013``) adds the corporate rules; ``GOI_FRB`` is the G-sec set for
+  GoI floating-rate bonds (``floating``).
 
 ``convert_yield`` and ``money_market_to_annual`` convert between yield bases.
 They moved here from ``curves``, which re-exports them.
@@ -41,6 +48,21 @@ Sources cited in the field comments:
   https://www.fimmda.org/UploadPopupPageFiles/FIMCIR2023_24_36_FIMMDA_CD_Operational_GuidelinesDated%2029Dec23.pdf
 * Auction pairs: FIMMDA G-sec auction files for 2025-26 and 2026-27, see
   ``tests/test_bonds.py``.
+* SEBI 2013: circular CIR/IMD/DF/18/2013 of 29 Oct 2013, Annex A (read in a
+  copy at https://corporatelawreporter.com, not on SEBI's site).
+* SEBI 2016: circular CIR/IMD/DF-1/122/2016 of 11 Nov 2016,
+  https://www.sebi.gov.in/sebi_data/attachdocs/aug-2022/1659352777649.pdf
+* SEBI 2025: circular SEBI/HO/DDHS/DDHSPOD1/P/CIR/2025/72 of 13 May 2025,
+  https://www.sebi.gov.in/sebi_data/attachdocs/may-2025/1747410005828.pdf
+* NCS master circular: SEBI's master circular for issue and listing of
+  non-convertible securities of 15 Oct 2025 (read in a copy at
+  https://taxguru.in), chapters III, XVI and XXII and its cash-flow
+  illustration.
+* Term sheets: Power Finance Corporation's public issue of Jan 2026 and Capri
+  Global Capital's of Oct 2025 (copies at https://media.thefixedincome.com).
+
+Corporate rules no source confirms are marked UNVERIFIED in the field
+comments of ``NCD``; ``docs/conventions.md`` lists them with the choices.
 """
 
 from __future__ import annotations
@@ -55,10 +77,18 @@ from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
 import numpy as np
 import pandas as pd
 
-COMPOUNDING = ("annual", "semiannual")
-COMPOUNDING_FREQUENCY = {"annual": 1, "semiannual": 2}
-DAY_COUNTS = ("30E/360", "30/360 US", "ACT/365F", "ACT/ACT ICMA")
+COMPOUNDING = ("annual", "semiannual", "quarterly", "monthly")
+COMPOUNDING_FREQUENCY = {"annual": 1, "semiannual": 2, "quarterly": 4, "monthly": 12}
+ACT_ACT_SEBI = "ACT/ACT SEBI"
+DAY_COUNTS = ("30E/360", "30/360 US", "ACT/365F", "ACT/ACT ICMA", ACT_ACT_SEBI)
 THIRTY_360 = ("30E/360", "30/360 US")
+# Which year of 365 or 366 days an ACT/ACT SEBI fraction divides by (corporates.year_fraction_sebi).
+LEAP_YEAR_RULES = ("anniversary", "calendar", "fixed365")
+# Which date a corporate bond's flow is discounted on: "by_date" switches from payment to due dates on
+# CorporateConventions.due_dates_from (SEBI 2025); "due" and "payment" always use one of them.
+FLOW_DATE_RULES = ("by_date", "due", "payment")
+PERIOD_END_RULES = ("scheduled", "to_payment")
+ANNIVERSARY_ANCHORS = ("issue", "maturity")
 ROLLS = ("following", "preceding", "modified_following", "modified_preceding", "unadjusted")
 FINAL_PERIOD_RULES = ("simple", "compound")
 FRACTION_RULES = ("excel", "days_to_next")
@@ -168,9 +198,16 @@ def day_count_days(day_count: str, start, end) -> int:
     return days_actual(start, end)
 
 
+def _refuse_sebi(day_count: str, what: str) -> None:
+    if day_count == ACT_ACT_SEBI:
+        raise ValueError(f"{what} is not defined for {ACT_ACT_SEBI}: its year is 365 or 366 days by a leap-year "
+                         "rule, so use corporates.year_fraction_sebi (corporates.CorporateBond prices these bonds)")
+
+
 def coupon_period_days(day_count: str, period_start, period_end, frequency: int) -> float:
     """Length ``E`` of a coupon period in days: 360/f or 365/f, or the actual days for ACT/ACT ICMA."""
     _check_day_count(day_count)
+    _refuse_sebi(day_count, "a coupon period length")
     if day_count == "ACT/ACT ICMA":
         return float(days_actual(period_start, period_end))
     return _YEAR_DAYS[day_count] / frequency
@@ -182,9 +219,11 @@ def year_fraction(day_count: str, start, end, *, period_start=None, period_end=N
 
     ACT/ACT ICMA needs the regular coupon period that holds the dates and the
     coupon frequency: the fraction is days / (frequency x days in the period).
-    Bonds split irregular periods into regular ones themselves.
+    Bonds split irregular periods into regular ones themselves. ``ACT/ACT SEBI``
+    is refused: ``corporates.year_fraction_sebi`` computes it.
     """
     _check_day_count(day_count)
+    _refuse_sebi(day_count, "year_fraction")
     if day_count == "ACT/ACT ICMA":
         if period_start is None or period_end is None or not frequency:
             raise ValueError("ACT/ACT ICMA needs period_start, period_end and frequency")
@@ -279,7 +318,8 @@ class BondConventions:
     ``time_basis``: ``periods`` counts time to each flow in coupon periods (whole
     periods plus that fraction); ``act/365`` uses actual days / 365.
     ``ex_coupon_days``: days before a coupon when the bond trades without it.
-    Only 0 is built (record dates come with corporate bonds).
+    ``bonds`` refuses anything but 0; ``corporates.CorporateBond`` reads it as
+    the record-date offset (calendar days before each due date).
     ``shut_days_before_coupon``, ``shut_days_before_redemption``: calendar days
     in which transfers stop; ``in_shut_period`` flags them, pricing ignores them.
     """
@@ -359,6 +399,70 @@ class DiscountConventions:
         _choice(self.price_rounding, ("half_up", "truncate"), "price_rounding")
         _choice(self.maturity_roll, ROLLS, "maturity_roll")
         _choice(self.quote, ("price", "yield"), "quote")
+
+
+@dataclass(frozen=True, kw_only=True)
+class CorporateConventions(BondConventions):
+    """Conventions of a listed corporate bond (NCD); ``corporates.CorporateBond`` reads them.
+
+    The inherited fields keep their meaning, with three readings of their own:
+    ``ex_coupon_days`` is the record date's offset (calendar days before each due
+    date); ``final_period="simple"`` is the money-market rule (a single flow left
+    less than ``mm_final_days`` away is priced on simple interest, actual/365);
+    ``frequency`` is descriptive (each bond carries its own, 0 for zero-coupon
+    and cumulative bonds). ``time_basis`` must be ``act/365``: flows are
+    discounted on actual days over 365, compounded ``compounding``.
+
+    ``leap_year_rule``: which 365- or 366-day year an ACT/ACT SEBI fraction
+    divides by (``corporates.year_fraction_sebi``): ``anniversary`` (years
+    between anniversaries of ``anniversary_anchor``, the deemed date of
+    allotment by default), ``calendar`` (calendar years) or ``fixed365``.
+    ``postponed_coupon``: interest on a coupon paid late because its due date
+    is a holiday runs to the due date (``scheduled``) or to the payment date
+    (``to_payment``, the next period then starting there).
+    ``redemption_interest``: the same for the last period when the redemption
+    is paid early (``scheduled``: the full scheduled coupon).
+    ``flow_dates``: discount on due dates (``due``), payment dates
+    (``payment``) or ``by_date``: due dates for settlements on or after
+    ``due_dates_from``, payment dates before.
+    ``record_roll``: how a record date on a holiday moves.
+    ``payment_calendar_name``: the calendar payment and record dates roll on
+    (a name in ``calendars.CALENDARS``).
+    ``amount_decimals``: rounding of cash amounts (``CorporateBond.cash_flows``
+    with ``rounded=True``); valuation is never rounded.
+    """
+
+    leap_year_rule: str = "anniversary"
+    anniversary_anchor: str = "issue"
+    postponed_coupon: str = "scheduled"
+    redemption_interest: str = "scheduled"
+    flow_dates: str = "by_date"
+    due_dates_from: date = date(2025, 8, 18)
+    record_roll: str = "preceding"
+    payment_calendar_name: str = "mumbai_settlement"
+    mm_final_days: int = 365
+    amount_decimals: int | None = None
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        _choice(self.day_count, (ACT_ACT_SEBI, "ACT/365F"), "day_count of corporate conventions")
+        _choice(self.leap_year_rule, LEAP_YEAR_RULES, "leap_year_rule")
+        if (self.day_count == "ACT/365F") != (self.leap_year_rule == "fixed365"):
+            raise ValueError(f"day_count {self.day_count!r} and leap_year_rule {self.leap_year_rule!r} disagree: "
+                             "ACT/365F goes with fixed365, ACT/ACT SEBI with anniversary or calendar")
+        _choice(self.anniversary_anchor, ANNIVERSARY_ANCHORS, "anniversary_anchor")
+        _choice(self.postponed_coupon, PERIOD_END_RULES, "postponed_coupon")
+        _choice(self.redemption_interest, PERIOD_END_RULES, "redemption_interest")
+        _choice(self.flow_dates, FLOW_DATE_RULES, "flow_dates")
+        _choice(self.record_roll, ROLLS, "record_roll")
+        if self.time_basis != "act/365":
+            raise ValueError(f"time_basis of corporate conventions must be 'act/365', not {self.time_basis!r}")
+        if not isinstance(self.payment_calendar_name, str) or not self.payment_calendar_name.strip():
+            raise ValueError(f"payment_calendar_name must name a calendar, not {self.payment_calendar_name!r}")
+        object.__setattr__(self, "due_dates_from", as_date(self.due_dates_from))
+        object.__setattr__(self, "mm_final_days", as_int(self.mm_final_days, "mm_final_days", minimum=0))
+        if self.amount_decimals is not None:
+            object.__setattr__(self, "amount_decimals", as_int(self.amount_decimals, "amount_decimals", minimum=0))
 
 
 GSEC = BondConventions(
@@ -450,3 +554,73 @@ CD = DiscountConventions(
 CONVENTIONS: dict[str, BondConventions | DiscountConventions] = {
     "gsec": GSEC, "sdl": SDL, "strips": STRIPS, "tbill": TBILL, "cmb": CMB, "cp": CP, "cd": CD,
 }
+
+# Listed non-convertible debentures issued from 1 Jan 2017 (SEBI 2016 applies to them). Sources at the top.
+NCD = CorporateConventions(
+    name="Listed NCD (issued from 1 Jan 2017)",
+    day_count=ACT_ACT_SEBI,  # SEBI 2013 (copy) and 2016 para 1; NCS master circular Ch. III: actual/actual interest
+    frequency=1,  # Descriptive: annual for most institutional and PSU issues; each bond carries its own
+    compounding="annual",  # PARTLY VERIFIED: issuers' printed yields reproduce on annual XIRR; no rule text found
+    settlement_lag=1,  # FIMMDA handbook 3.5.1: corporate bonds trade for T+1 to 17:15 (T+0 to 14:30)
+    quote="clean_price",  # NCS master circular Annex XXIB: platforms show clean and dirty prices; trades carry a price
+    price_decimals=4,  # FIMMDA handbook 6.9.1(b): prices and yields to at most four decimals
+    price_tick=0.0001,  # UNVERIFIED: no tick rule found; four decimals taken as the tick
+    coupon_roll="following",  # SEBI 2013 para I, SEBI 2016 para 3(a): a coupon due on a holiday is paid the next day
+    redemption_roll="preceding",  # SEBI 2013 para I; NCS master circular Ch. III: redemption the previous working day
+    final_period="simple",  # FIMMDA handbook 6.9.1(c): under a year left, no interim interest: money-market yield
+    fraction_rule="days_to_next",  # Not used: times are actual days / 365 from settlement to each flow
+    time_basis="act/365",  # PARTLY VERIFIED: as compounding (XIRR on actual days over 365)
+    ex_coupon_days=15,  # PARTLY VERIFIED: record date 15 days before a due date (NCS Regulations amendment of
+    # 10 Jul 2024, read through summaries); the PFC and Capri term sheets say 15 days
+    shut_days_before_coupon=0,  # NCS master circular Ch. XVI 6.1: no shut period for interest payments
+    shut_days_before_redemption=15,  # PFC, Capri: trading suspended from the redemption record date to redemption
+    calendar_name="mumbai_settlement",  # UNVERIFIED: exchange settlement calendars are not built; the RBI
+    # settlement calendar stands in
+    leap_year_rule="anniversary",  # UNVERIFIED reading: SEBI 2016 para 3(b) counts 366 for the whole one-year period
+    # holding 29 Feb; the years are taken between allotment anniversaries, which reproduces the NCS master
+    # circular's illustration (89,500 a year); one issuer's monthly table follows calendar years instead
+    anniversary_anchor="issue",  # The deemed date of allotment, as the issues read count their coupon years
+    postponed_coupon="scheduled",  # SEBI 2016 para 3(a): interest only to the original due date; schedule unchanged
+    redemption_interest="scheduled",  # UNVERIFIED as a market rule: the NCS master circular's illustration pays
+    # the full last coupon on an early redemption; the PFC and Capri term sheets pay interest to the payment date
+    # (redemption_interest="to_payment" per issue)
+    flow_dates="by_date",  # SEBI 2025 paras 1.2-1.3 and 4: due dates for yield-to-price from 18 Aug 2025;
+    # PARTLY VERIFIED that payment dates were used before (SEBI RFQ working group report, Mar 2025)
+    due_dates_from=date(2025, 8, 18),  # SEBI 2025 para 4
+    record_roll="preceding",  # UNVERIFIED: PFC moves a record date on a holiday to the preceding trading day,
+    # Capri to the following working day
+    payment_calendar_name="mumbai_settlement",  # UNVERIFIED: SEBI 2016 para 3(c) pays on Mumbai money-market days,
+    # and working Saturdays pay (PFC); no banking calendar with Saturday holidays is built, so all Saturdays are off
+    mm_final_days=365,  # FIMMDA handbook 6.9.1(c): residual maturity of less than one year
+    amount_decimals=None,  # PARTLY VERIFIED: SEBI 2013 rounds interest to the rupee per security; valuation unrounded
+)
+
+# Issues of 1 Dec 2013 to 31 Dec 2016: SEBI 2013 Annex A (copy) accrues a postponed coupon to its payment date
+# and starts the next period there (367 then 364 days, reproduced exactly), and pays the redemption and the
+# interest accrued to it on the previous working day.
+NCD_2013 = replace(NCD, name="Listed NCD (issued 1 Dec 2013 - 31 Dec 2016)", postponed_coupon="to_payment",
+                   redemption_interest="to_payment")
+
+# Issues before 1 Dec 2013 followed each issue's information memorandum. UNVERIFIED: actual/365 fixed, the
+# common reading (docs/rates_data_sources.md); pass the issue's own terms where known.
+NCD_PRE2013 = replace(NCD, name="Listed NCD (issued before 1 Dec 2013)", day_count="ACT/365F",
+                      leap_year_rule="fixed365", postponed_coupon="to_payment", redemption_interest="to_payment")
+
+# GoI floating-rate bonds are dated G-secs (FIMMDA handbook 6.6): PARTLY VERIFIED that every G-sec convention
+# (30E/360 periods, semi-annual, T+1, no ex-coupon) applies to them; floating.GoiFloatingRateBond uses it.
+GOI_FRB = replace(GSEC, name="GoI floating rate bond")
+
+# Separate from CONVENTIONS, whose keys are the instruments bonds.py prices.
+CORPORATE_CONVENTIONS: dict[str, BondConventions] = {
+    "ncd": NCD, "ncd_2013": NCD_2013, "ncd_pre2013": NCD_PRE2013, "frb": GOI_FRB,
+}
+NCD_2013_FROM = date(2013, 12, 1)  # SEBI 2013 para 2: applies to debt securities issued on or after 1 Dec 2013
+NCD_2017_FROM = date(2017, 1, 1)  # SEBI 2016: the holiday and leap-year clarifications apply from 1 Jan 2017
+
+
+def ncd_conventions(issue_date) -> CorporateConventions:
+    """``NCD``, ``NCD_2013`` or ``NCD_PRE2013`` by the bond's deemed date of allotment."""
+    d = as_date(issue_date)
+    if d >= NCD_2017_FROM:
+        return NCD
+    return NCD_2013 if d >= NCD_2013_FROM else NCD_PRE2013

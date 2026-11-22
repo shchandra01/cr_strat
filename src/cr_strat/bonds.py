@@ -56,11 +56,12 @@ Inputs are checked: yields must be finite and above the level where a
 discount factor stops being defined (-200% on semi-annual compounding), and
 prices positive and finite; anything else raises ``ValueError``.
 
-Corporate bonds (calls, puts, amortisation, record dates) and floating-rate
-bonds are not built. They fit as further ``Bond`` subclasses: every price,
-yield and risk number comes from ``_flows``, a list of (time, amount) pairs,
-so a call date, an amortising principal or projected floating coupons change
-only how that list is built. A flow at a time of zero or less is refused.
+Corporate bonds (calls, puts, amortisation, record dates) are priced in
+``corporates`` and floating-rate bonds in ``floating``, as further ``Bond``
+subclasses: every price, yield and risk number comes from ``_flows``, a list
+of (time, amount) pairs, so a call date, an amortising principal or projected
+floating coupons change only how that list is built. A flow at a time of zero
+or less is refused.
 """
 
 from __future__ import annotations

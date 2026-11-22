@@ -32,7 +32,32 @@ from cr_strat.auctions import (
 )
 from cr_strat.bonds import FixedRateBond, ZeroCouponBond
 from cr_strat.calendars import mumbai_settlement_calendar
-from cr_strat.conventions import CONVENTIONS, FINAL_PERIOD_RULES, as_date
+from cr_strat.conventions import (
+    CONVENTIONS,
+    CORPORATE_CONVENTIONS,
+    FINAL_PERIOD_RULES,
+    FLOW_DATE_RULES,
+    LEAP_YEAR_RULES,
+    PERIOD_END_RULES,
+    as_date,
+    ncd_conventions,
+)
+from cr_strat.corporates import (
+    BOND_FREQUENCIES,
+    FIRST_PERIODS,
+    SCHEDULES,
+    TIERS,
+    CallPut,
+    CorporateBond,
+    corporate_from_terms,
+    default_calendar,
+    perpetual_bond,
+    price_corporates,
+    read_amortisation,
+    read_corporate_options,
+    read_corporate_schedule,
+    read_corporate_terms,
+)
 from cr_strat.costs import read_cost_table
 from cr_strat.cra_disclosures import disclosure_summary, load_cra_disclosures, unmapped_issuers
 from cr_strat.curvefit import (
@@ -64,6 +89,19 @@ from cr_strat.curvefit import (
 from cr_strat.curves import BenchmarkCurve, SpreadBenchmark
 from cr_strat.event_prices import DEFAULT_ANCHORS, event_price_paths
 from cr_strat.fbil import GSEC_KINDS, MM_KINDS, combine_curves, load_fbil_gsec_curve, load_fbil_money_market
+from cr_strat.floating import (
+    FRB_COUPONS_CSV,
+    FRB_TERMS_CSV,
+    discount_margin_bp,
+    goi_frb_bond,
+    goi_frb_rates,
+    index_dv01,
+    load_frb_terms,
+    price_from_dm,
+    spread_duration,
+    spread_dv01,
+    tbill_way_table,
+)
 from cr_strat.flows import DEFAULT_WINDOWS, event_flows, parse_windows
 from cr_strat.funding import (
     FUNDING_SOURCES,
@@ -894,6 +932,220 @@ def _bond_price(args: argparse.Namespace) -> int:
     return 0
 
 
+def _option_arg(text: str, kind: str) -> CallPut:
+    """``--call``/``--put`` as ``DATE`` or ``DATE:PRICE`` (price per 100 of the outstanding face, default 100)."""
+    when, _, price = text.partition(":")
+    try:
+        return CallPut(kind, _date_arg(when, f"--{kind}"), float(price) if price else 100.0)
+    except ValueError as exc:
+        raise ValueError(f"--{kind} {text}: {exc}") from None
+
+
+def _corporate_bond(args: argparse.Namespace) -> CorporateBond:
+    """The bond ``corp-price`` prices: a terms-table row (``--terms --isin``) or the terms given as flags."""
+    calendar = None if args.calendar == "none" else "default"
+    extra = tuple(_option_arg(t, "call") for t in args.call) + tuple(_option_arg(t, "put") for t in args.put)
+    if args.terms:
+        if not args.isin:
+            raise ValueError("--terms needs --isin")
+        terms = read_corporate_terms(args.terms)
+        rows = terms[terms["isin"] == args.isin]
+        if rows.empty:
+            raise ValueError(f"--isin {args.isin} is not in {args.terms}")
+        bond = corporate_from_terms(
+            rows.iloc[0].to_dict(), calendar=calendar,
+            schedule=read_corporate_schedule(args.schedule_file) if args.schedule_file else None,
+            options=read_corporate_options(args.options) if args.options else None,
+            amortisation=read_amortisation(args.amortisation) if args.amortisation else None)
+        return replace(bond, options=bond.options + extra) if extra else bond
+    missing = [flag for flag, value in (("--coupon", args.coupon), ("--issue-date", args.issue_date))
+               if value is None]
+    if args.maturity is None and not args.perpetual:
+        missing.append("--maturity")
+    if missing:
+        raise ValueError(f"give --terms and --isin, or the terms: {', '.join(missing)} missing")
+    issue = _date_arg(args.issue_date, "--issue-date")
+    conventions = CORPORATE_CONVENTIONS[args.conventions] if args.conventions else ncd_conventions(issue)
+    kwargs = {name: getattr(args, name) for name in ("record_days", "record_roll", "leap_year_rule",
+                                                     "postponed_coupon", "redemption_interest", "flow_dates")
+              if getattr(args, name) is not None}
+    if args.tier is not None:
+        kwargs["tier"] = args.tier
+    kwargs.update(conventions=conventions, frequency=args.frequency, redemption=args.redemption,
+                  first_period=args.first_period, isin=args.isin or "",
+                  calendar=None if calendar is None else default_calendar(conventions))
+    if args.perpetual:
+        bond = perpetual_bond(issue, args.coupon, [o for o in extra if o.kind == "call"], **kwargs)
+        puts = tuple(o for o in extra if o.kind == "put")
+        return replace(bond, options=bond.options + puts) if puts else bond
+    return CorporateBond(args.coupon, _date_arg(args.maturity, "--maturity"), issue, schedule=args.schedule,
+                         first_coupon_date=_date_arg(args.first_coupon_date, "--first-coupon-date"), options=extra,
+                         **kwargs)
+
+
+def _corp_price(args: argparse.Namespace) -> int:
+    """Price one corporate bond (NCD) from its terms, or every row of a prices file."""
+    try:
+        if args.prices:
+            if not (args.terms and args.out):
+                raise ValueError("--prices needs --terms and --out")
+            frame = _read_csv_text(args.prices)
+            given = "yield_pct" if args.valuation == "sebi" or ("yield_pct" in frame and "clean_price" not in frame) \
+                else "clean_price"
+            out = price_corporates(frame, read_corporate_terms(args.terms),
+                                   schedule=read_corporate_schedule(args.schedule_file) if args.schedule_file
+                                   else None,
+                                   options=read_corporate_options(args.options) if args.options else None,
+                                   amortisation=read_amortisation(args.amortisation) if args.amortisation else None,
+                                   given=given, valuation=args.valuation,
+                                   calendar=None if args.calendar == "none" else "default")
+            _write(out, Path(args.out))
+            return 0
+        if (args.yield_pct is None) == (args.clean_price is None):
+            raise ValueError("give exactly one of --yield and --price (or --prices with --out)")
+        if not args.settlement:
+            raise ValueError("--settlement is required")
+        s = _date_arg(args.settlement, "--settlement")
+        bond = _corporate_bond(args)
+        target, label, note = bond, "maturity", ""
+        if args.valuation == "worst":
+            if args.clean_price is not None:
+                w = bond.yield_to_worst(s, args.clean_price)
+                target, label = bond.to_workout(w.date, w.price), f"{w.kind} {w.date}"
+            else:
+                _, when, kind = bond.price_to_worst(s, args.yield_pct)
+                price = {(k, d): p for k, d, p in bond.workouts(s)}[(kind, when)]
+                target, label = bond.to_workout(when, price), f"{kind} {when}"
+        elif args.valuation == "sebi":
+            if args.yield_pct is None:
+                raise ValueError("--valuation sebi works from --yield")
+            v = bond.sebi_valuation(s, args.yield_pct)
+            price = {(k, d): p for k, d, p in bond.workouts(s)}
+            key = {"first_call": "call", "deemed_maturity": "put"}.get(v.kind, v.kind)
+            target = bond.to_workout(v.date, price.get((key, v.date)) if v.kind != "maturity" else None)
+            label = f"{v.kind} {v.date}"
+            note = (f"call trigger {v.call_trigger or 'none'}, put trigger {v.put_trigger or 'none'}"
+                    + (f"; {v.notes}" if v.notes else "") + ("; a put favours the holder (yield > coupon + 30 bp)"
+                                                             if v.put_favours_holder else ""))
+        a = target.analytics(s, yield_pct=args.yield_pct, clean_price=args.clean_price)
+        c = bond.conventions
+        record = bond.record_date(bond.next_coupon_date(s))
+    except (ValueError, TypeError, NotImplementedError, FileNotFoundError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    kind = "zero-coupon or cumulative" if not bond.frequency else f"{bond.frequency} coupon(s) a year"
+    rows = [
+        ("bond", (f"{bond.isin + ' ' if bond.isin else ''}{bond.coupon_pct:g}% maturing {bond.maturity}"
+                  f"{' (deemed, perpetual)' if bond.perpetual else ''}, allotted {bond.issue_date}, {kind}")),
+        ("conventions", (f"{c.name}: {c.day_count} ({bond._yf_rule}), {c.compounding} on actual/365, flows on "
+                         f"{'due' if bond._use_due(s) else 'payment'} dates, record date {bond._record_days} days")),
+        ("valued to", label + (f" ({note})" if note else "")),
+        ("settlement", a.settlement),
+        ("previous coupon", a.previous_coupon_date),
+        ("next coupon", a.next_coupon_date),
+        ("record date", f"{record}{' (passed: ex-interest)' if bond.is_ex_interest(s) else ''}"),
+        ("clean price", f"{a.clean_price:.6f}"),
+        ("accrued interest", f"{a.accrued_interest:.6f}"),
+        ("dirty price", f"{a.dirty_price:.6f}"),
+        ("yield (%)", f"{a.yield_pct:.6f}"),
+        ("macaulay duration", f"{a.macaulay_duration:.4f}"),
+        ("modified duration", f"{a.modified_duration:.4f}"),
+        ("dv01 (per 100)", f"{a.dv01:.6f}"),
+        ("convexity", f"{a.convexity:.4f}"),
+    ]
+    for label_, value in rows:
+        print(f"{label_:<19}{value}")
+    if bond.options:
+        heading = "yield (%)" if args.clean_price is not None else "clean"
+        print(f"\n{'workout':<10}{'date':<12}{'price':>9}{heading:>14}")
+        for kind_, when, price in bond.workouts(s):
+            w = bond.to_workout(when, price)
+            value = (w.yield_from_price(args.clean_price, s) if args.clean_price is not None
+                     else w.clean_price(args.yield_pct, s))
+            print(f"{kind_:<10}{when.isoformat():<12}{price:>9.4f}{value:>14.6f}")
+    if args.cash_flows:
+        print(f"\n{'due':<12}{'paid':<12}{'kind':<12}{'amount':>12}{'periods':>12}")
+        for f in target.cash_flows(s):
+            print(f"{f.date.isoformat():<12}{f.payment_date.isoformat():<12}{f.kind:<12}{f.amount:>12.6f}"
+                  f"{f.periods:>12.6f}")
+    return 0
+
+
+def _frb_price(args: argparse.Namespace) -> int:
+    """Price a GoI FRB: its coupons as known at --as-of, the discount margin and the spread risks."""
+    try:
+        terms = load_frb_terms(args.terms or FRB_TERMS_CSV)
+        rows = terms[terms["isin"] == args.isin]
+        if rows.empty:
+            raise ValueError(f"--isin {args.isin} is not in {args.terms or FRB_TERMS_CSV}; known: "
+                             f"{', '.join(terms['isin'])}")
+        row = rows.iloc[0].to_dict()
+        default_time = _clock_arg(args.tbill_time, "--tbill-time") if args.tbill_time else None
+        tbills = None
+        if args.tbills:
+            tbills = tbill_way_table(_read_csv_text(args.tbills), default_time=default_time)
+        elif args.store:
+            tbills = tbill_way_table(rbi_store.read_table(args.store, "tbill_result"), default_time=default_time)
+        as_of = _time_arg(args.as_of, "--as-of") if args.as_of else None
+        announced = None if args.no_coupons else (args.coupons or FRB_COUPONS_CSV)
+        rates = goi_frb_rates(row, tbills, announced, as_of=as_of, allow_fewer=args.allow_fewer)
+        s = _date_arg(args.settlement, "--settlement")
+        bond = goi_frb_bond(row, rates)
+        index = args.index if args.index is not None else bond.index_pct
+        if index is None:
+            raise ValueError("no flat index to measure the discount margin from: pass --index")
+        if (args.clean_price is None) == (args.dm is None):
+            raise ValueError("give exactly one of --price and --dm")
+        if args.dm is not None:
+            clean, dirty = price_from_dm(bond, s, args.dm, index_pct=index)
+            dm = args.dm
+        else:
+            clean = args.clean_price
+            dm = discount_margin_bp(bond, s, clean, index_pct=index)
+            dirty = clean + bond.accrued_interest(s)
+        y = bond.yield_from_price(clean, s)
+        current = rates[(rates["period_start"] <= s) & (rates["period_end"] > s)].iloc[0]
+        ahead = rates[rates["period_start"] > s].head(1)
+    except (ValueError, TypeError, NotImplementedError, FileNotFoundError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    def describe(r) -> str:
+        when = "" if pd.isna(r["public_from"]) else f", public from {pd.Timestamp(r['public_from']):%Y-%m-%d %H:%M}"
+        return f"{r['rate_pct']:.4f}% {r['status']} ({r['period_start']} to {r['period_end']}{when})"
+
+    lines = [
+        ("bond", f"{row['isin']} {row['name']}, spread {row['spread_pct'] or 'none'}, index {row['index']}"),
+        ("as of", "everything in the inputs" if as_of is None else as_of),
+        ("settlement", s),
+        ("current coupon", describe(current)),
+        ("next coupon", describe(ahead.iloc[0]) if not ahead.empty else "none (last period)"),
+        ("index (flat)", f"{index:.4f}%"),
+        ("clean price", f"{clean:.6f}"),
+        ("accrued interest", f"{bond.accrued_interest(s):.6f}"),
+        ("dirty price", f"{dirty:.6f}"),
+        ("yield (%)", f"{y:.6f} (semi-annual, the projected coupons)"),
+        ("discount margin", f"{dm:.4f} bp over the index"),
+        ("spread dv01", f"{spread_dv01(bond, s, dm, index_pct=index):.6f}"),
+        ("spread duration", f"{spread_duration(bond, s, dm, index_pct=index):.4f}"),
+        ("index dv01", f"{index_dv01(bond, s, dm, index_pct=index):.6f}"),
+    ]
+    for label, value in lines:
+        print(f"{label:<19}{value}")
+    notes = [n for n in (current["notes"], *(ahead["notes"].tolist())) if n]
+    for n in notes:
+        print(f"note: {n}")
+    if args.rates:
+        print(f"\n{'period start':<14}{'rate (%)':>10}  {'status':<10}{'public from':<18}notes")
+        for r in rates[rates["period_end"] > s].to_dict("records"):
+            when = "" if pd.isna(r["public_from"]) else f"{pd.Timestamp(r['public_from']):%Y-%m-%d %H:%M}"
+            print(f"{r['period_start'].isoformat():<14}{r['rate_pct']:>10.4f}  {r['status']:<10}{when:<18}"
+                  f"{r['notes']}")
+    if args.out:
+        _write(rates, Path(args.out))
+    return 0
+
+
 def _curve_fit(args: argparse.Namespace) -> int:
     """Fit a curve to one settlement date's prices, cross-check it and write the curve and every residual."""
     try:
@@ -1472,6 +1724,73 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--first-coupon-date", help="first coupon date, for an irregular first period")
     p.add_argument("--cash-flows", action="store_true", help="also list the remaining cash flows")
     p.set_defaults(func=_bond_price)
+
+    p = sub.add_parser("corp-price", help="price, yield, accrued interest, workouts and risk of a corporate bond "
+                                          "(NCD) from its terms, or of every row of a prices file")
+    p.add_argument("--terms", help="corporate_terms.csv (with --isin, or with --prices)")
+    p.add_argument("--isin", help="the bond's ISIN in --terms (or a label for terms given as flags)")
+    p.add_argument("--options", help="corporate_options.csv: calls and puts")
+    p.add_argument("--amortisation", help="corporate_amortisation.csv: principal by date")
+    p.add_argument("--schedule-file", help="corporate_schedule.csv: due, payment and record dates and amounts")
+    p.add_argument("--coupon", type=float, help="coupon, percent a year (0 with --frequency 0)")
+    p.add_argument("--issue-date", help="deemed date of allotment, YYYY-MM-DD")
+    p.add_argument("--maturity", help="maturity date, YYYY-MM-DD (none with --perpetual)")
+    p.add_argument("--frequency", type=int, choices=BOND_FREQUENCIES, default=1,
+                   help="coupons a year; 0 for zero-coupon and cumulative bonds")
+    p.add_argument("--schedule", choices=[s for s in SCHEDULES if s != "explicit"], default="forward",
+                   help="how due dates are counted (default forward from the allotment)")
+    p.add_argument("--first-coupon-date", help="first coupon date of a forward or backward schedule")
+    p.add_argument("--first-period", choices=FIRST_PERIODS, default="separate",
+                   help="clubbed: the first short period paid with the next")
+    p.add_argument("--redemption", type=float, default=100.0, help="redemption per 100 face (cumulative: accreted)")
+    p.add_argument("--conventions", choices=[k for k in CORPORATE_CONVENTIONS if k != "frb"],
+                   help="default by the issue date: ncd (2017 on), ncd_2013 (Dec 2013-2016), ncd_pre2013")
+    p.add_argument("--call", action="append", default=[], metavar="DATE[:PRICE]", help="a call (repeatable)")
+    p.add_argument("--put", action="append", default=[], metavar="DATE[:PRICE]", help="a put (repeatable)")
+    p.add_argument("--perpetual", action="store_true", help="a perpetual: deemed to mature 100 years after issue")
+    p.add_argument("--tier", choices=[t for t in TIERS if t], help="at1 (valued to the first call) or tier2")
+    p.add_argument("--record-days", type=int, help="record date, calendar days before each due date (default 15)")
+    p.add_argument("--record-roll", choices=["preceding", "following"], help="record date on a holiday")
+    p.add_argument("--leap-year-rule", choices=LEAP_YEAR_RULES, help="which 366-day year (default anniversary)")
+    p.add_argument("--postponed-coupon", choices=PERIOD_END_RULES, help="interest on a coupon paid late")
+    p.add_argument("--redemption-interest", choices=PERIOD_END_RULES, help="interest on a redemption paid early")
+    p.add_argument("--flow-dates", choices=FLOW_DATE_RULES, help="discount on due or payment dates")
+    p.add_argument("--calendar", choices=["settlement", "none"], default="settlement",
+                   help="roll payment and record dates on the Mumbai settlement calendar (lenient after its years) "
+                        "or not at all")
+    p.add_argument("--settlement", help="settlement date, YYYY-MM-DD")
+    given = p.add_mutually_exclusive_group()
+    given.add_argument("--yield", dest="yield_pct", type=float, help="yield, percent (annual, actual/365)")
+    given.add_argument("--price", dest="clean_price", type=float, help="clean price per 100 face")
+    p.add_argument("--valuation", choices=["ytm", "worst", "sebi"], default="ytm",
+                   help="to maturity, to worst over calls, or SEBI's trigger rule for calls and puts (from --yield)")
+    p.add_argument("--prices", help="CSV of isin, settlement_date and clean_price or yield_pct: price every row")
+    p.add_argument("--out", help="with --prices: the analytics CSV to write")
+    p.add_argument("--cash-flows", action="store_true", help="also list the flows a buyer receives")
+    p.set_defaults(func=_corp_price)
+
+    p = sub.add_parser("frb-price", help="a GoI floating-rate bond's coupons as known at a time, price, yield, "
+                                         "discount margin and spread risk")
+    p.add_argument("--isin", required=True, help="the FRB's ISIN in --terms")
+    p.add_argument("--terms", help="GoI FRB terms CSV (default: the shipped goi_frb_terms.csv)")
+    p.add_argument("--coupons", help="announced coupons CSV (default: the shipped goi_frb_coupons.csv)")
+    p.add_argument("--no-coupons", action="store_true", help="use no announced coupon, only T-bill results")
+    source = p.add_mutually_exclusive_group()
+    source.add_argument("--tbills", help="CSV of 182-day T-bill results: auction_date, tenor_days, way or wap, "
+                                         "public_from (or published, release_date)")
+    source.add_argument("--store", help="an RBI store directory: its T-bill results (rbi-store-ingest)")
+    p.add_argument("--tbill-time", help="HH:MM on the auction day for results without a public time (a rule)")
+    p.add_argument("--as-of", help="use only what was public by this time (India, YYYY-MM-DDTHH:MM)")
+    p.add_argument("--allow-fewer", action="store_true", help="project from fewer than three T-bill results")
+    p.add_argument("--settlement", required=True, help="settlement date, YYYY-MM-DD")
+    given = p.add_mutually_exclusive_group(required=True)
+    given.add_argument("--price", dest="clean_price", type=float, help="clean price per 100 face")
+    given.add_argument("--dm", type=float, help="discount margin over the index, basis points")
+    p.add_argument("--index", type=float, help="the index the discount margin is measured over (default: the base "
+                                               "of the flat projection)")
+    p.add_argument("--rates", action="store_true", help="also list every coupon period's rate from settlement on")
+    p.add_argument("--out", help="write every period's rate, status and public time to this CSV")
+    p.set_defaults(func=_frb_price)
 
     p = sub.add_parser("curve-fit", help="fit a zero curve to one settlement date's G-sec and T-bill prices or "
                                          "yields; write the curve on a grid and every bond's rich/cheap residual")

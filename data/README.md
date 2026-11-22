@@ -125,6 +125,33 @@ from what your clearing member gives you. FBIL's MIBOR and MIBOR-OIS need a
 subscription before they are kept as a history
 ([`docs/rates_data_sources.md`](../docs/rates_data_sources.md)).
 
+## Corporate bond and FRB terms: `cr-strat corp-price`, `frb-price`
+
+Typed in by you from term sheets or, for listed ISINs from 18 Aug 2025,
+SEBI's centralised corporate bond database; none is shipped except the GoI FRB
+files. All are CSV with ISO dates and one row per key: a key given twice with
+different values is refused, an exact repeat kept once, blank rows dropped
+(`corporates.read_term_table`). The rules each column switches are in
+[`docs/conventions.md`](../docs/conventions.md#corporate-bonds-and-floating-rate-bonds).
+
+| File | Key | Columns (required in bold) |
+|---|---|---|
+| `corporate_terms.csv` | isin | **isin**, issuer_id, name, **kind** (`corporate`, `perpetual`, `frb_corp`), instrument_class, **coupon_pct**, **frequency** (0, 1, 2, 4, 12), schedule (`forward`, `backward`, `month_start`), first_period (`separate`, `clubbed`), **issue_date** (deemed allotment), maturity_date (blank only for a perpetual: 100 years), first_coupon_date, redemption_per100, face_value_rs, conventions (`ncd`, `ncd_2013`, `ncd_pre2013`; blank: by the issue date), record_days, record_roll, leap_year_rule, postponed_coupon, redemption_interest, flow_dates, tier (`at1`, `tier2`), sector, source, status |
+| `corporate_schedule.csv` | isin, due_date, kind | **isin**, **due_date**, payment_date, record_date, kind (`coupon`, `principal`, `redemption`), amount_per100 (checked against the rules: a difference above 1e-6 per 100 is refused), source |
+| `corporate_options.csv` | isin, kind, date | **isin**, **kind** (`call`, `put`), **date**, price_per100 (100), notice_days, portion (1), exercised (`yes`, `no`, blank), exercised_public_from (needed with exercised), source |
+| `corporate_amortisation.csv` | isin, date | **isin**, **date** (a due date), **principal_per100**, basis (`face`, `quantity`), source |
+| `corporate_steps.csv` | isin | **isin**, **threshold** (a grade such as `AA`), **step_bp_per_notch**, max_step_bp, agencies (`;` list), combine (`worst`, `best`, `second_best`), effective (`next_period`, `from_event`), step_down, source |
+| `corporate_floating.csv` | isin | **isin**, **benchmark**, **spread_pct**, **reset_months**, fixing_lag_days, lookback, floor_pct, cap_pct, decimals, source |
+| `fixings.csv` | benchmark, date | **benchmark**, **date**, **value_pct**, **public_from** (a bare date counts from 23:59:59), source |
+| T-bill results for `frb-price --tbills` | auction date | **auction_date**, **tenor_days**, way (or wap), cutoff_yield or cutoff_price, public_from (or the RBI store's published and release_date; else `--tbill-time` as a rule) |
+| `src/cr_strat/data/goi_frb_terms.csv` (shipped) | isin | **isin**, **name**, **issue_date**, **maturity_date**, first_coupon_date, **index** (`tbill182_way_avg3`, `tbill182_cutoff_avg3`, `gsec5y_reset5y`), spread_pct, decimals, reset_months, source, status, notes |
+| `src/cr_strat/data/goi_frb_coupons.csv` (shipped) | isin, period_start | **isin**, **period_start**, period_end (exclusive), **rate_pct**, announced (RBI's release time or date; blank: estimated as 00:00 on the fixing day), source, status |
+
+Add RBI's coupon releases to `goi_frb_coupons.csv` (or a copy passed with
+`--coupons`) as they come: the shipped file lacks the coupons set from June to
+October 2026 for FRB 2028, 2031, 2033 and 2034, and the RBI store will hold the
+182-day results needed to compute them only from its first poll.
+
 ## RBI press releases: saved pages and `pressreleases_rss.xml`
 
 RBI publishes every auction and liquidity operation as a press release: GoI

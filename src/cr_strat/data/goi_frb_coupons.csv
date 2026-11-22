@@ -1,0 +1,18 @@
+isin,period_start,period_end,rate_pct,announced,source,status
+IN0020210160,2021-10-04,2022-04-04,4.04,2021-10-01,"New-issue cut-off yield in the auction table (FIMMDA's G-sec auction files)",P
+IN0020210160,2026-04-04,2026-10-04,6.17,,"RBI coupon release read through a search summary",P
+IN0020180041,2018-05-07,,7.33,2018-05-04,"New-issue cut-off yield in the auction table (FIMMDA's G-sec auction files)",P
+IN0020180041,2022-12-07,2023-06-07,7.69,,"RBI coupon release read through a search summary",P
+IN0020180041,2025-12-07,2026-06-07,6.52,,"RBI coupon release read through a search summary",P
+IN0020200120,2020-06-22,2020-09-22,4.65,2020-06-19,"New-issue cut-off yield in the auction table (FIMMDA's G-sec auction files)",P
+IN0020200120,2025-09-22,2026-03-22,6.82,,"RBI coupon release read through a search summary",P
+IN0020200120,2026-03-22,2026-09-22,6.75,2026-03-20,"RBI coupon release of 20 Mar 2026 read through a search summary",P
+IN0020210137,2021-08-30,2021-10-30,4.45,2021-08-27,"New-issue cut-off yield in the auction table (FIMMDA's G-sec auction files)",P
+IN0020210137,2022-10-30,2023-04-30,7.69,2022-10-28,"RBI release of 28 Oct 2022 (copy at https://www.simpliance.in)",V
+IN0020210137,2023-04-30,2023-10-30,7.93,,"RBI coupon release read through a search summary",P
+IN0020210137,2024-04-30,2024-10-30,8.00,,"RBI coupon release read through a search summary",P
+IN0020210137,2024-10-30,2025-04-30,7.53,,"RBI coupon release read through a search summary",P
+IN0020210137,2025-04-30,2025-10-30,6.99,,"RBI coupon release read through a search summary",P
+IN0020210137,2026-04-30,2026-10-30,6.45,2026-04-29,"RBI coupon release of 29 Apr 2026 read through a search summary",P
+IN0020042050,2020-01-25,2025-01-25,6.58,,"RBI release read through a search summary",P
+IN0020042050,2025-01-25,2030-01-25,6.66,,"RBI release read through a search summary",P

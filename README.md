@@ -48,8 +48,8 @@ Input formats and where to get each file: [`data/README.md`](data/README.md).
 Sources and their terms: [`docs/data_sources.md`](docs/data_sources.md) for this
 pipeline, [`docs/rates_data_sources.md`](docs/rates_data_sources.md) for the rates
 and credit strategies. Day counts, calendars and price-yield rules for G-secs,
-SDLs, STRIPS, T-bills, CP and CD, with their sources:
-[`docs/conventions.md`](docs/conventions.md).
+SDLs, STRIPS, T-bills, CP and CD, listed corporate bonds (NCDs) and floating-rate
+bonds, with their sources: [`docs/conventions.md`](docs/conventions.md).
 
 ## Quickstart
 
@@ -73,6 +73,12 @@ cr-strat event-prices --events data/out/rating_events.csv --panel data/out/price
     --out-dir data/out
 
 cr-strat bond-price --coupon 6.94 --maturity 2036-05-11 --settlement 2026-11-16 --price 97.43
+cr-strat corp-price --coupon 8.95 --issue-date 2023-12-14 --maturity 2030-12-14 --settlement 2026-11-16 \
+    --price 102.26 --cash-flows                         # an NCD from its terms: SEBI actual/actual, record dates
+cr-strat corp-price --terms data/raw/corporate_terms.csv --isin INE000X01011 --options data/raw/corporate_options.csv \
+    --settlement 2026-11-20 --yield 7.4 --valuation sebi    # or --prices prices.csv --out analytics.csv for many
+cr-strat frb-price --isin IN0020200120 --store data/rbi_store --as-of 2026-11-19T20:00 --settlement 2026-11-20 \
+    --price 100.25 --rates                              # a GoI FRB: coupons as known then, discount margin
 cr-strat curve-fit --prices data/raw/prices_20261116.csv --master data/out/sovereign_master.csv \
     --settlement 2026-11-16 --out-dir data/out/curve_20261116   # needs licensed traded prices (docs/analytics.md)
 cr-strat curve-fit ... --nss-params data/out/nss_params.csv --public-from 2026-11-13T19:00   # the table returns reads
@@ -127,9 +133,11 @@ the pressure variable and the price response for each event.
 | `ownership` | Constrained ownership at each event and holder selling after it |
 | `trades` | Loads NSE/BSE reported-trade files (trade-level or ISIN-day summaries), flags yield outliers, aggregates to value-weighted ISIN-day yields |
 | `curves` | Benchmark curve interpolation with compounding conversion; matched-peer spread benchmark |
-| `conventions` | Day counts (30E/360 for G-secs and SDLs, 30/360 US, Act/365F, Act/Act ICMA), yield-basis conversions, and each instrument type's conventions with their sources |
+| `conventions` | Day counts (30E/360 for G-secs and SDLs, 30/360 US, Act/365F, Act/Act ICMA, SEBI's actual/actual for NCDs), yield-basis conversions (annual, semi-annual, quarterly, monthly), and each instrument type's conventions with their sources (`NCD`, `NCD_2013`, `NCD_PRE2013` and `GOI_FRB` in `CORPORATE_CONVENTIONS`) |
 | `calendars` | Mumbai settlement calendar from the holiday list shipped in the package (`src/cr_strat/data/`): business days, date rolls, T+n settlement dates from an instrument's conventions; refuses years not declared complete |
 | `bonds` | G-sec, SDL, STRIPS, T-bill, CMB, CP and CD pricing: coupon schedules, accrued interest, price and yield, duration, DV01, convexity |
+| `corporates` | Listed corporate bonds (NCDs) as `bonds.Bond` subclasses: schedules counted forward from the deemed allotment (or backward, monthly on the 1st with a clubbed first period, or explicit from the term sheet or SEBI's database), SEBI's actual/actual with its leap-year rule (three readings), coupons on holidays and early redemptions by SEBI's 2016 and 2013 rules, record dates and ex-interest pricing, the redemption record window refused, zero-coupon, deep-discount and cumulative bonds, amortisation, rating-linked coupon steps used only from when the rating was public, calls and puts (yields to each, to worst, prices to worst and best put, SEBI's mutual-fund trigger rule, AT1 to first call, perpetuals deemed 100 years), exercises counted from their notice; yields annual on actual/365 with the money-market rule in the last year, any compounding basis; term tables (`corporate_terms.csv` and its schedule, options, amortisation and step tables) and batch pricing; `cr-strat corp-price` ([`docs/conventions.md`](docs/conventions.md)) |
+| `floating` | GoI FRBs: 182-day T-bill weighted average yields from WAPs with each result's public time, the coupon rule (mean of the last three before the fixing day, rounded, plus the spread), each period's coupon as known at a time (announced, computed, projected flat or forward, or unknown), the bond as an unchanged `FixedRateBond` with a 1% coupon scaled by each period's rate, discount margin in index or curve form and back, spread DV01, spread duration, index DV01; benchmark-linked corporate FRBs (floors, caps, look-back, fixings with `public_from`); the five outstanding GoI FRBs' terms and known coupons shipped with sources (`data/goi_frb_terms.csv`, `data/goi_frb_coupons.csv`); `cr-strat frb-price` |
 | `curvefit` | Zero curves fitted to one day's G-sec and T-bill prices or yields (Nelson-Siegel-Svensson by multi-start Levenberg-Marquardt; a penalised B-spline of the forward curve as cross-check), every bond priced through `bonds`; rich/cheap residuals in bp and price, in the fit and out of sample (each bond against the curve refitted without it), with each bond's leverage; z-scores against a daily residual history it keeps; each residual's free drivers (coupon, age, FAR, reissues, stock as of the day) with an optional regression on them; butterflies, DV01-neutral pairs, par-curve spreads; a model-risk flag where the two curves refitted without a bond differ at its maturity (on a day with suspect bonds, also when fitted without them); `cr-strat curve-fit` for a generic price file, with `--nss-params` keeping the day's NSS parameters in the table `cr-strat returns` reads ([`docs/analytics.md`](docs/analytics.md)) |
 | `ois` | MIBOR-OIS (and SORR-OIS) conventions from FIMMDA's handbook with each rule's status, T+1 schedules on the Mumbai calendar, daily compounding of overnight fixings (weekends, holidays, missing days by the handbook's rules) and settlement statements; a discount curve bootstrapped from one day's par quotes (FBIL's 1M-5Y as `fbil` loads them, longer tenors given by the user; flat forwards, no extrapolation unless allowed); par rates, value, PV01 and DV01 of any OIS, accrued interest from fixings; `cr-strat ois-curve` ([`docs/analytics.md`](docs/analytics.md)) |
 | `asset_swaps` | Yield-yield (matched basis), par-par, proceeds and z-spreads of G-secs, SDLs, bills, CP and CD against an OIS curve or any discount curve (a fitted G-sec curve too), from `bonds`' cash flows; the OIS notional matching a bond's DV01; `cr-strat asset-swaps` |
@@ -195,8 +203,26 @@ the pressure variable and the price response for each event.
   years unless told to treat their weekdays as business days. Reissues
   settling before the first coupon of a security issued off its coupon
   schedule (96 FIMMDA rows, 2015-2021) do not reproduce RBI's yields: the
-  broken-period rule is not known. Corporate bonds and floating-rate bonds
-  are not priced yet.
+  broken-period rule is not known. Corporate bonds and FRBs: next item.
+- **The corporate bond and FRB pricer has seen no traded price.** It is tested on SEBI's worked examples
+  (the NCS master circular's cash flows, SEBI's 2013 and 2016 illustrations), one issuer's monthly table,
+  two issuers' printed yields and amounts, the RBI store's one 182-day T-bill result and synthetic bonds
+  with answers computed independently. Its readings no source settles are named parameters marked
+  UNVERIFIED (`docs/conventions.md`): which 366-day year SEBI's leap-year rule means (the allotment
+  anniversary reproduces SEBI's illustration; one issuer's table follows calendar years), interest on a
+  redemption paid early (full coupon by default, to the payment date for issues that say so), the payment
+  calendar (every Saturday off: no banking calendar with working Saturdays is built), record dates rolled to
+  the preceding day on the payment calendar (exchange and depository calendars are not built), pricing in
+  the ex-interest window (negative accrued interest), payment dates as flow dates before 18 Aug 2025,
+  yield to worst over calls only, rating steps from the next period, actual/365 for issues before Dec 2013.
+  FRBs: the base rounded half up from WAYs to 4 decimals, an auction on the fixing day left out, a coupon
+  computed only once no weekly auction can still come before its fixing day, an unknown release time taken
+  as 00:00 on the fixing day, the flat projection and the index-form discount margin. The coupons in force
+  since Jun-Oct 2026 for FRB 2028, 2031, 2033 and 2034 are not in the shipped table, and the saved T-bill
+  data hold one 182-day result, so those current coupons are projected and flagged until three results
+  (or RBI's release) are added. Not built: trade-yield checks, recomputed panel yields and corporate spreads,
+  corporate bonds and FRBs in the return engine, cost rows, FRB DV01 in the event ledger, a parser for RBI's
+  FRB coupon releases, AT1 coupon discretion, partial exercises.
 - **The curve fit has seen no secondary-market price.** It is tested on
   synthetic bonds priced off known curves and run on free auction cut-offs
   (one-day SDL auctions, G-sec auctions pooled over a quarter), which show
