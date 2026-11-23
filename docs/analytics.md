@@ -1185,13 +1185,21 @@ differences.
   (`CorporateBond.record_date`: 15 days before the due date under the SEBI conventions, a holiday moved to the
   preceding day; at the latest the day before the due date; a record date on a holiday takes the previous business
   day's close) and is a receivable until its payment date. A settlement after the record date is ex-interest: its
-  accrued interest is negative to the due date, in the position and in the fills.
+  accrued interest is negative to the due date, in the position and in the fills. The receivable is carried at face,
+  not discounted to its payment date, while the ex-interest mark leaves out the coupon's present value, so from the
+  record date's close until payment the NAV stands above the bond's cum-interest value by `C (1 - D)`, the coupon
+  times one less its discount factor to the payment date. That is about Rs 28,100 on Rs 10 crore of a 9% annual NCD
+  with 14 days to the coupon at 8.5%, or 2.8 bp of face, gone by the payment date (a simplification, UNVERIFIED as the
+  fund's accounting policy).
 - **Partial and final redemptions.** A partial redemption (amortisation) is entitled like a coupon: the principal is
   booked at face as a receivable and in `pull_to_par` against the clean price's fall. On its record date the mark's
   standard settlement is already ex the principal while the holder at the close is still owed it, so that day's mark is
   restated to settle on the day itself; a stale mark held across that record date holds its yield, not its price
   (which still holds the principal). Positions keep the original face (`corporates` prices per 100 original face; the
-  notes give the outstanding face). The redemption closes the position at its record date's close into a receivable
+  notes give the outstanding face). Marks of a partly redeemed bond must therefore be per 100 of the original face,
+  as `corp-price` gives them by default; the engine has no price-basis option. An exchange print, which `trade-check`
+  reads per 100 of the face outstanding by default, has to be multiplied by the outstanding share (outstanding face
+  over original face) before it is used as a mark. The redemption closes the position at its record date's close into a receivable
   paid on its payment date; a mark whose standard settlement falls after the redemption record date is restated to
   settle on the day itself.
 - **Calls and puts.** An exercised call or put redeems at its date and price once the exercise is public
