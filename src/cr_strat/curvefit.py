@@ -9,7 +9,10 @@ one from the model price. Every cash flow, accrued interest, yield and duration 
 G-sec, sovereign green bond or special security is a ``FixedRateBond`` on ``GSEC``, an SDL one on
 ``SDL``, a STRIP a ``ZeroCouponBond`` and a T-bill or CMB a ``DiscountInstrument`` whose single flow of
 100 falls on its maturity. Nothing here builds a cash flow of its own. Floating-rate and inflation-indexed
-bonds have no pricer in ``bonds`` and are reported without residuals.
+bonds have no pricer in ``bonds`` and are reported without residuals. Any other ``bonds.Bond`` (a
+``corporates.CorporateBond``, a ``floating.GoiFloatingRateBond``) is priced on a fitted curve by its own
+``cash_flows`` (``bond_price``, ``bond_yield``): corporate bonds are measured against the curve in
+``credit_spreads``, never fitted.
 
 **Curves.** ``DF(t) = exp(-z(t) t / 100)`` with ``t`` in Act/365F years from the settlement date to each
 flow's scheduled date (``flow_dates="payment"`` uses the holiday-adjusted dates; that needs a calendar
@@ -196,7 +199,7 @@ from typing import Protocol, runtime_checkable
 import numpy as np
 import pandas as pd
 
-from cr_strat.bonds import DiscountInstrument, FixedRateBond, ZeroCouponBond
+from cr_strat.bonds import Bond, DiscountInstrument, FixedRateBond, ZeroCouponBond
 from cr_strat.calendars import BusinessCalendar, CalendarCoverageError, calendar_for
 from cr_strat.conventions import CMB, GSEC, SDL, STRIPS, TBILL, as_date
 
@@ -532,6 +535,17 @@ def _check_frequency(frequency) -> int:
     if isinstance(frequency, bool) or frequency not in (1, 2, 4, 12):
         raise ValueError(f"frequency must be 1, 2, 4 or 12 coupons a year, not {frequency!r}")
     return int(frequency)
+
+
+def par_yields(curve, tenors, frequency: int = 2) -> np.ndarray:
+    """Par yields (percent, ``frequency`` coupons a year) at ``tenors`` (Act/365F years from the curve's valuation
+    date) of any curve with ``discount_t`` (an ``ois.OisCurve``, a curve seen from a later date): the formula of
+    ``FittedCurve.par_yield``. NaN where the curve gives no discount factor."""
+    m = _check_frequency(frequency)
+    flat, shape = _times(tenors)
+    if flat.size and flat.min() <= 0:
+        raise ValueError(f"par yields need maturities above zero, not {flat.min()}")
+    return _par_yields(curve, flat, m).reshape(shape)
 
 
 def _par_yields(curve: DiscountCurveLike, tenors: np.ndarray, m: int) -> np.ndarray:
@@ -890,7 +904,7 @@ def _instrument_flows(inst, s: date, flow_dates: str = "scheduled") -> tuple[np.
         inst.days_to_maturity(s)  # refuses a settlement on or after maturity or before issue
         when = inst.payment_date() if flow_dates == "payment" else inst.maturity
         times, amounts = np.array([(when - s).days / 365]), np.array([100.0])
-    elif isinstance(inst, (FixedRateBond, ZeroCouponBond)):
+    elif isinstance(inst, Bond):  # G-secs, SDLs, STRIPS and any other Bond (corporates, floating): by cash_flows
         flows = inst.cash_flows(s)
         when = [f.payment_date if flow_dates == "payment" else f.date for f in flows]
         times = np.array([(d - s).days / 365 for d in when])

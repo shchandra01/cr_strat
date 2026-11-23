@@ -4,7 +4,7 @@ B7 and B8 are the analytics spec's vectors (19 Nov 2026), computed there by a sc
 """
 
 import math
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import numpy as np
 import pandas as pd
@@ -16,7 +16,9 @@ from cr_strat import ois
 from cr_strat.bonds import DiscountInstrument, FixedRateBond, ZeroCouponBond
 from cr_strat.calendars import mumbai_settlement_calendar
 from cr_strat.cli import main
-from cr_strat.conventions import SDL
+from cr_strat.conventions import SDL, convert_yield
+from cr_strat.corporates import CorporateBond
+from cr_strat.floating import GoiFloatingRateBond, discount_margin_bp
 
 LENIENT = mumbai_settlement_calendar().lenient()
 TRADE, S = date(2026, 11, 19), date(2026, 11, 20)
@@ -243,3 +245,157 @@ def test_cli_missing_files_exit_2(tmp_path, capsys):
     assert main(["asset-swaps", "--quotes", str(tmp_path / "q.csv"), *common, "--bonds", str(tmp_path / "nob.csv"),
                  "--out", str(tmp_path / "a.csv")]) == 2
     assert "nob.csv" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------- corporate bonds and FRBs (synthetic data only)
+
+NCD = CorporateBond(7.4, date(2029, 6, 15), date(2024, 6, 15), isin="INE000A07011")
+
+
+def test_a_corporate_bond_on_the_curve_has_zero_par_par_and_z_spread(curve):
+    m = aw.asset_swap(NCD, S, on_curve_clean(NCD, curve), curve)
+    assert abs(m.par_par_bp) < 1e-9 and abs(m.proceeds_bp) < 1e-9 and abs(m.z_spread_bp) < 1e-9
+    assert m.accrued == pytest.approx(NCD.accrued_interest(S), rel=1e-15)
+    assert m.ytm_pct == pytest.approx(NCD.yield_from_price(m.clean_price, S), abs=1e-12)  # annual, actual/365
+    cheap = aw.asset_swap(NCD, S, 99.0, curve)
+    assert cheap.proceeds_bp == pytest.approx(cheap.par_par_bp * 100 / cheap.dirty_price, rel=1e-14)
+    assert 150 < cheap.z_spread_bp < cheap.proceeds_bp < cheap.par_par_bp < cheap.yield_yield_bp
+
+
+def test_the_matched_rate_is_restated_to_the_bonds_annual_basis(curve):
+    """A semi-annual NCD's yield is annual: its matched OIS rate on the semi-annual schedule is restated before the
+    yield-yield spread (without it a bond priced on the curve would show 9 bp)."""
+    semi = CorporateBond(7.4, date(2029, 6, 15), date(2024, 6, 15), frequency=2)
+    clean = on_curve_clean(semi, curve)
+    on_basis = aw.asset_swap(semi, S, clean, curve)
+    raw = aw.asset_swap(semi, S, clean, curve, k_match_basis="schedule")
+    assert on_basis.k_match_pct == pytest.approx(float(convert_yield(raw.k_match_pct, "semiannual", "annual")),
+                                                 rel=1e-14)
+    assert abs(on_basis.yield_yield_bp) < 0.1 and raw.yield_yield_bp > 9.0
+    zero = CorporateBond(0.0, date(2029, 11, 20), date(2025, 11, 20), frequency=0, redemption=125.0)
+    z = aw.asset_swap(zero, S, on_curve_clean(zero, curve), curve)
+    assert abs(z.yield_yield_bp) < 1e-9 and abs(z.par_par_bp) < 1e-9  # one period: the curve's annual zero rate
+    gsec = aw.asset_swap(GS2031, S, 99.50, curve, k_match_basis="bond")
+    assert gsec.k_match_pct == aw.asset_swap(GS2031, S, 99.50, curve).k_match_pct  # a G-sec's is on its basis
+    with pytest.raises(ValueError, match="k_match_basis"):
+        aw.asset_swap(NCD, S, 99.0, curve, k_match_basis="annual")
+
+
+def test_an_amortising_bond_swaps_an_amortising_notional(curve):
+    bond = CorporateBond(8.0, date(2030, 4, 1), date(2025, 4, 1),
+                         amortisation=((date(2028, 4, 1), 30.0), (date(2029, 4, 1), 30.0)))
+    m = aw.asset_swap(bond, S, on_curve_clean(bond, curve), curve)
+    assert abs(m.par_par_bp) < 1e-9 and abs(m.z_spread_bp) < 1e-9
+    flows = sorted({f.date for f in bond.cash_flows(S)})
+    d = [float(curve.discount(x) / curve.discount(S)) for x in flows]
+    tau = [(e - b).days / 365 for b, e in zip([S, *flows[:-1]], flows)]
+    assert flows == [date(2027, 4, 1), date(2028, 4, 1), date(2029, 4, 1), date(2030, 4, 1)]
+    faces = [100.0, 100.0, 70.0, 40.0]  # each period's face: 30 redeemed at the end of the 2028 and 2029 periods
+    assert m.annuity == pytest.approx(sum(t * x * f / 100 for t, x, f in zip(tau, d, faces)), rel=1e-14)
+
+
+def test_an_ex_interest_settlement_leaves_the_coupon_out(curve):
+    s = date(2026, 12, 3)  # the 15 Dec coupon's record date is 30 Nov: a settlement on 3 Dec is ex-interest
+    bond = CorporateBond(9.0, date(2030, 12, 15), date(2023, 12, 15))
+    assert bond.is_ex_interest(s) and bond.accrued_interest(s) < 0
+    flows = bond.cash_flows(s)
+    assert flows[0].date == date(2027, 12, 15)  # the 2026 coupon goes to the seller
+    pv = sum(f.amount * float(curve.discount(f.date) / curve.discount(s)) for f in flows)
+    m = aw.asset_swap(bond, s, pv - bond.accrued_interest(s), curve)
+    assert abs(m.par_par_bp) < 1e-9 and m.dirty_price == pytest.approx(pv, rel=1e-14)
+
+
+def corp_terms():
+    return pd.DataFrame([
+        {"isin": "INE000A07011", "kind": "corporate", "coupon_pct": "7.4", "frequency": "1",
+         "issue_date": "2024-06-15", "maturity_date": "2029-06-15"},
+        {"isin": "INE000F07011", "kind": "frb_corp", "coupon_pct": "7.4", "frequency": "4",
+         "issue_date": "2025-06-15", "maturity_date": "2028-06-15"},
+    ])
+
+
+def test_asset_swap_table_with_corporate_terms(curve):
+    frame = pd.DataFrame([
+        {"isin": "INE000A07011", "kind": "", "maturity_date": "", "clean_price": on_curve_clean(NCD, curve)},
+        {"isin": "INE000F07011", "kind": "", "maturity_date": "", "clean_price": 100.0},
+        {"isin": "INE000B07011", "kind": "corporate", "coupon_pct": 8.1, "maturity_date": "2028-03-10",
+         "issue_date": "2025-03-10", "frequency": 1, "yield_pct": 7.9},
+        {"isin": GS2031.name or "GS2031", "kind": "gsec", "coupon_pct": 6.36, "maturity_date": "2031-02-16",
+         "clean_price": 99.50},
+    ])
+    table = aw.asset_swap_table(frame, curve, terms=corp_terms())
+    rows = table.set_index("isin")
+    assert rows.loc["INE000A07011", "kind"] == "corporate" and rows.loc["INE000A07011", "error"] == ""
+    assert rows.loc["INE000A07011", "maturity_date"] == date(2029, 6, 15)
+    assert abs(rows.loc["INE000A07011", "par_par_bp"]) < 1e-9
+    assert "discount margin" in rows.loc["INE000F07011", "error"]
+    row = rows.loc["INE000B07011"]  # a corporate row read as a terms row: priced from its yield
+    bond = CorporateBond(8.1, date(2028, 3, 10), date(2025, 3, 10))
+    assert row["error"] == "" and row["ytm_pct"] == pytest.approx(7.9, abs=1e-9)
+    assert row["clean_price"] == pytest.approx(bond.clean_price(7.9, S), rel=1e-14)
+    assert rows.loc["GS2031", "par_par_bp"] == pytest.approx(34.7471, abs=1e-4)  # G-secs unchanged
+    clash = frame.iloc[[0]].assign(maturity_date="2029-06-16")
+    assert "differs from the terms" in aw.asset_swap_table(clash, curve, terms=corp_terms())["error"].iloc[0]
+
+
+def flat_curve(rate: float):
+    class FlatCC(Flat):
+        def discount_t(self, t):
+            return np.exp(-self.rate * np.asarray(t, dtype=float))
+    return FlatCC(rate)
+
+
+def frb2033(rate: float = 7.70, projected: float = 7.73) -> GoiFloatingRateBond:
+    """FRB 2033 with synthetic rates: the current period at ``rate``, later ones projected (T22's set-up)."""
+    starts = [date(2026, 9, 22)] + [date(y, m, 22) for y in range(2027, 2034) for m in (3, 9)
+                                    if date(y, m, 22) < date(2033, 9, 22)]
+    rows = [(starts[0], rate, "announced")] + [(d, projected, "projected") for d in starts[1:]]
+    return GoiFloatingRateBond(date(2033, 9, 22), date(2020, 6, 22), 1.22, tuple(rows),
+                               first_coupon_date=date(2020, 9, 22), index_pct=6.51)
+
+
+def test_frbs_are_measured_by_their_discount_margin():
+    bond = frb2033()
+    curve = flat_curve(0.065)
+    with pytest.raises(ValueError, match="discount margin"):
+        aw.asset_swap(bond, S, 100.0, curve)
+    m = aw.frb_measures(bond, S, 100.0, curve)
+    assert m.accrued == pytest.approx(1.2405555556, abs=1e-10)  # T22: 7.70% on the unit accrued 0.1611111111
+    assert m.frb_yield_pct == pytest.approx(7.7250833578, abs=1e-9)  # T22's yield at clean 100
+    assert m.dm_index_bp == pytest.approx(121.508336, abs=1e-6)  # over the 6.51% index
+    assert m.dm_curve_bp == pytest.approx(discount_margin_bp(bond, S, 100.0, curve=curve, form="curve"), abs=1e-8)
+    assert m.coupon_pct == 7.70 and m.coupon_status == "announced"
+    assert m.spread_dv01 > 0 and abs(m.index_dv01) < m.spread_dv01 / 10  # a floater's rate risk is small
+    no_index = aw.frb_measures(GoiFloatingRateBond(bond.maturity, bond.issue_date, 1.22, bond.rates,
+                                                   first_coupon_date=bond.first_coupon_date), S, 100.0, curve)
+    assert math.isnan(no_index.dm_index_bp) and no_index.spread_dv01 > 0
+
+
+def weekly_tbills(public_shift_days: int = 0) -> pd.DataFrame:
+    rows, d, k = [], date(2026, 5, 20), 0
+    while d <= date(2026, 11, 18):
+        public = d + timedelta(days=public_shift_days if d == date(2026, 11, 18) else 0)
+        rows.append({"auction_date": d.isoformat(), "tenor_days": 182, "way_pct": round(5.50 + 0.01 * k, 4),
+                     "public_from": f"{public.isoformat()}T18:30"})
+        d += timedelta(days=7)
+        k += 1
+    return pd.DataFrame(rows)
+
+
+def test_frb_asset_swap_table_uses_only_coupons_known_at_as_of(curve):
+    frame = pd.DataFrame([{"isin": "IN0020210160", "clean_price": 100.40}, {"isin": "GS2036", "clean_price": 97.4}])
+    as_of = datetime(2026, 11, 19, 20, 0)
+    table = aw.frb_asset_swap_table(frame, curve, S, tbills=weekly_tbills(), as_of=as_of)
+    assert list(table.columns) == list(aw.FRB_ASW_COLUMNS)
+    rows = table.set_index("isin")
+    frb = rows.loc["IN0020210160"]  # FRB 2028, spread 0.64 (shipped terms)
+    assert frb["error"] == "" and frb["name"] == "GOI FRB 2028"
+    assert frb["coupon_status"] == "computed" and frb["coupon_pct"] == pytest.approx(5.68 + 0.64)  # Sep auctions
+    assert frb["next_status"] == "projected" and frb["index_pct"] == pytest.approx(5.75)  # 4, 11, 18 Nov results
+    assert frb["next_coupon_pct"] == pytest.approx(5.75 + 0.64)
+    assert "not in the GoI FRB terms" in rows.loc["GS2036", "error"]
+    late = aw.frb_asset_swap_table(frame.iloc[[0]], curve, S, tbills=weekly_tbills(public_shift_days=1), as_of=as_of)
+    assert late["index_pct"].iloc[0] == pytest.approx(5.75)  # 18 Nov's result public on 19 Nov at 18:30: used
+    later = aw.frb_asset_swap_table(frame.iloc[[0]], curve, S, tbills=weekly_tbills(public_shift_days=2),
+                                    as_of=as_of)
+    assert later["index_pct"].iloc[0] == pytest.approx(5.74)  # public on 20 Nov: 28 Oct, 4 and 11 Nov only

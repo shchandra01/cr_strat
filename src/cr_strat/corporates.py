@@ -689,6 +689,16 @@ class CorporateBond(Bond):
         rule = self._flow_rule
         return rule == "due" or (rule == "by_date" and s >= self.conventions.due_dates_from)
 
+    def uses_due_dates(self, settlement) -> bool:
+        """True when a settlement on ``settlement`` discounts the flows on their due dates (``flow_dates``: due, or
+        by date from ``due_dates_from``), False when on their payment dates."""
+        return self._use_due(as_date(settlement))
+
+    def last_cum_settlement(self) -> date:
+        """The last settlement date whose buyer receives the redemption: the redemption's record date (a
+        settlement on it is cum), or the day before maturity with no record date. Trading stops after it."""
+        return min(self._record(self._n - 1), self.maturity - timedelta(days=1))
+
     def _accrued(self, k0: int, ex: int, s: date) -> float:
         if not self.frequency:
             return 0.0

@@ -61,7 +61,26 @@ import pandas as pd
 
 from cr_strat.bonds import DiscountInstrument, FixedRateBond, ZeroCouponBond
 from cr_strat.calendars import BusinessCalendar, calendar_for
-from cr_strat.conventions import CONVENTIONS, BondConventions, DiscountConventions, as_date
+from cr_strat.conventions import CONVENTIONS, BondConventions, DiscountConventions, as_date, convert_yield
+from cr_strat.corporates import (
+    CorporateBond,
+    corporate_from_terms,
+    read_amortisation,
+    read_corporate_options,
+    read_corporate_schedule,
+    read_corporate_terms,
+)
+from cr_strat.floating import (
+    FRB_COUPONS_CSV,
+    GoiFloatingRateBond,
+    discount_margin_bp,
+    goi_frb_bond,
+    goi_frb_rates,
+    index_dv01,
+    load_frb_terms,
+    spread_dv01,
+    tbill_way_table,
+)
 from cr_strat.ois import MIBOR_OIS, OisConventions, ois_schedule
 
 FLOAT_SCHEDULES = ("bond_coupons",)
@@ -69,7 +88,13 @@ ASW_COLUMNS = ("isin", "kind", "coupon_pct", "maturity_date", "settlement_date",
                "dirty_price", "ytm_pct", "modified_duration", "dv01", "years_to_maturity", "pv_on_curve", "annuity",
                "k_match_pct", "yield_yield_bp", "par_par_bp", "proceeds_bp", "z_spread_bp", "z_spread_sa_bp",
                "extrapolated", "calendar_projected", "error")
-TABLE_KINDS = ("gsec", "sdl", "green", "special", "tbill", "cmb", "cp", "cd")
+TABLE_KINDS = ("gsec", "sdl", "green", "special", "tbill", "cmb", "cp", "cd", "corporate")
+K_MATCH_BASES = ("schedule", "bond")
+FRB_ASW_COLUMNS = ("isin", "name", "settlement_date", "clean_price", "accrued", "dirty_price", "frb_yield_pct",
+                   "index_pct", "dm_index_bp", "dm_curve_bp", "z_spread_sa_bp", "spread_dv01", "index_dv01",
+                   "years_to_maturity", "coupon_pct", "coupon_status", "next_coupon_pct", "next_status",
+                   "extrapolated", "calendar_projected", "notes", "error")
+_BASIS_OF = {1: "annual", 2: "semiannual", 4: "quarterly", 12: "monthly"}
 _KIND_ALIASES = {"green": "gsec", "special": "gsec"}
 _YEAR = 365.0
 
@@ -100,23 +125,45 @@ class AssetSwapMeasures:
 
 
 def _flows(bond, s: date) -> tuple[list[date], np.ndarray]:
-    """Scheduled dates and amounts (per 100) of the payments after ``s``, one per date."""
+    """Scheduled dates and amounts (per 100) of the payments after ``s``, one per date. A corporate bond's flows fall
+    on the dates it is priced on: due dates, or payment dates for a settlement before SEBI's due-date rule
+    (``CorporateBond.uses_due_dates``)."""
     if isinstance(bond, DiscountInstrument):
         bond.days_to_maturity(s)  # refuses a settlement on or after maturity
         return [bond.maturity], np.array([100.0])
+    due = bond.uses_due_dates(s) if isinstance(bond, CorporateBond) else True
     by_date: dict[date, float] = {}
     for flow in bond.cash_flows(s):
-        by_date[flow.date] = by_date.get(flow.date, 0.0) + flow.amount
+        when = flow.date if due else flow.payment_date
+        by_date[when] = by_date.get(when, 0.0) + flow.amount
     dates = sorted(by_date)
     return dates, np.array([by_date[d] for d in dates])
 
 
 def _check_bond(bond) -> None:
+    if isinstance(bond, GoiFloatingRateBond):
+        raise ValueError("an FRB's coupons reset with its index: it has no fixed-coupon asset swap; measure its "
+                         "discount margin instead (asset_swaps.frb_measures, floating.discount_margin_bp)")
     if isinstance(bond, ZeroCouponBond):
         raise ValueError("STRIPS are not measured: a zero-coupon bond's asset swap has no coupon schedule to float on")
-    if not isinstance(bond, (FixedRateBond, DiscountInstrument)):
-        raise TypeError(f"bond must be a bonds.FixedRateBond (G-sec, SDL) or DiscountInstrument (T-bill, CMB, CP, CD), "
-                        f"not {type(bond).__name__}")
+    if not isinstance(bond, (FixedRateBond, DiscountInstrument, CorporateBond)):
+        raise TypeError(f"bond must be a bonds.FixedRateBond (G-sec, SDL), DiscountInstrument (T-bill, CMB, CP, CD) "
+                        f"or corporates.CorporateBond, not {type(bond).__name__}")
+
+
+def _k_on_bond_basis(bond: CorporateBond, k_pct: float, s: date, dates: Sequence[date]) -> float:
+    """``K_match`` (simple per floating period) restated to the corporate bond's yield basis: unchanged when the bond's
+    yield is simple (one flow under the money-market rule), from the coupon frequency's compounding to the bond's
+    otherwise (``convert_yield``; one period of ``tau`` years: ``(1 + K tau)^(1/tau) - 1`` first)."""
+    flows = bond._flows(s)
+    if flows.simple:
+        return k_pct
+    basis = bond.conventions.compounding
+    if len(dates) == 1 or not bond.frequency:
+        tau = (dates[-1] - s).days / _YEAR
+        annual = ((1 + k_pct / 100 * tau) ** (1 / tau) - 1) * 100
+        return float(convert_yield(annual, "annual", basis))
+    return float(convert_yield(k_pct, _BASIS_OF[bond.frequency], basis))
 
 
 def _rebased(curve, s: date, dates: Sequence[date], what: str) -> tuple[np.ndarray, bool]:
@@ -205,16 +252,37 @@ def z_spread(dates: Sequence[date], amounts, settlement, dirty_price: float, cur
     return _solve(price, target, max(-0.05, floor + 1e-9), 0.05)
 
 
-def asset_swap(bond, settlement, clean_price: float, curve, *,
-               float_schedule: str = "bond_coupons") -> AssetSwapMeasures:
+def _period_faces(bond, s: date, dates: Sequence[date]) -> np.ndarray:
+    """Face outstanding (per 100 original) in each floating period ending on ``dates``: 100 for every bond but an
+    amortising corporate bond, whose asset swap's notional amortises with it."""
+    if not isinstance(bond, CorporateBond) or not bond.amortisation:
+        return np.full(len(dates), 100.0)
+    due = bond.uses_due_dates(s)
+    face_at = {}
+    for p in bond.periods():
+        face_at.setdefault(p.due if due else p.payment, p.face)
+    return np.array([face_at.get(d, bond.outstanding_face(s)) for d in dates], dtype=float)
+
+
+def asset_swap(bond, settlement, clean_price: float, curve, *, float_schedule: str = "bond_coupons",
+               k_match_basis: str | None = None) -> AssetSwapMeasures:
     """Asset-swap measures of ``bond`` bought at ``clean_price`` (per 100; a bill's price) for ``settlement``.
 
-    ``bond``: a ``bonds.FixedRateBond`` (G-sec, SDL) or ``DiscountInstrument`` (T-bill, CMB, CP, CD). ``curve``:
-    any ``DiscountCurveLike``. ``float_schedule``: the asset swap's floating schedule (only ``"bond_coupons"``).
+    ``bond``: a ``bonds.FixedRateBond`` (G-sec, SDL), ``DiscountInstrument`` (T-bill, CMB, CP, CD) or
+    ``corporates.CorporateBond`` (an NCD: its flows on the dates it is priced on, an amortising bond's floating
+    notional amortising with it; an FRB is refused: ``frb_measures``). ``curve``: any ``DiscountCurveLike``.
+    ``float_schedule``: the asset swap's floating schedule (only ``"bond_coupons"``). ``k_match_basis``:
+    ``schedule`` (the matched OIS rate as a par rate on the floating schedule, the default for G-secs and bills)
+    or ``bond`` (restated to the bond's own yield basis before the yield-yield spread: annual compounding for an
+    NCD, its default; a simple rate under the money-market rule is left simple).
     """
     _check_bond(bond)
     if float_schedule not in FLOAT_SCHEDULES:
         raise ValueError(f"float_schedule must be one of {FLOAT_SCHEDULES}, not {float_schedule!r}")
+    basis = k_match_basis if k_match_basis is not None else ("bond" if isinstance(bond, CorporateBond) else
+                                                             "schedule")
+    if basis not in K_MATCH_BASES:
+        raise ValueError(f"k_match_basis must be one of {K_MATCH_BASES}, not {k_match_basis!r}")
     s = as_date(settlement)
     clean = float(clean_price)
     if not (math.isfinite(clean) and clean > 0):
@@ -237,8 +305,16 @@ def asset_swap(bond, settlement, clean_price: float, curve, *,
     pv = float(cf @ d)
     starts = [s, *dates[:-1]]
     tau = np.array([(e - b).days for b, e in zip(starts, dates)], dtype=float) / _YEAR
-    annuity = float(tau @ d)
-    k_match = float((1.0 - d[-1]) / annuity * 100)
+    faces = _period_faces(bond, s, dates)
+    if (faces == 100.0).all():
+        annuity = float(tau @ d)
+        k_match = float((1.0 - d[-1]) / annuity * 100)
+    else:  # an amortising notional: the par rate of an OIS whose notional follows the bond's face
+        d_start = np.r_[1.0, d[:-1]]
+        annuity = float((tau * faces / 100) @ d)
+        k_match = float((faces / 100) @ (d_start - d) / annuity * 100)
+    if basis == "bond" and isinstance(bond, CorporateBond):  # a G-sec's or bill's rate is on its own basis already
+        k_match = _k_on_bond_basis(bond, k_match, s, dates)
     par_par = (pv - dirty) / (100.0 * annuity)
     return AssetSwapMeasures(
         settlement=s, maturity=bond.maturity, clean_price=clean, accrued=accrued, dirty_price=dirty, ytm_pct=ytm,
@@ -289,10 +365,15 @@ def _blank(value) -> bool:
 def instrument_from_row(rec: dict, where: str = "row"):
     """A ``bonds`` instrument from a row (``kind``, ``maturity_date``, ``coupon_pct``, optional ``issue_date`` and
     ``first_coupon_date``) and its kind: G-secs, green bonds, special securities and SDLs as ``FixedRateBond``,
-    bills, CP and CD as ``DiscountInstrument`` (``TABLE_KINDS``)."""
+    bills, CP and CD as ``DiscountInstrument`` (``TABLE_KINDS``); a ``corporate`` row is read as a row of the
+    corporate terms table (``corporates.corporate_from_terms``: ``issue_date`` and ``frequency`` too, payment and
+    record dates on the default lenient settlement calendar)."""
     kind = str(rec.get("kind") or "gsec").strip().lower()
     if kind not in TABLE_KINDS:
         raise ValueError(f"{where}: kind {kind!r} has no pricer here (one of {TABLE_KINDS})")
+    if kind == "corporate":
+        return corporate_from_terms({k: v for k, v in rec.items() if not _blank(v)} | {"kind": "corporate"},
+                                    where=where), kind
     conv = CONVENTIONS[_KIND_ALIASES.get(kind, kind)]
     if _blank(rec.get("maturity_date")):
         raise ValueError(f"{where}: maturity_date is missing")
@@ -355,17 +436,26 @@ def _same(a, b) -> bool:
         return str(a).strip().lower() == str(b).strip().lower()
 
 
-def asset_swap_table(frame: pd.DataFrame, curve, settlement=None) -> pd.DataFrame:
+def asset_swap_table(frame: pd.DataFrame, curve, settlement=None, *, terms=None, schedule=None, options=None,
+                     amortisation=None) -> pd.DataFrame:
     """``asset_swap`` for every row of ``frame``: one row per bond (``ASW_COLUMNS``), sorted by maturity and ISIN.
 
     Columns: ``isin``, ``maturity_date``, ``clean_price`` (or ``yield_pct``, priced with ``bonds``), ``kind``
     (default ``gsec``; ``TABLE_KINDS``), ``coupon_pct`` for coupon bonds, optional ``issue_date``,
     ``first_coupon_date`` and ``settlement_date`` (default ``settlement``, else the curve's ``effective`` date). A
-    row that cannot be measured keeps NaN and the reason in ``error`` (a bond past the curve, say).
+    row that cannot be measured keeps NaN and the reason in ``error`` (a bond past the curve, say). A row whose ISIN
+    is in ``terms`` (the corporate terms table, with its ``schedule``, ``options`` and ``amortisation`` tables) is a
+    corporate bond built from them (its ``maturity_date`` may then be blank; ``k_match_pct`` is restated to its
+    annual basis); a floating-rate one is refused, pointing to ``frb_asset_swap_table``.
     """
     if not isinstance(frame, pd.DataFrame):
         raise TypeError("frame must be a DataFrame")
-    missing = [c for c in ("isin", "maturity_date") if c not in frame]
+    corp = read_corporate_terms(terms) if terms is not None else None
+    by_isin = {} if corp is None else {r["isin"]: r for r in corp.to_dict("records")}
+    sched = None if schedule is None else read_corporate_schedule(schedule)
+    opts = None if options is None else read_corporate_options(options)
+    amort = None if amortisation is None else read_amortisation(amortisation)
+    missing = [c for c in ("isin",) + (() if by_isin else ("maturity_date",)) if c not in frame]
     if missing or not ({"clean_price", "yield_pct"} & set(frame.columns)):
         raise ValueError("the bonds need isin, maturity_date and clean_price or yield_pct; missing "
                          f"{missing or 'a price'}")
@@ -381,7 +471,22 @@ def asset_swap_table(frame: pd.DataFrame, curve, settlement=None) -> pd.DataFram
         out.update(isin=rec.get("isin"), kind=rec.get("kind") or "gsec", coupon_pct=rec.get("coupon_pct", math.nan),
                    extrapolated=None, calendar_projected=None, error="")
         try:
-            out["maturity_date"] = as_date(rec["maturity_date"])
+            isin = str(rec.get("isin") or "").strip()
+            if isin in by_isin:
+                row = by_isin[isin]
+                if row["kind"] == "frb_corp":
+                    raise ValueError(f"{isin} is a floating-rate bond: its spread is a discount margin "
+                                     "(asset_swaps.frb_asset_swap_table, floating.discount_margin_bp)")
+                bond, kind = corporate_from_terms(row, schedule=sched, options=opts, amortisation=amort,
+                                                  where=where), "corporate"
+                out["coupon_pct"] = bond.coupon_pct
+                if not _blank(rec.get("maturity_date")) and as_date(rec["maturity_date"]) != bond.maturity:
+                    raise ValueError(f"maturity_date {rec['maturity_date']} differs from the terms' {bond.maturity}")
+                out["maturity_date"] = bond.maturity
+            elif "maturity_date" not in rec:
+                raise ValueError("maturity_date is missing (and the ISIN is not in the corporate terms)")
+            else:
+                out["maturity_date"] = as_date(rec["maturity_date"])
             given = rec.get("settlement_date")
             given = None if _blank(given) else given
             if given is None and default is None:
@@ -389,7 +494,8 @@ def asset_swap_table(frame: pd.DataFrame, curve, settlement=None) -> pd.DataFram
                                  "date")
             s = as_date(given if given is not None else default)
             out["settlement_date"] = s
-            bond, kind = instrument_from_row(rec, where)
+            if isin not in by_isin:
+                bond, kind = instrument_from_row(rec, where)
             out["kind"] = kind
             clean = rec.get("clean_price")
             if _blank(clean):
@@ -403,7 +509,7 @@ def asset_swap_table(frame: pd.DataFrame, curve, settlement=None) -> pd.DataFram
                 if hasattr(m, name):
                     out[name] = getattr(m, name)
             out.update(clean_price=m.clean_price, settlement_date=m.settlement)
-        except (ValueError, TypeError) as exc:
+        except (ValueError, TypeError, NotImplementedError) as exc:
             out["error"] = str(exc)
         rows.append(out)
     table = pd.DataFrame(rows, columns=list(ASW_COLUMNS))
@@ -411,5 +517,136 @@ def asset_swap_table(frame: pd.DataFrame, curve, settlement=None) -> pd.DataFram
     return table.loc[order.sort_values(["_m", "_i"], kind="mergesort").index].reset_index(drop=True)
 
 
-__all__ = ["ASW_COLUMNS", "FLOAT_SCHEDULES", "MASTER_FIELDS", "TABLE_KINDS", "AssetSwapMeasures", "asset_swap",
-           "asset_swap_table", "fill_from_master", "hedge_notional", "instrument_from_row", "z_spread"]
+@dataclass(frozen=True)
+class FrbMeasures:
+    """A GoI FRB's spread measures against one curve, per 100 face (``frb_measures``)."""
+
+    settlement: date
+    maturity: date
+    clean_price: float
+    accrued: float
+    dirty_price: float
+    frb_yield_pct: float
+    index_pct: float
+    dm_index_bp: float
+    dm_curve_bp: float
+    z_spread_sa_bp: float
+    spread_dv01: float
+    index_dv01: float
+    years_to_maturity: float
+    coupon_pct: float
+    coupon_status: str
+    extrapolated: bool
+    calendar_projected: bool
+
+
+def frb_measures(bond: GoiFloatingRateBond, settlement, clean_price: float, curve, *,
+                 index_pct: float | None = None) -> FrbMeasures:
+    """The measures of a GoI FRB (``floating.GoiFloatingRateBond``) bought at ``clean_price`` against ``curve``.
+
+    An FRB's coupons follow its index, so it has no fixed-coupon asset swap: its spread is a discount margin.
+    ``dm_curve_bp``: the parallel shift of the curve's continuously compounded zero rates that prices its flows, the
+    coupons not yet fixed at their projected rates (``floating.discount_margin_bp`` in curve form; on an OIS curve,
+    the FRB's spread over OIS); ``z_spread_sa_bp`` the semi-annual variant; ``dm_index_bp`` the index form over
+    ``index_pct`` (default the bond's: the base its flat projection stands on), NaN without one. ``spread_dv01``:
+    the price change per bp of discount margin (index form when an index is known, else curve form);
+    ``index_dv01``: per bp of the projected index, margin held (index form; NaN without an index).
+    """
+    if not isinstance(bond, GoiFloatingRateBond):
+        raise TypeError(f"bond must be a floating.GoiFloatingRateBond, not {type(bond).__name__}")
+    s = as_date(settlement)
+    clean = float(clean_price)
+    if not (math.isfinite(clean) and clean > 0):
+        raise ValueError(f"clean price must be a positive number, not {clean_price!r}")
+    cal = getattr(curve, "calendar", None) or calendar_for("mumbai_settlement")
+    if not (cal if cal.covers(s) else cal.lenient()).is_business_day(s):
+        raise ValueError(f"settlement {s} is not a business day on calendar {cal.name!r}")
+    dates, cf = _flows(bond, s)
+    _, extrapolated = _rebased(curve, s, dates, f"the FRB maturing {bond.maturity}")
+    accrued = bond.accrued_interest(s)
+    dirty = clean + accrued
+    index = index_pct if index_pct is not None else bond.index_pct
+    dm_curve = z_spread(dates, cf, s, dirty, curve) * 1e4
+    if index is not None:
+        dm_index = discount_margin_bp(bond, s, clean, index_pct=index)
+        dv01 = spread_dv01(bond, s, dm_index, index_pct=index)
+        idx_dv01 = index_dv01(bond, s, dm_index, index_pct=index)
+    else:
+        dm_index, idx_dv01 = math.nan, math.nan
+        dv01 = spread_dv01(bond, s, dm_curve, curve=curve, form="curve")
+    return FrbMeasures(
+        settlement=s, maturity=bond.maturity, clean_price=clean, accrued=accrued, dirty_price=dirty,
+        frb_yield_pct=bond.yield_from_price(clean, s), index_pct=math.nan if index is None else float(index),
+        dm_index_bp=dm_index, dm_curve_bp=dm_curve,
+        z_spread_sa_bp=z_spread(dates, cf, s, dirty, curve, compounding="semiannual") * 1e4, spread_dv01=dv01,
+        index_dv01=idx_dv01, years_to_maturity=(bond.maturity - s).days / _YEAR, coupon_pct=bond.coupon_rate(s),
+        coupon_status=bond.rate_status(s), extrapolated=extrapolated,
+        calendar_projected=bool(getattr(curve, "calendar_projected", False)))
+
+
+def frb_asset_swap_table(frame: pd.DataFrame, curve, settlement=None, *, terms=None, announced=FRB_COUPONS_CSV,
+                         tbills=None, as_of=None, allow_fewer: bool = False) -> pd.DataFrame:
+    """``frb_measures`` for every GoI FRB row of ``frame`` (``FRB_ASW_COLUMNS``), sorted by maturity and ISIN.
+
+    ``frame``: ``isin``, ``clean_price`` (or ``yield_pct``), optional ``settlement_date`` (default ``settlement``,
+    else the curve's ``effective`` date). ``terms``: the GoI FRB terms (default the shipped table),
+    ``announced``: announced coupons (default the shipped table; ``None`` for none), ``tbills``: 182-day T-bill
+    results (``floating.tbill_way_table`` or its input). Each FRB's coupons are those known at ``as_of``
+    (``floating.goi_frb_rates``; ``None``: everything in the inputs, a look-ahead for a past date): a back-test must
+    pass the time it decides at. A row that cannot be measured keeps the reason in ``error``.
+    """
+    if not isinstance(frame, pd.DataFrame):
+        raise TypeError("frame must be a DataFrame")
+    if "isin" not in frame or not ({"clean_price", "yield_pct"} & set(frame.columns)):
+        raise ValueError("the FRBs need isin and clean_price or yield_pct")
+    table = load_frb_terms() if terms is None else load_frb_terms(terms)
+    by_isin = {r["isin"]: r for r in table.to_dict("records")}
+    bills = None if tbills is None else tbill_way_table(tbills)
+    default = settlement if settlement is not None else getattr(curve, "effective", None)
+    rows = []
+    for rec in frame.to_dict("records"):
+        isin = str(rec.get("isin") or "").strip()
+        out = dict.fromkeys(FRB_ASW_COLUMNS, math.nan) | {"isin": isin, "name": "", "coupon_status": "",
+                                                          "next_status": "", "extrapolated": None,
+                                                          "calendar_projected": None, "notes": "", "error": ""}
+        try:
+            if isin not in by_isin:
+                raise ValueError(f"{isin} is not in the GoI FRB terms (floating.load_frb_terms)")
+            row = by_isin[isin]
+            out["name"] = row["name"]
+            given = rec.get("settlement_date")
+            if _blank(given) and default is None:
+                raise ValueError("no settlement date: give settlement_date, settlement= or a curve with an effective "
+                                 "date")
+            s = as_date(default if _blank(given) else given)
+            out["settlement_date"] = s
+            rates = goi_frb_rates(row, bills, announced, as_of=as_of, allow_fewer=allow_fewer)
+            bond = goi_frb_bond(row, rates)
+            out["maturity_date"] = bond.maturity
+            clean = rec.get("clean_price")
+            if _blank(clean):
+                y = rec.get("yield_pct")
+                if _blank(y):
+                    raise ValueError("no clean_price or yield_pct")
+                clean = bond.clean_price(float(y), s)
+            m = frb_measures(bond, s, float(clean), curve)
+            for name in FRB_ASW_COLUMNS:
+                if hasattr(m, name):
+                    out[name] = getattr(m, name)
+            ahead = rates[rates["period_start"] > s].head(1)
+            current = rates[(rates["period_start"] <= s) & (rates["period_end"] > s)]
+            if not ahead.empty:
+                out.update(next_coupon_pct=float(ahead["rate_pct"].iloc[0]), next_status=ahead["status"].iloc[0])
+            out["notes"] = "; ".join(n for n in (*current["notes"].tolist(), *ahead["notes"].tolist()) if n)
+        except (ValueError, TypeError, NotImplementedError) as exc:
+            out["error"] = str(exc)
+        rows.append(out)
+    result = pd.DataFrame(rows, columns=list(FRB_ASW_COLUMNS) + ["maturity_date"])
+    order = result.assign(_m=pd.to_datetime(result["maturity_date"], errors="coerce"), _i=result["isin"].astype(str))
+    result = result.loc[order.sort_values(["_m", "_i"], kind="mergesort").index].reset_index(drop=True)
+    return result[list(FRB_ASW_COLUMNS)]
+
+
+__all__ = ["ASW_COLUMNS", "FLOAT_SCHEDULES", "FRB_ASW_COLUMNS", "K_MATCH_BASES", "MASTER_FIELDS", "TABLE_KINDS",
+           "AssetSwapMeasures", "FrbMeasures", "asset_swap", "asset_swap_table", "fill_from_master",
+           "frb_asset_swap_table", "frb_measures", "hedge_notional", "instrument_from_row", "z_spread"]

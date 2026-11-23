@@ -1,13 +1,14 @@
 """The return engine: positions, daily valuation, funding, OIS hedges, NAV and a P&L attribution that adds up.
 
-For the strategies of ``docs/rates_data_sources.md`` whose instruments ``bonds`` prices (S1 asset swaps first, then S3,
-S5 and S7; S2 for CP and CD only, S4's auction trades, S6's SDLs): a ledger of bond and OIS trades kept by book, valued
-every Mumbai business day from a table of marks, funded overnight in TREPS or market repo at the RBI store's rates,
-charged the costs of ``costs``, with each day's change in NAV split into lines that sum to it exactly. ``run_book`` runs
-a list of trades; ``run_backtest`` runs a strategy that decides each evening on what was public then and trades the next
-business day. Every price, accrued interest, yield, DV01 and convexity comes from ``bonds``, every OIS value from
-``ois.ois_npv`` and ``ois.settlement_amounts``, every haircut and TREPS cap from ``funding``, every curve from
-``curvefit`` (any ``DiscountCurveLike``); nothing here builds a cash flow. The rules are those of the return-engine
+For the strategies of ``docs/rates_data_sources.md`` whose instruments ``bonds``, ``corporates`` and ``floating`` price
+(S1 asset swaps first, then S3, S5 and S7; S2's CP, CD and corporate bonds, S4's auction trades, S6's SDLs, GoI FRBs):
+a ledger of bond and OIS trades kept by book, valued every Mumbai business day from a table of marks, funded overnight
+in TREPS or market repo at the RBI store's rates, charged the costs of ``costs``, with each day's change in NAV split
+into lines that sum to it exactly. ``run_book`` runs a list of trades; ``run_backtest`` runs a strategy that decides
+each evening on what was public then and trades the next business day. Every price, accrued interest, yield, DV01 and
+convexity comes from ``bonds`` (or ``corporates`` and ``floating``), every OIS value from ``ois.ois_npv`` and
+``ois.settlement_amounts``, every haircut and TREPS cap from ``funding``, every curve from ``curvefit`` (any
+``DiscountCurveLike``); nothing here builds a cash flow. The rules are those of the return-engine
 specification of 19 Nov 2026 (its section numbers in brackets); each rule no source confirms is a named parameter marked
 UNVERIFIED here and in ``docs/analytics.md``.
 
@@ -37,6 +38,39 @@ residual), then ``stale`` (the last mark's clean price held), each flagged with 
 than ``max_stale_days`` (5 business days, UNVERIFIED) are flagged ``stale_warning``. A position with no mark at all
 yet, or traded today when its only mark is older, is valued at the fund's own fill of the day (``fill``, flagged).
 Fills never use model or stale prices.
+
+**Corporate bonds and FRBs.** An ISIN listed in ``MarketData.corporate_terms`` is a corporate bond priced by
+``corporates.CorporateBond`` (with its schedule, calls and puts, amortisation, rating-linked steps and, for
+``frb_corp``, benchmark fixings); a GoI FRB (``frb``) is priced by ``floating.GoiFloatingRateBond`` from ``frb_terms``
+(the shipped table by default). A corporate trade settles on the exchange, T+1 unless its ``settlement_date`` says
+otherwise (T+0 allowed, handbook 3.5.1); an FRB as a G-sec. Each day at the valuation time, and at each trade's
+settlement check, the bond is rebuilt as known then (``Instrument.known``): a ``frb_corp`` fixing, a rating action and
+a call's or put's exercise only from their ``public_from``; an FRB's coupon as ``floating.goi_frb_rates`` knows it
+(announced, computed from the three latest 182-day T-bill results public by then, or projected flat and noted; a period
+it cannot project is refused unless ``frb_allow_fewer``). When the bond as known changes, the previous close's mark is
+restated on it (its yield from the same clean price) and the interest accrued to that close is restated at the new
+coupon in the ``coupon_reset`` line, ``F/100 (AI_new(prev) - AI_old(prev))``, nonzero only when a coupon becomes known
+after its period began (a fixing or rating action published late). A corporate coupon goes to the holder at the close
+of its record date (``CorporateBond.record_date``: 15 days before the due date under the SEBI conventions of
+``corporates``, a holiday moved to the preceding day; at the latest the day before the due date; a record date on a
+holiday takes the previous business day's close) and is a receivable until its payment date; a settlement after the
+record date is ex-interest, its accrued interest negative to the due date. A partial redemption is entitled the same
+way (``pull_to_par``: the principal booked at face against the clean price's fall), the mark of its record date,
+whose standard settlement is ex the principal, is restated to settle that day, and a stale mark held across that
+record date holds its yield rather than its price (which still holds the principal); positions keep the original face
+(``corporates`` prices per 100 original face; the notes give the outstanding face). The redemption closes the position
+at its record date's close into a receivable: trading is suspended after it, so a later settlement is refused and a
+mark whose standard settlement falls after it is restated to settle on the day itself. An exercised call or put
+redeems at its date and price once the exercise is public; an unexercised option changes no flow (the bond is valued
+to maturity and the mark carries the option). Costs (``costs``): the debenture stamp duty (0.0001% of the
+consideration, on the buyer), the exchange's fee (Rs 5 a crore of value, Rs 25 to Rs 500, GST extra), no CCIL charge,
+the half spread by the trade's ``rating_bucket`` (else the terms', else the widest, all UNVERIFIED); FRBs take the
+G-sec rows. Funding: neither is TREPS collateral here (corporate bonds are not on CCIL's list; FRBs are GoI dated
+securities but are taken as ineligible, UNVERIFIED and conservative); with a row for its kind in the user's haircut
+table a bond is lent against in market repo (``excess_segment``), without one not at all (equity-funded). Attribution:
+a corporate bond's yield moves against the G-sec curve (``rich_cheap`` is its spread's change); an FRB has no default
+reference curve, so its price move is ``price_unattributed`` (a fixed-rate DV01 on projected coupons would overstate
+its rate risk).
 
 **Attribution** (A2). For each position and day, market lines on the start-of-day book from close to close: ``accrual``
 (accrued interest gained plus coupons entitled), ``pull_to_par`` (``F/100 (clean(y0, s_d) - clean(y0, s_prev))``), and
@@ -125,12 +159,16 @@ fixings, the RBI store's four days of Nov 2026 for funding): no licensed mark, c
 used. Unverified: the valuation convention, the roll-down definition, the factor basis, the missing-mark rules, the
 funding sizing and rate basis, the TREPS-first split, the margin's form, a hedge's DV01 allowed up to
 ``HEDGE_TOLERANCE`` (105%) of its bonds' under ``hedge_only``, the auction allotment share, the costs marked U in
-``costs``, the decision and mark times. Not built: corporate bonds (S2's AAA bonds), FRBs and inflation-indexed bonds
-(no pricer: refused); CSA, clearing margin or charges on OIS; security-wise repo rates (a short's special rate is the
-user's, constant over the short); the key-rate DV01 table (DV01 is by tenor bucket); the funding lines allocated to
-positions (they stay at book level; ``positions.funded`` gives each long's share for reporting); the tradable
-universe from the issuance ledger (a strategy's own job); an auction's own allotment rules beyond the limits above
-(pro-rata at the cut-off, the 5% non-competitive pool); intraday timing beyond the decision time; tax.
+``costs``, the decision and mark times; for corporate bonds and FRBs, the exchange's T+1, the record-date rules of
+``corporates``, FRBs as not TREPS collateral, the half spreads by rating, the flat projection of an unknown coupon.
+Not built: inflation-indexed bonds (no pricer: refused); a corporate bond's default or missed payment (every scheduled
+flow is paid), a partial exercise of a call or put, a ``frb_corp`` bond with rating steps as well, an FRB's split into
+index and spread risk (``asset_swaps.frb_measures`` gives the measures); CSA, clearing margin or charges on OIS;
+security-wise repo rates (a short's special rate is the user's, constant over the short); the key-rate DV01 table (DV01
+is by tenor bucket); the funding lines allocated to positions (they stay at book level; ``positions.funded`` gives each
+long's share for reporting); the tradable universe from the issuance ledger (a strategy's own job); an auction's own
+allotment rules beyond the limits above (pro-rata at the cut-off, the 5% non-competitive pool); intraday timing beyond
+the decision time; tax.
 """
 
 from __future__ import annotations
@@ -151,7 +189,32 @@ from cr_strat import costs as cost_rules
 from cr_strat.bonds import DiscountInstrument, FixedRateBond, ZeroCouponBond
 from cr_strat.calendars import BusinessCalendar, CalendarCoverageError, mumbai_settlement_calendar
 from cr_strat.conventions import CONVENTIONS, as_date
+from cr_strat.corporates import (
+    CorporateBond,
+    apply_rating_steps,
+    corporate_from_terms,
+    read_amortisation,
+    read_corporate_options,
+    read_corporate_schedule,
+    read_corporate_terms,
+    read_step_rules,
+    step_rule_from_row,
+)
 from cr_strat.curvefit import FittedCurve, NssCurve
+from cr_strat.floating import (
+    FRB_COUPONS_CSV,
+    GoiFloatingRateBond,
+    corporate_frb_rates,
+    floating_terms_from_row,
+    goi_frb_bond,
+    goi_frb_rates,
+    load_frb_coupons,
+    load_frb_terms,
+    rate_steps,
+    read_fixings,
+    read_floating_terms,
+    tbill_way_table,
+)
 from cr_strat.funding import FUNDING_SOURCES, haircut, read_haircuts, treps_class, treps_shares
 from cr_strat.issuance import TENOR_BUCKETS, tenor_bucket
 from cr_strat.ois import (
@@ -171,7 +234,7 @@ from cr_strat.ois import (
 
 TRADE_COLUMNS = ("trade_id", "book", "isin", "kind", "side", "face", "price", "yield_pct", "trade_date", "trade_time",
                  "settlement_date", "venue", "mid_price", "liquidity", "broker", "special_repo_pct", "notified_cr",
-                 "coupon_pct", "maturity_date", "issue_date", "first_coupon_date", "note")
+                 "coupon_pct", "maturity_date", "issue_date", "first_coupon_date", "rating_bucket", "note")
 SWAP_TRADE_COLUMNS = ("trade_id", "book", "trade_date", "effective", "months", "fixed_rate_pct", "notional",
                       "pay_fixed", "mid_rate_pct", "purpose", "note")
 FLOW_COLUMNS = ("date", "book", "amount")
@@ -202,6 +265,7 @@ PERFORMANCE_COLUMNS = ("book", "start", "end", "business_days", "calendar_days",
 DRAWDOWN_COLUMNS = ("date", "book", "index", "peak", "drawdown")
 
 CARRY_LINES = ("accrual", "pull_to_par")
+RESET_LINE = "coupon_reset"  # a coupon as known changing in the period it is accrued (FRBs, rating steps)
 FACTORS = ("parallel", "slope", "curvature")
 TRADE_LINES = ("trading", "spread_cost")
 COST_LINES = ("fees", "brokerage", "gst", "stamp_duty")
@@ -211,7 +275,7 @@ MEMO_LINES = ("memo_haircut_cost", "memo_margin_cost", "memo_cash_benchmark")
 COSTS_IN_PNL = ("spread_cost", "fees", "brokerage", "gst", "stamp_duty", "repo_charges")
 DEFAULT_NODES = (0.5, 1.0, 2.0, 3.0, 5.0, 7.0, 10.0, 15.0, 20.0, 30.0, 40.0)  # UNVERIFIED node choice
 DEFAULT_REFERENCE = (("gsec", "gsec"), ("green", "gsec"), ("special", "gsec"), ("tbill", "gsec"), ("cmb", "gsec"),
-                     ("strips", "gsec"), ("sdl", "gsec"), ("cp", "ois"), ("cd", "ois"))
+                     ("strips", "gsec"), ("sdl", "gsec"), ("cp", "ois"), ("cd", "ois"), ("corporate", "gsec"))
 FACTOR_BASES = ("legendre3", "key_rates")
 ROLL_BASES = ("constant_curve", "forwards")
 PNL_BASES = ("actual", "excess_of_cash")
@@ -222,10 +286,12 @@ EXECUTIONS = ("next_vwap", "next_close")
 OIS_PURPOSES = ("none", "hedge_only", "any")
 COUPON_KINDS = frozenset({"gsec", "green", "special", "sdl"})
 DISCOUNT_KINDS = frozenset({"tbill", "cmb", "cp", "cd"})
-PRICED_KINDS = COUPON_KINDS | DISCOUNT_KINDS | {"strips"}
-NO_PRICER_KINDS = frozenset({"frb", "iib", "corporate"})
+TERMS_KINDS = frozenset({"corporate", "frb"})  # priced from their own terms tables: corporates, floating
+PRICED_KINDS = COUPON_KINDS | DISCOUNT_KINDS | {"strips"} | TERMS_KINDS
+NO_PRICER_KINDS = frozenset({"iib"})
 CENTRAL_DATED = frozenset({"gsec", "green"})
-T0_KINDS = frozenset({"cp", "cd"})  # Handbook 3.5.1: T+0 windows for CP and CD, none for G-secs (partly verified)
+T0_KINDS = frozenset({"cp", "cd", "corporate"})  # Handbook 3.5.1: T+0 windows for CP, CD and corporate bonds (to
+# 14:30), none for G-secs (partly verified)
 _KIND_CONVENTIONS = {"gsec": "gsec", "green": "gsec", "special": "gsec", "sdl": "sdl", "strips": "strips",
                      "tbill": "tbill", "cmb": "cmb", "cp": "cp", "cd": "cd"}
 _YEAR = 365.0
@@ -526,6 +592,8 @@ class EngineSettings:
     competitive order fills at most this share of the amount accepted: 10%, UNVERIFIED) and
     ``auction_nc_limit_rs`` (a non-competitive bid in a GoI dated auction: Rs 2 crore, RBI's auction notifications,
     verified; an SDL's is 1% of the notified amount, verified; T-bill non-competitive bids are not modelled).
+    ``frb_allow_fewer``: project a GoI FRB's coupons from fewer than three public T-bill results (flagged), as
+    ``floating.goi_frb_rates`` allows; otherwise such a projection is refused and the coupon stays unknown.
     """
 
     access: AccessPolicy
@@ -543,6 +611,7 @@ class EngineSettings:
     rf_segment: str = "triparty"
     auction_max_share: float = 0.10
     auction_nc_limit_rs: float = 2e7
+    frb_allow_fewer: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.access, AccessPolicy):
@@ -918,7 +987,13 @@ def _risk(bond, y: float, s: date) -> tuple[float, float, float]:
 @dataclass(frozen=True)
 class Instrument:
     """A priced security of the book: its ``bonds`` object without a calendar (``bond``, for every price and yield)
-    and the same with the engine's calendar (``paying``, only for payment dates near the day asked)."""
+    and the same with the engine's calendar (``paying``, only for payment dates near the day asked).
+
+    A corporate bond or an FRB has ``known``: the bond as known at a time (coupons fixed or announced by then,
+    exercises and rating steps public by then); ``bond`` and ``paying`` are then the bond as known at the current
+    day's valuation time, ``version`` counts its changes, ``maturity`` is the effective one (a call exercised) and
+    ``rating_bucket`` the terms table's, for the costs. A corporate bond keeps its own lenient payment calendar.
+    """
 
     isin: str
     kind: str
@@ -928,20 +1003,36 @@ class Instrument:
     issue_date: date | None
     conventions: Any
     liquidity: str | None = None
+    known: Callable[[datetime], Any] | None = None
+    version: int = 0
+    rating_bucket: str | None = None
 
     @property
     def lag(self) -> int:
         return self.conventions.settlement_lag
 
+    @property
+    def last_settlement(self) -> date:
+        """The last settlement date that receives the redemption: a corporate bond's redemption record date (trading
+        stops after it), else the day before maturity."""
+        if isinstance(self.bond, CorporateBond):
+            return self.bond.last_cum_settlement()
+        return self.maturity - timedelta(days=1)
+
     def redemption_payment(self) -> date:
         if isinstance(self.paying, DiscountInstrument):
             return self.paying.payment_date()
+        if isinstance(self.paying, CorporateBond):
+            return self.paying.periods()[-1].payment
         return [f for f in self.paying.cash_flows(self._before_maturity()) if f.kind == "redemption"][0].payment_date
 
     def redemption_amount(self) -> float:
         """Per 100 face: the redemption plus the last coupon (a bill: 100)."""
         if isinstance(self.bond, DiscountInstrument):
             return 100.0
+        if isinstance(self.bond, CorporateBond):
+            last = self.bond.periods()[-1]
+            return last.amount + last.principal
         s = self._before_maturity()
         last = [f for f in self.bond.cash_flows(s) if f.date == self.maturity]
         return sum(f.amount for f in last)
@@ -953,12 +1044,18 @@ class Instrument:
 def make_instrument(isin: str, terms: Mapping, calendar: BusinessCalendar, where: str) -> Instrument:
     """An ``Instrument`` from terms (``kind``, ``coupon_pct``, ``maturity_date``, ``issue_date``,
     ``first_coupon_date``): G-secs, green bonds, special securities and SDLs as ``bonds.FixedRateBond``, STRIPS as
-    ``ZeroCouponBond``, T-bills, CMBs, CP and CD as ``DiscountInstrument``. FRBs, inflation-indexed and corporate bonds
-    have no pricer and are refused."""
+    ``ZeroCouponBond``, T-bills, CMBs, CP and CD as ``DiscountInstrument``. Inflation-indexed bonds have no pricer and
+    are refused; corporate bonds and FRBs are refused here too: their terms tables build them (``MarketData``'s
+    ``corporate_terms`` and ``frb_terms``)."""
     kind = _text(terms.get("kind")).lower()
     if kind in NO_PRICER_KINDS:
-        raise ValueError(f"{where}: {isin} is a {kind}, which has no pricer in bonds.py (floating-rate, "
-                         "inflation-indexed and corporate bonds are not built)")
+        raise ValueError(f"{where}: {isin} is a {kind}, which has no pricer in bonds.py (inflation-indexed bonds are "
+                         "not built)")
+    if kind in TERMS_KINDS:
+        table = "corporate_terms (corporates.read_corporate_terms)" if kind == "corporate" else (
+            "frb_terms (floating.load_frb_terms; the shipped table holds the five outstanding GoI FRBs)")
+        raise ValueError(f"{where}: {isin} is a {kind}, which has no pricer in bonds.py: its terms come from "
+                         f"MarketData.{table}, which does not list it")
     if kind not in PRICED_KINDS:
         raise ValueError(f"{where}: {isin}: kind {terms.get('kind')!r} is not one of {sorted(PRICED_KINDS)}")
     maturity = _opt_date(terms.get("maturity_date"), f"{where}: maturity_date")
@@ -1277,6 +1374,17 @@ class MarketData:
     ``store`` (an RBI store directory, for ``Snapshot.store_table``), ``macro_store`` (a macro store directory, for
     ``Snapshot.macro``) and ``mpc_meetings`` (a meetings file for ``policy_path.load_mpc_calendar``; default the
     shipped one). Only ``marks`` and, for a book that borrows, ``funding`` and ``haircuts`` are needed.
+
+    Corporate bonds and FRBs are priced from their own terms (each table a frame or CSV): ``corporate_terms``
+    (``corporates.read_corporate_terms``; an ISIN in it is a corporate bond), with its ``corporate_schedule``,
+    ``corporate_options`` (calls and puts, each exercise counted from its ``exercised_public_from``) and
+    ``corporate_amortisation``; ``corporate_steps`` (``corporates.read_step_rules``: rating-linked coupon steps) with
+    ``ratings`` (``agency``, ``rating``, ``public_from`` and ``isin`` or ``issuer_id``: each action used only from its
+    time); ``corporate_floating`` (``floating.read_floating_terms``: a ``frb_corp`` bond's benchmark terms) with
+    ``benchmark_fixings`` (``floating.read_fixings``, each fixing with its ``public_from``). GoI FRBs: ``frb_terms``
+    (default the shipped ``goi_frb_terms.csv``), ``frb_coupons`` (announced coupons, default the shipped table;
+    ``None`` for none) and ``tbills`` (182-day T-bill results, ``floating.tbill_way_table`` or its input: each with
+    its ``public_from``). Every day the bond is rebuilt as known at the valuation time.
     """
 
     marks: pd.DataFrame | None = None
@@ -1295,6 +1403,17 @@ class MarketData:
     store: Any = None
     macro_store: Any = None
     mpc_meetings: Any = None
+    corporate_terms: Any = None
+    corporate_schedule: Any = None
+    corporate_options: Any = None
+    corporate_amortisation: Any = None
+    corporate_steps: Any = None
+    ratings: Any = None
+    corporate_floating: Any = None
+    benchmark_fixings: Any = None
+    frb_terms: Any = None
+    frb_coupons: Any = FRB_COUPONS_CSV
+    tbills: Any = None
 
 
 AUCTION_COLUMNS = ("isin", "auction_date", "settlement_date", "cutoff_price", "wap", "notified_cr", "accepted_cr",
@@ -1670,6 +1789,7 @@ class _Book:
     short_since: dict[str, date] = field(default_factory=dict)
     traded_face: float = 0.0
     traded_dv01: float = 0.0
+    ai_prev: dict[str, float] = field(default_factory=dict)  # accrued interest at the close, on that day's terms
 
 
 class Snapshot:
@@ -1912,6 +2032,11 @@ class _Engine:
         self.auctions = self._auctions(market.auctions)
         self.issue_evidence = self._issue_evidence(market.events)
         self.strategy = strategy
+        self._terms_tables(market)
+        self._changed: set[str] = set()  # instruments whose terms as known changed at today's valuation time
+        self._period_cache: dict[tuple[str, int], tuple] = {}
+        self._base_maturity: dict[str, date] = {}
+        self.frb_projected: dict[str, date] = {}  # FRBs held while their current coupon was projected: first day
         self.instruments: dict[str, Instrument] = {}
         self.books: dict[str, _Book] = {}
         self.trades = self._prepare_trades(read_trades(trades) if trades is not None else None)
@@ -1929,10 +2054,157 @@ class _Engine:
         self.projected_nights: set[date] = set()  # calendar nights of funding held at a table's last rate
         self.order_seq = 0
         st = settings.attribution
-        self.line_order = (*CARRY_LINES, "roll_down", *st.curve_lines, "rich_cheap", "convexity",
+        self.line_order = (*CARRY_LINES, RESET_LINE, "roll_down", *st.curve_lines, "rich_cheap", "convexity",
                            "price_unattributed", *TRADE_LINES, *COST_LINES, *FUNDING_LINES, *OIS_BASE_LINES,
                            *st.ois_curve_lines, "ois_settlement_rounding", "cash_benchmark", "unexplained",
                            *MEMO_LINES)
+
+    # -- corporate bonds and FRBs: their terms tables, and each bond as known at a time
+
+    def _terms_tables(self, market: MarketData) -> None:
+        """Read the corporate and FRB tables once (each refused at once when malformed)."""
+        def opt(table, reader):
+            return None if table is None else reader(table)
+
+        self.corp_terms = {} if market.corporate_terms is None else {
+            r["isin"].upper(): r for r in read_corporate_terms(market.corporate_terms).to_dict("records")}
+        self.corp_schedule = opt(market.corporate_schedule, read_corporate_schedule)
+        self.corp_options = opt(market.corporate_options, read_corporate_options)
+        self.corp_amortisation = opt(market.corporate_amortisation, read_amortisation)
+        steps = opt(market.corporate_steps, read_step_rules)
+        self.corp_steps = {} if steps is None else {r["isin"].upper(): r for r in steps.to_dict("records")}
+        floating = opt(market.corporate_floating, read_floating_terms)
+        self.corp_floating = {} if floating is None else {r["isin"].upper(): r for r in floating.to_dict("records")}
+        self.benchmark_fixings = opt(market.benchmark_fixings, read_fixings)
+        self.ratings = None if market.ratings is None else _frame(market.ratings, "the ratings")
+        self._frb_terms: dict[str, dict] | None = None  # read when an FRB is first met
+        self._frb_coupons = None
+        self._tbills = None
+
+    def _frb_tables(self) -> dict[str, dict]:
+        if self._frb_terms is None:
+            market = self.market
+            table = load_frb_terms() if market.frb_terms is None else load_frb_terms(market.frb_terms)
+            self._frb_terms = {r["isin"].upper(): r for r in table.to_dict("records")}
+            self._frb_coupons = None if market.frb_coupons is None else load_frb_coupons(market.frb_coupons)
+            self._tbills = None if market.tbills is None else tbill_way_table(market.tbills)
+        return self._frb_terms
+
+    def _ratings_of(self, isin: str, row: Mapping) -> pd.DataFrame:
+        """The rating actions behind a bond's steps: rows of its ISIN, else of its issuer (``issuer_id``)."""
+        if self.ratings is None:
+            raise ValueError(f"{isin} has rating-step terms (corporate_steps) but MarketData.ratings is not given")
+        frame = self.ratings
+        if "isin" in frame and frame["isin"].map(_text).str.upper().eq(isin).any():
+            return frame[frame["isin"].map(_text).str.upper() == isin].reset_index(drop=True)
+        issuer = _text(row.get("issuer_id"))
+        if issuer and "issuer_id" in frame:
+            return frame[frame["issuer_id"].map(_text) == issuer].reset_index(drop=True)
+        return frame.iloc[0:0]
+
+    def _corporate_instrument(self, isin: str, row: Mapping, where: str) -> Instrument:
+        """A corporate bond from its terms row and tables; ``known(t)`` gives it as known at ``t``: fixings of a
+        ``frb_corp`` bond public by then, rating steps public by then, exercises whose notice was public by then."""
+        base = corporate_from_terms(row, schedule=self.corp_schedule, options=self.corp_options,
+                                    amortisation=self.corp_amortisation, where=where)
+        floating = self.corp_floating.get(isin)
+        if row["kind"] == "frb_corp" and floating is None:
+            raise ValueError(f"{where}: {isin} is a frb_corp bond without a corporate_floating row (its benchmark)")
+        if floating is not None and self.benchmark_fixings is None:
+            raise ValueError(f"{where}: {isin} floats on {floating['benchmark']}: give MarketData.benchmark_fixings")
+        steps = self.corp_steps.get(isin)
+        if steps is not None and floating is not None:
+            raise ValueError(f"{where}: {isin} has both benchmark fixings and rating steps: not built")
+        rule = step_rule_from_row(steps) if steps is not None else None
+        ratings = self._ratings_of(isin, row) if rule is not None else None
+        terms = floating_terms_from_row(floating) if floating is not None else None
+        fixings = self.benchmark_fixings
+
+        def known(t: datetime) -> CorporateBond:
+            bond = base
+            if terms is not None:
+                bond = bond.with_rates(rate_steps(corporate_frb_rates(base, terms, fixings, as_of=t)))
+            if rule is not None:
+                bond = apply_rating_steps(bond, ratings, rule, as_of=t)
+            return bond.effective_bond(t)
+
+        rating = _text(row.get("rating_bucket")).upper() or None
+        self._base_maturity[isin] = base.maturity
+        return Instrument(isin=isin, kind="corporate", bond=base, paying=base, maturity=base.maturity,
+                          issue_date=base.issue_date, conventions=base.conventions, known=known,
+                          rating_bucket=rating)
+
+    def _frb_instrument(self, isin: str, row: Mapping, where: str) -> Instrument:
+        """A GoI FRB from its terms row; ``known(t)`` its coupons as known at ``t`` (``floating.goi_frb_rates``:
+        announced, computed from T-bill results public by then, or projected flat), every period from ``t`` on."""
+        coupons, tbills, allow = self._frb_coupons, self._tbills, self.settings.frb_allow_fewer
+
+        def known(t: datetime) -> GoiFloatingRateBond:
+            rates = goi_frb_rates(row, tbills, coupons, as_of=t, allow_fewer=allow)
+            gaps = rates[rates["rate_pct"].isna() & (rates["period_end"] > t.date())]
+            if not gaps.empty:
+                first = gaps["period_start"].iloc[0]
+                raise ValueError(f"{isin}: the coupon of the period from {first} is not known at {t:%Y-%m-%d %H:%M} "
+                                 "and cannot be projected: give the announced coupons (MarketData.frb_coupons) or the "
+                                 "182-day T-bill results (MarketData.tbills), or EngineSettings(frb_allow_fewer=True)")
+            return goi_frb_bond(row, rates)
+
+        try:
+            unit = goi_frb_bond(row, goi_frb_rates(row, None, None))
+        except ValueError as exc:
+            raise ValueError(f"{where}: {isin}: {exc}") from None
+        return Instrument(isin=isin, kind="frb", bond=unit, paying=unit, maturity=unit.maturity,
+                          issue_date=unit.issue_date, conventions=unit.conventions, known=known)
+
+    def _bond_known(self, inst: Instrument, t: datetime) -> Any:
+        try:
+            return inst.known(t)
+        except (ValueError, NotImplementedError) as exc:
+            text = str(exc)
+            raise ValueError(text if text.startswith(inst.isin) else f"{inst.isin}: {text}") from None
+
+    def _refresh_known(self, t: datetime) -> None:
+        """Rebuild each corporate bond and FRB the books hold, wait for or trade today as known at ``t``; a bond whose
+        terms as known changed gets a new version, and the previous close's mark is restated on it (its yield and
+        model yield from the same clean price), so that the day's moves compare like with like."""
+        self._changed = set()
+        wanted = {isin for b in self.books.values() for isin in (*b.holdings, *(t_.isin for t_ in b.pending))}
+        wanted |= {r["isin"] for r in self.trades.get(t.date(), [])} | {o["isin"] for o in self.queue if o["isin"]}
+        for isin in sorted(wanted):
+            inst = self.instruments.get(isin)
+            if inst is None or inst.known is None:
+                continue
+            bond = self._bond_known(inst, t)
+            if bond == inst.bond:
+                continue
+            paying = replace(bond, calendar=self.calendar) if isinstance(bond, GoiFloatingRateBond) else bond
+            new = replace(inst, bond=bond, paying=paying, maturity=bond.maturity, version=inst.version + 1)
+            self.instruments[isin] = new
+            self._pay_cache.pop(isin, None)
+            self._changed.add(isin)
+            prev = self.prev_marks.get(isin)
+            if prev is not None:
+                try:
+                    y = _yield(bond, prev.clean, prev.settlement)
+                    m = model_yield(prev.curve, bond, prev.settlement) if prev.curve is not None else math.nan
+                except ValueError as exc:
+                    raise ValueError(f"{isin}: the terms as known on {t:%Y-%m-%d} cannot price the previous close's "
+                                     f"mark for {prev.settlement} ({exc})") from None
+                self.prev_marks[isin] = replace(prev, yield_pct=y, model_yield_pct=m)
+
+    def _periods(self, inst: Instrument) -> tuple:
+        key = (inst.isin, inst.version)
+        if key not in self._period_cache:
+            self._period_cache[key] = inst.bond.periods()
+        return self._period_cache[key]
+
+    def _principal_straddled(self, inst: Instrument, d: date, s: date) -> bool:
+        """Whether the holder at ``d``'s close is still owed a partial redemption (amortisation) that a settlement on
+        ``s`` no longer receives: its record date falls in ``[d, s)``. The clean price falls by the principal at the
+        record date (accrued interest carries only the coupon), so such a day's mark is restated to settlement on
+        ``d``, as the redemption's is."""
+        return any(per.principal and per.kind != "redemption" and d <= min(per.record, per.due - timedelta(days=1)) < s
+                   for per in self._periods(inst))
 
     # -- reference data
 
@@ -2181,14 +2453,42 @@ class _Engine:
                 merged[key] = value
         if isin in self.instruments:
             inst = self.instruments[isin]
+            if inst.known is not None:
+                self._check_given_terms(inst, given, where)
+                return inst
             for key in ("kind", "coupon_pct", "maturity_date"):
                 if not _blank(given[key]) and not _same_term(given[key], _term_of(inst, key)):
                     raise ValueError(f"{where}: {isin}'s {key} {given[key]!r} differs from an earlier trade's "
                                      f"{_term_of(inst, key)!r}")
             return inst
-        inst = make_instrument(isin, merged, self.calendar, where)
+        kind = _text(merged.get("kind")).lower()
+        if isin in self.corp_terms:
+            if kind not in ("", "corporate"):
+                raise ValueError(f"{where}: {isin} is in the corporate terms, but its kind is given as {kind!r}")
+            inst = self._corporate_instrument(isin, self.corp_terms[isin], where)
+        elif kind in ("", "frb") and isin in self._frb_tables():
+            inst = self._frb_instrument(isin, self._frb_tables()[isin], where)
+        else:
+            inst = make_instrument(isin, merged, self.calendar, where)
+        if inst.known is not None:
+            self._check_given_terms(inst, given, where)
         self.instruments[isin] = inst
         return inst
+
+    def _check_given_terms(self, inst: Instrument, given: Mapping, where: str) -> None:
+        """A trade's coupon and maturity of a corporate bond (or an FRB's maturity) must agree with its terms table:
+        the original maturity, not an exercised call's."""
+        if inst.kind == "corporate":
+            row = self.corp_terms[inst.isin]
+            coupon, maturity = row.get("coupon_pct"), row.get("maturity_date")
+        else:
+            row = self._frb_tables()[inst.isin]
+            coupon, maturity = None, row.get("maturity_date")
+        for key, known in (("coupon_pct", coupon), ("maturity_date", maturity)):
+            value = given.get(key)
+            if not _blank(value) and not _blank(known) and not _same_term(value, known):
+                raise ValueError(f"{where}: {inst.isin}'s {key} is {value!r} in the trades but {known!r} in its "
+                                 f"{inst.kind} terms")
 
     # -- inputs
 
@@ -2244,13 +2544,17 @@ class _Engine:
                 "liquidity": _text(rec.get("liquidity")).lower().replace("-", "_") or None,
                 "broker": _text(rec.get("broker")) or None, "special": special,
                 "notified_cr": _opt_num(rec.get("notified_cr"), f"{where}: notified_cr"),
-                "note": _text(rec.get("note"))})
+                "rating_bucket": _text(rec.get("rating_bucket")).upper() or None, "note": _text(rec.get("note"))})
         for rows in out.values():
             rows.sort(key=_order_key)
         return out
 
     def _settlement(self, inst: Instrument, day: date, settle: date | None, venue: str, where: str) -> date:
         cal = self.calendar
+        if inst.known is not None and cal.is_business_day(day):  # the bond as known on the trade day
+            bond = self._bond_known(inst, _at(day, self.settings.valuation_time))
+            paying = replace(bond, calendar=cal) if isinstance(bond, GoiFloatingRateBond) else bond
+            inst = replace(inst, bond=bond, paying=paying, maturity=bond.maturity)
         if not cal.is_business_day(day):
             raise ValueError(f"{where}: trade date {day} is not a Mumbai business day (the engine trades on business "
                              "days)")
@@ -2273,6 +2577,12 @@ class _Engine:
             raise ValueError(f"{where}: settlement {s} is on or after {inst.isin}'s maturity {inst.maturity}")
         if inst.issue_date is not None and s < inst.issue_date:
             raise ValueError(f"{where}: settlement {s} is before {inst.isin}'s issue date {inst.issue_date}")
+        if inst.kind == "corporate":
+            last = inst.last_settlement
+            if s > last:
+                raise ValueError(f"{where}: settlement {s} is after {inst.isin}'s redemption record date {last}: "
+                                 f"trading is suspended until the redemption due {inst.maturity}")
+            return s
         if hasattr(inst.bond, "in_shut_period") and inst.bond.in_shut_period(s):
             raise ValueError(f"{where}: settlement {s} falls in {inst.isin}'s shut period before redemption on "
                              f"{inst.maturity} (one day, UNVERIFIED rule of conventions)")
@@ -2406,9 +2716,19 @@ class _Engine:
                               "checks.csv has a row per day)")
         if self.unverified:
             self.notes.append("costs used UNVERIFIED default rules: " + ", ".join(sorted(self.unverified)))
+        for isin, first in sorted(self.frb_projected.items()):
+            self.notes.append(f"FRB {isin}: its current coupon was projected, not announced or computed, from {first} "
+                              "(UNVERIFIED flat projection: floating.goi_frb_rates; positions.notes per day)")
+        corporates = sorted(i for i, inst in self.instruments.items() if inst.kind == "corporate")
+        if corporates:
+            self.notes.append(f"corporate bonds ({len(corporates)}): coupons and principal entitled at the close of "
+                              "their record dates, payment and record dates rolled on the lenient settlement calendar "
+                              "(weekends only past its years); a TREPS book cannot lend against them (market repo with "
+                              "a haircut row, else equity)")
 
     def _day(self, d: date, p: date | None) -> None:
         t_val = _at(d, self.settings.valuation_time)
+        self._refresh_known(t_val)  # corporate bonds and FRBs as known at today's valuation time
         lines: dict[tuple[str, str, str], float] = {}
         self._positions_today: dict[tuple[date, str], list[dict]] = {}  # the day's rows, for the decision's snapshot
         names = set(self.flows.get(d, {})) | {t["book"] for t in self.trades.get(d, [])} \
@@ -2530,6 +2850,9 @@ class _Engine:
             face = sod["holdings"][isin]
             inst = self.instruments[isin]
             units = face / 100
+            if inst.kind == "corporate":
+                self._corporate_entitlements(book, inst, units, p, d, sod, lines)
+                continue
             # the payment rolls back at most a few days from maturity: only look it up near it (a strict calendar
             # refuses years without a holiday list)
             pay = None
@@ -2541,7 +2864,8 @@ class _Engine:
                 amount = inst.redemption_amount()
                 book.cash += units * amount
                 last_coupon = amount - 100.0
-                _add(lines, book.name, isin, "accrual", units * (last_coupon - _accrued(inst.bond, p)))
+                ai_prev = book.ai_prev[isin] if inst.known is not None else _accrued(inst.bond, p)
+                _add(lines, book.name, isin, "accrual", units * (last_coupon - ai_prev))
                 _add(lines, book.name, isin, "pull_to_par", units * (100.0 - book.clean_prev[isin]))
                 sod["redeemed"][isin] = units * amount
                 del book.holdings[isin]
@@ -2549,8 +2873,10 @@ class _Engine:
                 book.dirty_prev.pop(isin, None)
                 book.entry.pop(isin, None)
                 book.short_since.pop(isin, None)
+                book.ai_prev.pop(isin, None)
                 continue
-            if isinstance(inst.bond, DiscountInstrument) or not inst.bond.coupon_pct:
+            if isinstance(inst.bond, DiscountInstrument) or (
+                    not isinstance(inst.bond, GoiFloatingRateBond) and not inst.bond.coupon_pct):
                 continue
             coupons = 0.0
             for flow in inst.paying.cash_flows(p, until=d):
@@ -2567,6 +2893,46 @@ class _Engine:
             else:
                 keep.append(rec)
         book.receivables = keep
+
+    def _corporate_entitlements(self, book: _Book, inst: Instrument, units: float, p: date, d: date, sod: dict,
+                                lines: dict) -> None:
+        """A corporate bond's flows go to the holder at the close of their record date: the last settlement date that
+        receives a flow is its record date (a settlement on it is cum), or the day before it is due without one, and
+        a record date on a holiday uses the previous business day's close. So on business day ``d`` the holding of
+        the previous close ``p`` is entitled to the flows whose last cum settlement falls in ``[p, d)``: coupons
+        (accrual) and principal (pull to par) as receivables until their payment dates; the redemption closes the
+        position into a receivable, trading being suspended until it is paid."""
+        isin = inst.isin
+        coupons = principal = 0.0
+        closing = None
+        for per in self._periods(inst):
+            cut = min(per.record, per.due - timedelta(days=1))
+            if not p <= cut < d:
+                continue
+            if per.kind == "redemption":
+                closing = per
+                continue
+            if per.amount:
+                coupons += per.amount
+                book.receivables.append(_Receivable(isin, units * per.amount, per.due, per.payment))
+            if per.principal:
+                principal += per.principal
+                book.receivables.append(_Receivable(isin, units * per.principal, per.due, per.payment))
+        if closing is not None:
+            amount = closing.amount + closing.principal
+            book.receivables.append(_Receivable(isin, units * amount, closing.due, closing.payment))
+            _add(lines, book.name, isin, "accrual", units * (coupons + closing.amount - book.ai_prev[isin]))
+            _add(lines, book.name, isin, "pull_to_par",
+                 units * (principal + closing.principal - book.clean_prev[isin]))
+            sod["redeemed"][isin] = units * amount
+            del book.holdings[isin]
+            for table in (book.clean_prev, book.dirty_prev, book.entry, book.short_since, book.ai_prev):
+                table.pop(isin, None)
+            return
+        if coupons:
+            sod["coupons"][isin] = coupons
+        if principal:
+            sod.setdefault("principal", {})[isin] = principal
 
     def _settle_pending(self, book: _Book, d: date, sod: dict) -> None:
         keep = []
@@ -2625,7 +2991,8 @@ class _Engine:
             self._fill_bond(book, inst, sod[book.name], lines, trade_id=rec["trade_id"], order_id="", side=rec["side"],
                             face=rec["face"], d=d, settle=rec["settlement"], venue=rec["venue"], mid=mid,
                             fill=price, broker=rec["broker"], liquidity=rec["liquidity"], special=rec["special"],
-                            notified=rec["notified_cr"], given_mid=rec["mid"] is not None or rec["price"] is None)
+                            notified=rec["notified_cr"], given_mid=rec["mid"] is not None or rec["price"] is None,
+                            rating_bucket=rec.get("rating_bucket"))
         for rec in self.swap_trades.get(d, []):
             book = self.books[rec["book"]]
             self._fill_swap(book, sod[book.name], lines, rec, d)
@@ -2643,6 +3010,8 @@ class _Engine:
                 else:
                     price = row["price"]
                 s_row = row["settlement"] or self._mark_settlement(inst, d)
+                if inst.kind == "corporate":
+                    s_row = min(s_row, inst.last_settlement)
                 if price is None:
                     y = row["yield"]
                     return _clean(inst.bond, y, settle)
@@ -2654,7 +3023,7 @@ class _Engine:
     def _fill_bond(self, book: _Book, inst: Instrument, sod: dict, lines: dict, *, trade_id: str, order_id: str,
                    side: int, face: float, d: date, settle: date, venue: str, mid: float, fill: float | None,
                    broker: str | None, liquidity: str | None, special: float | None, notified: float | None,
-                   given_mid: bool) -> None:
+                   given_mid: bool, rating_bucket: str | None = None) -> None:
         where = f"trade {trade_id or order_id}"
         liq = liquidity or self.liquidity_on(inst, d)
         self._check_access(book, inst, side, face, d, venue, notified, special, where)
@@ -2663,7 +3032,7 @@ class _Engine:
         breakdown = cost_rules.bond_trade_costs(
             self.costs, kind=inst.kind, side=side, face=face, mid=mid, dv01_per100=dv01, trade_date=d, venue=venue,
             liquidity=liq, years=cost_rules.years_between(d, inst.maturity), accrued=_accrued(inst.bond, settle),
-            broker=broker, isin=inst.isin, fill=fill)
+            broker=broker, isin=inst.isin, fill=fill, rating_bucket=rating_bucket or inst.rating_bucket)
         self.unverified.update(breakdown.unverified)
         price = breakdown.fill
         book.cash -= breakdown.total
@@ -3071,6 +3440,13 @@ class _Engine:
         return rule.value
 
     def _haircut(self, inst: Instrument, d: date, where: str) -> float:
+        if inst.kind in TERMS_KINDS:  # not TREPS collateral here: market repo with a haircut row, else equity-funded
+            if self.haircuts is None:
+                return 100.0
+            try:
+                return self.haircuts.get(inst, d, self.liquidity_on(inst, d))
+            except ValueError:
+                return 100.0
         if self.haircuts is None:
             raise ValueError(f"{where}: no haircut table (MarketData.haircuts, the user's dated table: "
                              "funding.read_haircuts); no default haircut is assumed")
@@ -3175,6 +3551,12 @@ class _Engine:
                     why = (f"the access policy {access.name!r} allows no repo (RBI Repo Directions 2025 para 4(1)(b), "
                            "(e): make a variant with repo=True if the fund is listed or approved)" if not access.repo
                            else "haircut-adjusted collateral at the previous close, less the TREPS margin")
+                    unlent = [inst.isin for (inst, _, _), h in zip(longs, cuts)
+                              if inst.kind in TERMS_KINDS and h >= 100]
+                    if unlent:
+                        why += (f"; {', '.join(unlent)} lend nothing: corporate bonds and FRBs are not TREPS "
+                                "collateral here, and without a haircut row they are not lent against in market repo "
+                                "either (equity-funded)")
                     raise ValueError(f"funding_shortfall: {where} needs Rs {want:,.2f} for the night but can borrow Rs "
                                      f"{want - over:,.2f} ({why}); add capital or pass "
                                      "FundingPolicy(on_shortfall='overdraft', overdraft_rate_pct=...)")
@@ -3268,7 +3650,7 @@ class _Engine:
 
     def _restate(self, inst: Instrument, row: dict, d: date, v: date) -> tuple[float, float]:
         s_row = row["settlement"] or self._mark_settlement(inst, row["date"], flag=d)
-        if s_row >= inst.maturity:
+        if s_row >= inst.maturity or (inst.kind == "corporate" and s_row > inst.last_settlement):
             s_row = v
         if row["price"] is None:
             y = row["yield"]
@@ -3278,11 +3660,20 @@ class _Engine:
         y = _yield(inst.bond, row["price"], s_row)
         return _clean(inst.bond, y, v), y
 
+    def _held_settlement(self, inst: Instrument, row: dict, d: date) -> date:
+        """The settlement the clean price ``_held_clean`` holds is for."""
+        if row["price"] is None:
+            s_row = row["settlement"] or self._mark_settlement(inst, row["date"], flag=d)
+            return min(s_row, inst.last_settlement if inst.kind == "corporate" else inst.maturity - timedelta(days=1))
+        s_row = row["settlement"] or self._mark_settlement(inst, row["date"], flag=d)
+        return min(s_row, inst.last_settlement) if inst.kind == "corporate" else s_row
+
     def _held_clean(self, inst: Instrument, row: dict, d: date) -> float:
         if row["price"] is not None:
             return row["price"]
         s_row = row["settlement"] or self._mark_settlement(inst, row["date"], flag=d)
-        return _clean(inst.bond, row["yield"], min(s_row, inst.maturity - timedelta(days=1)))
+        return _clean(inst.bond, row["yield"], min(s_row, inst.last_settlement if inst.kind == "corporate"
+                                                   else inst.maturity - timedelta(days=1)))
 
     def _age(self, observed: date, d: date) -> int:
         if observed >= d:
@@ -3300,7 +3691,12 @@ class _Engine:
 
     def _mark(self, inst: Instrument, d: date, t_val: datetime, prev: MarkState | None, fill_hint) -> MarkState:
         s_std = self._mark_settlement(inst, d)
-        v = s_std if s_std < inst.maturity else d
+        if inst.kind == "corporate":  # past the redemption record date nothing settles: the mark is restated to today,
+            # as it is when a partial redemption's record date falls between today and the standard settlement
+            straddled = s_std <= inst.last_settlement and self._principal_straddled(inst, d, s_std)
+            v = s_std if s_std <= inst.last_settlement and not straddled else d
+        else:
+            v = s_std if s_std < inst.maturity else d
         curve, raw, m = None, None, math.nan
         if v == s_std:
             curve, raw = self._reference_curve(inst, d, v, t_val)
@@ -3334,10 +3730,16 @@ class _Engine:
                     continue
                 if row is not None and (prev is None or prev.observed is None or row["date"] > prev.observed):
                     clean, observed = self._held_clean(inst, row, d), row["date"]
+                    held = self._held_settlement(inst, row, d)
                 else:
                     clean, observed = prev.clean, prev.observed or prev.date
+                    held = prev.settlement
                 if fill_hint is not None and observed < d:
                     continue  # the fund's own fill of today is newer than any mark held: it values the position
+                if inst.kind == "corporate" and self._principal_straddled(inst, held, v):
+                    # a partial redemption paid since the price held: hold its yield instead (the clean price falls
+                    # by the principal at its record date), restating it to today's settlement
+                    clean = _clean(inst.bond, _yield(inst.bond, clean, held), v)
                 y = _yield(inst.bond, clean, v)
                 return MarkState(d, v, clean, y, "stale", curve, m, self._age(observed, d), observed, raw)
         if fill_hint is not None:
@@ -3376,7 +3778,7 @@ class _Engine:
             self.short_fits.add(d)
 
     def _bond_flows(self, inst: Instrument, s: date) -> tuple[np.ndarray, np.ndarray]:
-        key = (inst.isin, s)
+        key = (inst.isin, s) if inst.known is None else (inst.isin, s, inst.version)
         if key not in self._flow_cache:
             if len(self._flow_cache) > 50_000:
                 self._flow_cache.clear()
@@ -3412,8 +3814,14 @@ class _Engine:
             if p is not None and isin in self.prev_marks and today is not None:
                 moves = self._moves(isin, inst)
                 if h0 and isin not in sod["redeemed"]:
+                    ai_p = _accrued(inst.bond, p)
                     _add(lines, book.name, isin, "accrual", h0 / 100 * (
-                        _accrued(inst.bond, d) - _accrued(inst.bond, p) + sod["coupons"].get(isin, 0.0)))
+                        _accrued(inst.bond, d) - ai_p + sod["coupons"].get(isin, 0.0)))
+                    if isin in self._changed:  # the accrued interest of the close, on today's terms as known
+                        _add(lines, book.name, isin, RESET_LINE, h0 / 100 * (ai_p - book.ai_prev[isin]))
+                    principal = sod.get("principal", {}).get(isin, 0.0)
+                    if principal:  # an amortisation entitled: its cash offsets the clean price's fall
+                        _add(lines, book.name, isin, "pull_to_par", h0 / 100 * principal)
                     self._component(book, inst, h0 / 100, book.clean_prev[isin], today.settlement, moves, lines, acc)
                 for trade in sod["pending"]:
                     if trade.isin != isin:
@@ -3441,6 +3849,7 @@ class _Engine:
                 dv01 = face / 100 * inst.bond.dv01(today.yield_pct, today.settlement)
                 book.clean_prev[isin] = today.clean
                 book.dirty_prev[isin] = today.clean + ai
+                book.ai_prev[isin] = ai
                 bonds += value
                 gross_long += max(value, 0.0)
                 gross_short += max(-value, 0.0)
@@ -3448,7 +3857,7 @@ class _Engine:
                 bucket = tenor_bucket(inst.maturity, d)
                 buckets[bucket] = buckets.get(bucket, 0.0) + dv01
                 positions.append(self._position_row(book, inst, d, "settled", face, today.settlement, today, ai,
-                                                    value, dv01, bucket, ""))
+                                                    value, dv01, bucket, self._terms_note(inst, today)))
             for trade in book.pending:
                 if trade.isin != isin or today is None:
                     continue
@@ -3517,6 +3926,28 @@ class _Engine:
             row["calendar_projected"] = projected
         self.rows["positions"].extend(positions)
         self._positions_today[(d, book.name)] = positions
+
+    def _terms_note(self, inst: Instrument, mark: MarkState) -> str:
+        """What a corporate bond's or FRB's position row says of its terms as known (blank for other kinds)."""
+        if inst.known is None:
+            return ""
+        bond, s, notes = inst.bond, mark.settlement, []
+        if isinstance(bond, GoiFloatingRateBond):  # the coupon accruing on the position's date
+            status = bond.rate_status(mark.date)
+            notes.append(f"coupon {bond.coupon_rate(mark.date):.4f}% {status}")
+            if status == "projected":
+                self.frb_projected.setdefault(inst.isin, mark.date)
+            return "; ".join(notes)
+        if bond.is_ex_interest(s):
+            notes.append(f"the mark's settlement {s} is ex-interest")
+        face = bond.outstanding_face(s)
+        if face < 100:
+            notes.append(f"outstanding {face:g} per 100 original face (prices per 100 original)")
+        if bond.maturity != self._base_maturity[inst.isin]:
+            notes.append(f"redeemed on {bond.maturity} at {bond.redemption:g} (an exercise public)")
+        if bond.rate_steps:
+            notes.append(f"coupon {bond.rate_on(s):g}% from its steps")
+        return "; ".join(notes)
 
     def _trade_lines(self, book: _Book, inst: Instrument, today: MarkState, fill: dict, d: date,
                      lines: dict) -> None:

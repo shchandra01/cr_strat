@@ -228,3 +228,63 @@ def test_stamp_duty_on_cp_falls_on_the_seller_and_on_cd_on_every_trade(table):
             duty[(kind, side)] = (out.stamp_duty, [r for r in out.rules if r.startswith("SD")])
     assert duty[("cp", "buy")] == (0.0, ["SD02:P"]) and duty[("cp", "sell")][0] == pytest.approx(492.5)
     assert duty[("cd", "buy")] == duty[("cd", "sell")] == (pytest.approx(492.5), ["SD05:U"])  # payer UNVERIFIED
+
+
+# ---------------------------------------------------------------- corporate bonds and FRBs
+
+
+def test_corporate_rows_by_rating_bucket(table):
+    picks = {rb: co.cost_rule(table, "half_spread_bp", kind="corporate", on=S, rating_bucket=rb)
+             for rb in ("AAA", "AA+", "AA", "AA-", "A", "BBB", "SUB_IG", None)}
+    assert {rb: (r.rule_id, r.value) for rb, r in picks.items()} == {
+        "AAA": ("HS20", 4.0), "AA+": ("HS21", 7.5), "AA": ("HS21", 7.5), "AA-": ("HS22", 10.0), "A": ("HS23", 20.0),
+        "BBB": ("HS23", 20.0), "SUB_IG": ("HS23", 20.0), None: ("HS24", 20.0)}
+    assert all(r.status == "U" for r in picks.values())
+    buy = co.bond_trade_costs(table, kind="corporate", side="buy", face=25e7, mid=101.0, dv01_per100=0.04,
+                              trade_date=S, venue="otc", accrued=1.0, rating_bucket="AAA")
+    assert buy.fill == pytest.approx(101.16)  # 4 bp a side on a DV01 of 0.04
+    assert buy.ccil == 0.0 and buy.platform == pytest.approx(5 * 25.54)  # Rs 5 a crore of the Rs 25.54 crore paid
+    assert buy.gst == pytest.approx(0.18 * 5 * 25.54) and buy.stamp_duty == pytest.approx(255.40)  # 0.0001%, buyer
+    assert buy.rules == ("HS20:U", "CS07:U", "PF04:P", "CU01:U", "GS01:P", "SD06:P")
+    sell = co.bond_trade_costs(table, kind="corporate", side="sell", face=25e7, mid=101.0, dv01_per100=0.04,
+                               trade_date=S, venue="otc", accrued=1.0, rating_bucket="AAA")
+    assert sell.stamp_duty == 0.0 and sell.fill == pytest.approx(100.84)
+    small = co.bond_trade_costs(table, kind="corporate", side="buy", face=1e6, mid=100.0, dv01_per100=0.04,
+                                trade_date=S, venue="otc", fill=100.0)
+    assert small.platform == 25.0  # the exchange fee's minimum
+    old = co.bond_trade_costs(table, kind="corporate", side="buy", face=1e9, mid=100.0, dv01_per100=0.04,
+                              trade_date=date(2019, 5, 2), venue="otc", fill=100.0)
+    assert "SD16:U" in old.rules and old.stamp_duty == pytest.approx(1000.0)  # held back before Jul 2020
+
+
+def test_frb_rows_are_those_of_a_dated_gsec(table):
+    frb = co.bond_trade_costs(table, kind="frb", side="buy", face=1e9, mid=100.0, dv01_per100=0.02, trade_date=S,
+                              fill=100.0)
+    gsec = co.bond_trade_costs(table, kind="gsec", side="buy", face=1e9, mid=100.0, dv01_per100=0.02, trade_date=S,
+                               fill=100.0, liquidity="liquid")
+    assert frb.ccil == gsec.ccil == 4750.0 and frb.stamp_duty == 0.0 and frb.platform == 0.0
+    assert frb.rules == ("CS06:P", "PF05:U", "CU01:U", "GS01:P", "SD07:P")
+    assert co.cost_rule(table, "half_spread_bp", kind="frb", on=S).value == 4.5
+
+
+def test_rating_buckets_rank_below_the_kind_and_a_table_without_them_reads():
+    user = pd.DataFrame([
+        {"rule_id": "U1", "component": "half_spread_bp", "kind": "corporate", "min_years": "0", "max_years": "3",
+         "effective_from": "2015-01-01", "value": "1.0", "unit": "bp_yield", "source": "my desk"},
+        {"rule_id": "U2", "component": "half_spread_bp", "kind": "corporate", "min_years": "3", "max_years": "50",
+         "effective_from": "2026-01-01", "value": "2.0", "unit": "bp_yield", "source": "my desk"},
+    ])
+    mine = co.CostTable(co.read_cost_table(overrides=user))  # a user table without a rating_bucket column
+    # same date (2015): the default's rating bucket outranks the user's maturity bucket
+    assert co.cost_rule(mine, "half_spread_bp", kind="corporate", on=S, rating_bucket="AA", years=2.0).rule_id == \
+        "HS21"
+    assert co.cost_rule(mine, "half_spread_bp", kind="corporate", on=S, years=2.0).rule_id == "U1"
+    # a later row wins whatever its specificity
+    assert co.cost_rule(mine, "half_spread_bp", kind="corporate", on=S, rating_bucket="AA", years=5.0).rule_id == \
+        "U2"
+    bad = user.assign(rating_bucket=["AAA", "AA plus"])
+    with pytest.raises(ValueError, match="rating_bucket 'AA PLUS' is not one of"):
+        co.read_cost_table(overrides=bad)
+    both = user.iloc[[0]].assign(rating_bucket="aa;AAA", rule_id="U3", effective_from="2026-06-01")
+    frame = co.read_cost_table(overrides=both)
+    assert frame.loc[frame["rule_id"] == "U3", "rating_bucket"].iloc[0] == "AAA;AA"  # upper case, notch order

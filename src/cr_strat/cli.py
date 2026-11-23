@@ -16,7 +16,7 @@ import pandas as pd
 from cr_strat import event_ledger, macro_store, rbi_store
 from cr_strat import returns as return_engine
 from cr_strat.amfi_debt_trades import build_mf_trades, mapping_report, to_price_trades
-from cr_strat.asset_swaps import asset_swap_table, fill_from_master
+from cr_strat.asset_swaps import asset_swap_table, fill_from_master, frb_asset_swap_table
 from cr_strat.auctions import (
     REPORT_COLUMNS,
     build_auctions,
@@ -60,6 +60,8 @@ from cr_strat.corporates import (
 )
 from cr_strat.costs import read_cost_table
 from cr_strat.cra_disclosures import disclosure_summary, load_cra_disclosures, unmapped_issuers
+from cr_strat.credit_spreads import WORKOUTS as SPREAD_WORKOUTS
+from cr_strat.credit_spreads import add_peer_spreads, spread_table
 from cr_strat.curvefit import (
     CONTROL_DRIVERS,
     LOSSES,
@@ -86,7 +88,7 @@ from cr_strat.curvefit import (
     residual_drivers,
     rich_cheap_table,
 )
-from cr_strat.curves import BenchmarkCurve, SpreadBenchmark
+from cr_strat.curves import BenchmarkCurve, SpreadBenchmark, tenor_bucket
 from cr_strat.event_prices import DEFAULT_ANCHORS, event_price_paths
 from cr_strat.fbil import GSEC_KINDS, MM_KINDS, combine_curves, load_fbil_gsec_curve, load_fbil_money_market
 from cr_strat.floating import (
@@ -146,7 +148,7 @@ from cr_strat.policy_path import (
     policy_rate_on,
     read_policy_table,
 )
-from cr_strat.price_panel import build_price_panel, read_price_panel
+from cr_strat.price_panel import YIELD_SOURCES, build_price_panel, read_price_panel
 from cr_strat.rating_actions import load_rating_actions
 from cr_strat.rating_events import build_rating_events, rating_timeline
 from cr_strat.rating_scale import parse_rating, parse_ratings
@@ -155,7 +157,18 @@ from cr_strat.rbi_releases import INDEX_COLUMNS, parse_releases
 from cr_strat.schemes import attach_categories, parse_amfi_navall
 from cr_strat.sovereign import GOI_LIST_COLUMNS, build_master, load_far_list, load_goi_outstanding, read_master
 from cr_strat.textparse import UNIT_MULTIPLIERS
-from cr_strat.trades import clean_trades, isin_daily, load_trades, read_trades
+from cr_strat.trades import (
+    CHECK_STATUSES,
+    TOLERANCE_BP,
+    WORKOUT_RULES,
+    check_trade_yields,
+    clean_trades,
+    isin_daily,
+    isin_daily_checked,
+    load_trades,
+    read_trades,
+    recomputed_trades,
+)
 
 
 def _write(df: pd.DataFrame, path: Path) -> None:
@@ -226,8 +239,20 @@ def _load_trades(args: argparse.Namespace) -> int:
 
 def _price_panel(args: argparse.Namespace) -> int:
     out = Path(args.out_dir)
+    raw = read_trades(args.trades)
+    recomputed = args.yield_source == "recomputed"
+    if recomputed:  # each trade's yield recomputed from its price and the bond's terms (trade-check), reported kept
+        if not args.terms:
+            print("error: --yield-source recomputed needs --terms (the corporate terms table)", file=sys.stderr)
+            return 2
+        checked = check_trade_yields(raw, args.terms, schedule=args.schedule_file, options=args.options,
+                                     amortisation=args.amortisation, tolerance_bp=args.tolerance_bp,
+                                     workout=args.workout)
+        _write(checked, out / "trade_checks.csv")
+        raw = recomputed_trades(checked)
+        print(f"{len(raw)} of {len(checked)} trades have a recomputed yield")
     trades = clean_trades(
-        read_trades(args.trades), min_amount_inr=args.min_amount_inr,
+        raw, min_amount_inr=args.min_amount_inr,
         dedupe_across_venues=args.dedupe_across_venues,
     )
     curve = BenchmarkCurve.from_csv(
@@ -236,8 +261,8 @@ def _price_panel(args: argparse.Namespace) -> int:
     )
     ratings = rating_timeline(load_rating_actions(args.rating_actions))
     panel = build_price_panel(
-        isin_daily(trades), load_securities(args.securities), curve, ratings,
-        bond_compounding=args.bond_compounding,
+        isin_daily_checked(trades) if recomputed else isin_daily(trades), load_securities(args.securities), curve,
+        ratings, bond_compounding=args.bond_compounding, yield_source=args.yield_source,
     )
     print(f"{int(trades['outlier'].sum())} of {len(trades)} trades flagged as yield outliers")
     _write(panel, out / "price_panel.csv")
@@ -1297,17 +1322,46 @@ def _ois_curve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _tbill_results(args: argparse.Namespace, *, store: str | None) -> pd.DataFrame | None:
+    """182-day T-bill results for GoI FRB coupons: ``--tbills`` (a CSV) or the T-bill results of an RBI store, each
+    result's time from its file, else ``--tbill-time`` on its auction day (a rule)."""
+    default_time = _clock_arg(args.tbill_time, "--tbill-time") if args.tbill_time else None
+    if args.tbills:
+        return tbill_way_table(_read_csv_text(args.tbills), default_time=default_time)
+    if store:
+        return tbill_way_table(rbi_store.read_table(store, "tbill_result"), default_time=default_time)
+    return None
+
+
 def _asset_swaps(args: argparse.Namespace) -> int:
-    """Asset-swap measures of each bond in a file against the OIS curve of one day's quotes."""
+    """Asset-swap measures of each bond in a file against the OIS curve of one day's quotes: corporate bonds from
+    their terms (``--terms``), GoI FRBs (``--frb-out``) as discount margins in a table of their own."""
+    frb_table = None
     try:
         trade = _date_arg(args.trade_date, "--trade-date")
         settlement = _date_arg(args.settlement, "--settlement")
         curve = _bootstrap(args, trade)
         bonds = _read_csv_text(args.bonds)
+        frb_isins = set(load_frb_terms(args.frb_terms or FRB_TERMS_CSV)["isin"])
+        is_frb = (bonds["isin"].str.strip().str.upper().isin(frb_isins) if "isin" in bonds
+                  else pd.Series(False, index=bonds.index))
+        frbs = None
+        if args.frb_out:
+            frbs, bonds = bonds[is_frb].reset_index(drop=True), bonds[~is_frb].reset_index(drop=True)
+        elif is_frb.any():
+            print(f"note: {int(is_frb.sum())} of the bonds are GoI FRBs, which have no fixed-coupon asset swap: pass "
+                  "--frb-out for their discount margins")
         if args.master:
             bonds = fill_from_master(bonds, read_master(args.master))
-        table = asset_swap_table(bonds, curve, settlement)
-    except (ValueError, TypeError, OSError) as exc:
+        table = asset_swap_table(bonds, curve, settlement, terms=args.terms, schedule=args.schedule_file,
+                                 options=args.options, amortisation=args.amortisation)
+        if frbs is not None:
+            as_of = _time_arg(args.as_of, "--as-of") if args.as_of else None
+            announced = None if args.no_frb_coupons else (args.frb_coupons or FRB_COUPONS_CSV)
+            frb_table = frb_asset_swap_table(frbs, curve, settlement, terms=args.frb_terms, announced=announced,
+                                             tbills=_tbill_results(args, store=args.store), as_of=as_of,
+                                             allow_fewer=args.frb_allow_fewer)
+    except (ValueError, TypeError, OSError, NotImplementedError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     _write(table, Path(args.out))
@@ -1316,7 +1370,92 @@ def _asset_swaps(args: argparse.Namespace) -> int:
           f"{trade} (to {curve.node_dates[-1]})")
     for rec in failed.to_dict("records"):
         print(f"refused {rec['isin']}: {rec['error']}")
+    measured = len(table) - len(failed)
+    if frb_table is not None:
+        _write(frb_table, Path(args.frb_out))
+        frb_failed = frb_table[frb_table["error"] != ""]
+        known = (f"as known at {args.as_of}" if args.as_of
+                 else "from everything in the inputs (no --as-of: a look-ahead for a past date)")
+        print(f"{len(frb_table) - len(frb_failed)} of {len(frb_table)} GoI FRBs measured, their coupons {known}")
+        for rec in frb_failed.to_dict("records"):
+            print(f"refused {rec['isin']}: {rec['error']}")
+        measured += len(frb_table) - len(frb_failed)
     _calendar_warning(curve.calendar_projected)
+    return 0 if measured else 1
+
+
+def _trade_check(args: argparse.Namespace) -> int:
+    """Recompute each reported trade's yield from its price and the bond's terms; flag the prints that disagree."""
+    try:
+        trades = read_trades(args.trades)
+        checked = check_trade_yields(trades, args.terms, schedule=args.schedule_file, options=args.options,
+                                     amortisation=args.amortisation, tolerance_bp=args.tolerance_bp,
+                                     workout=args.workout)
+        daily = isin_daily_checked(clean_trades(recomputed_trades(checked))) if args.daily_out else None
+    except (ValueError, TypeError, OSError, KeyError, NotImplementedError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    _write(checked, Path(args.out))
+    if daily is not None:
+        _write(daily, Path(args.daily_out))
+    counts = checked["yield_check"].value_counts()
+    print("yield checks: " + ", ".join(f"{status} {int(counts.get(status, 0))}" for status in CHECK_STATUSES)
+          + f" (tolerance {args.tolerance_bp:g} bp, recomputed to {args.workout})")
+    mismatched = checked[checked["yield_check"] == "mismatch"]
+    worst = mismatched.assign(_size=mismatched["yield_diff_bp"].abs()).sort_values(
+        ["_size", "isin"], ascending=[False, True], kind="mergesort").head(5)
+    for rec in worst.to_dict("records"):
+        print(f"mismatch {rec['isin']} on {pd.Timestamp(rec['trade_date']):%Y-%m-%d}: reported {rec['yield_pct']:g}%, "
+              f"nearest reading {rec['nearest_reading']} {rec['nearest_yield_pct']:.4f}% "
+              f"({rec['yield_diff_bp']:+.2f} bp)")
+    return 0 if (checked["yield_check"] != "no_terms").any() else 1
+
+
+def _credit_spreads(args: argparse.Namespace) -> int:
+    """Corporate bond spreads to one fitted G-sec curve (G-spread, matched par spread, z-spread), optionally against
+    the peer spreads of a price panel."""
+    try:
+        calendar = mumbai_settlement_calendar()
+        calendar = calendar.lenient() if args.project_calendar else calendar
+        curves = return_engine.read_nss_params(args.nss_params, calendar=calendar)
+        if args.curve not in curves:
+            raise ValueError(f"--curve {args.curve!r} is not in {args.nss_params} (curves: "
+                             f"{', '.join(sorted(curves))})")
+        entries = curves[args.curve]
+        if args.date:
+            day = _date_arg(args.date, "--date")
+            if day not in entries:
+                raise ValueError(f"--date {day}: the curve {args.curve!r} has no row for it")
+        elif len(entries) == 1:
+            day = next(iter(entries))
+        else:
+            raise ValueError(f"the curve {args.curve!r} has {len(entries)} dates in {args.nss_params}: pass --date")
+        curve = entries[day].curve
+        settlement = _date_arg(args.settlement, "--settlement") or curve.valuation_date
+        prices = _read_csv_text(args.prices)
+        table = spread_table(prices, args.terms, curve, workout=args.workout, settlement=settlement,
+                             schedule=args.schedule_file, options=args.options, amortisation=args.amortisation)
+        if args.peer_panel:
+            match_on = [c.strip() for c in args.match_on.split(",") if c.strip()]
+            extra = [c for c in ("issuer_id", *match_on) if c in prices and c not in table]
+            table = pd.concat([table, prices[extra].reset_index(drop=True)], axis=1)
+            if "tenor_bucket" in match_on and "tenor_bucket" not in table:
+                years = pd.to_numeric(table["years_to_workout"], errors="coerce")
+                table["tenor_bucket"] = tenor_bucket(years).astype(object).where(years.notna(), None)
+            bench = SpreadBenchmark(read_price_panel(args.peer_panel), match_on=match_on,
+                                    window_days=args.window_days, min_issuers=args.min_issuers)
+            table = add_peer_spreads(table, bench)
+    except (ValueError, TypeError, OSError, KeyError, NotImplementedError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    _write(table, Path(args.out))
+    failed = table[table["error"] != ""]
+    print(f"{len(table) - len(failed)} of {len(table)} bonds measured against the {args.curve} curve of {day} "
+          f"(valued at {curve.valuation_date}; workout {args.workout})")
+    for rec in failed.to_dict("records"):
+        print(f"refused {rec['isin']}: {rec['error']}")
+    if table["extrapolated"].fillna(False).astype(bool).any():
+        print("note: some workouts lie beyond the curve's fitted range (extrapolated)")
     return 0 if len(failed) < len(table) else 1
 
 
@@ -1526,11 +1665,17 @@ def _ois_curves_from_quotes(path: str, calendar) -> dict:
 def _returns(args: argparse.Namespace) -> int:
     """Daily NAV, positions, P&L attribution and performance of a book of trades (the return engine)."""
     try:
+        credit_flags = ("corporate_terms", "corporate_schedule", "corporate_options", "corporate_amortisation",
+                        "corporate_steps", "ratings", "corporate_floating", "benchmark_fixings", "frb_terms")
         for flag in ("trades", "swaps", "flows", "marks", "nss_params", "ois_quotes", "fixings", "haircuts", "costs",
-                     "master", "liquidity", "residual_history"):
+                     "master", "liquidity", "residual_history", *credit_flags, "frb_coupons", "tbills"):
             value = getattr(args, flag)
             if value and not Path(value).exists():
                 raise FileNotFoundError(f"--{flag.replace('_', '-')}: {value} not found")
+        if args.tbills and args.tbills_from_store:
+            raise ValueError("give --tbills or --tbills-from-store, not both")
+        if args.tbills_from_store and not args.store:
+            raise ValueError("--tbills-from-store needs --store")
         start, end = _date_arg(args.start, "--start"), _date_arg(args.end, "--end")
         calendar = mumbai_settlement_calendar()
         calendar = calendar.lenient() if args.project_calendar else calendar
@@ -1547,6 +1692,9 @@ def _returns(args: argparse.Namespace) -> int:
             series, times = _read_fixings(args.fixings)
             fixings = {d: float(v) for d, v in series.items()}
         master = read_master(args.master) if args.master else None
+        # corporate bonds and GoI FRBs: their tables as given (each read and checked by the engine)
+        credit = {flag: getattr(args, flag) for flag in credit_flags if getattr(args, flag)}
+        tbills = _tbill_results(args, store=args.store if args.tbills_from_store else None)
         market = return_engine.MarketData(
             marks=_read_csv_text(args.marks),
             curves=return_engine.read_nss_params(args.nss_params, calendar=calendar) if args.nss_params else {},
@@ -1554,7 +1702,9 @@ def _returns(args: argparse.Namespace) -> int:
             fixings=fixings, fixing_times=times, funding=funding_tables,
             haircuts=read_haircuts(args.haircuts) if args.haircuts else None,
             liquidity=_read_csv_text(args.liquidity) if args.liquidity else None, master=master,
-            residual_history=_read_csv_text(args.residual_history) if args.residual_history else None)
+            residual_history=_read_csv_text(args.residual_history) if args.residual_history else None,
+            frb_coupons=None if args.no_frb_coupons else (args.frb_coupons or FRB_COUPONS_CSV), tbills=tbills,
+            **credit)
         policy = return_engine.FundingPolicy(
             segment=args.funding_source, excess_segment=args.excess_source, spread_bp=args.funding_spread_bp,
             sizing=args.sizing, margin_pct=args.margin_pct, idle_cash_rate_pct=args.idle_rate_pct,
@@ -1570,7 +1720,7 @@ def _returns(args: argparse.Namespace) -> int:
         unused = sorted(set(market.curves) - set(reference.values()))
         settings = return_engine.EngineSettings(
             access=return_engine.access_policy(args.access), project_calendar=args.project_calendar,
-            allow_t0=args.allow_t0, funding=policy,
+            allow_t0=args.allow_t0, funding=policy, frb_allow_fewer=args.frb_allow_fewer,
             attribution=return_engine.AttributionSettings(factor_basis=args.factor_basis, basis=args.basis,
                                                           reference=tuple(sorted(reference.items()))),
             costs=read_cost_table(overrides=args.costs) if args.costs else None)
@@ -1595,6 +1745,32 @@ def _returns(args: argparse.Namespace) -> int:
         print(f"note: {note}")
     _calendar_warning(bool(result.nav["calendar_projected"].any()) if len(result.nav) else False)
     return 0 if len(result.positions) else 1  # 1: nothing could be valued
+
+
+def _corporate_table_args(p: argparse.ArgumentParser, *, terms_help: str, required: bool = False) -> None:
+    """The corporate terms table and its schedule, options and amortisation tables (``corporates``' readers)."""
+    p.add_argument("--terms", required=required, help=terms_help)
+    p.add_argument("--options", help="corporate_options.csv: calls and puts")
+    p.add_argument("--amortisation", help="corporate_amortisation.csv: principal by date")
+    p.add_argument("--schedule-file", help="corporate_schedule.csv: due, payment and record dates and amounts")
+
+
+def _frb_args(p: argparse.ArgumentParser, *, store: bool) -> None:
+    """GoI FRB terms, announced coupons and 182-day T-bill results (``floating``)."""
+    p.add_argument("--frb-terms", help="GoI FRB terms CSV (default: the shipped goi_frb_terms.csv)")
+    p.add_argument("--frb-coupons", help="announced FRB coupons CSV (default: the shipped goi_frb_coupons.csv)")
+    p.add_argument("--no-frb-coupons", action="store_true", help="use no announced FRB coupon, only T-bill results")
+    if store:
+        source = p.add_mutually_exclusive_group()
+        source.add_argument("--tbills", help="CSV of 182-day T-bill results: auction_date, tenor_days, way or wap, "
+                                             "public_from (or published, release_date)")
+        source.add_argument("--store", help="an RBI store directory: its T-bill results (rbi-store-ingest)")
+    else:
+        p.add_argument("--tbills", help="CSV of 182-day T-bill results: auction_date, tenor_days, way or wap, "
+                                        "public_from (or published, release_date)")
+    p.add_argument("--tbill-time", help="HH:MM on the auction day for results without a public time (a rule)")
+    p.add_argument("--frb-allow-fewer", action="store_true",
+                   help="project an FRB coupon from fewer than three T-bill results (flagged)")
 
 
 def _add_peer_args(p: argparse.ArgumentParser) -> None:
@@ -1658,7 +1834,27 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--benchmark-max-extrapolation-years", type=float,
                    help="leave spreads empty beyond the curve's longest tenor plus this (default: flat)")
     _add_peer_args(p)
+    p.add_argument("--yield-source", choices=YIELD_SOURCES, default="reported",
+                   help="reported: the exchanges' yields (default); recomputed: each trade's yield recomputed from its "
+                        "price and --terms (as trade-check), the reported one kept beside it")
+    _corporate_table_args(p, terms_help="corporate_terms.csv, for --yield-source recomputed")
+    p.add_argument("--workout", choices=WORKOUT_RULES, default="maturity",
+                   help="recomputed yields to maturity (default) or to worst over calls")
+    p.add_argument("--tolerance-bp", type=float, default=TOLERANCE_BP,
+                   help="a reported yield within this of a reading counts as it (UNVERIFIED default 1 bp)")
     p.set_defaults(func=_price_panel)
+
+    p = sub.add_parser("trade-check", help="recompute each reported corporate bond trade's yield from its price and "
+                                           "the bond's terms, and flag the prints that disagree")
+    p.add_argument("--trades", required=True, nargs="+", help="CSVs written by load-trades")
+    _corporate_table_args(p, terms_help="corporate_terms.csv: the bonds' terms", required=True)
+    p.add_argument("--tolerance-bp", type=float, default=TOLERANCE_BP,
+                   help="a reported yield within this of a reading counts as it (UNVERIFIED default 1 bp)")
+    p.add_argument("--workout", choices=WORKOUT_RULES, default="maturity",
+                   help="the recomputed yield: to maturity (default) or to worst over calls")
+    p.add_argument("--out", required=True, help="the trades with the check columns appended")
+    p.add_argument("--daily-out", help="also write ISIN-day rows on the recomputed yields (the reported beside)")
+    p.set_defaults(func=_trade_check)
 
     p = sub.add_parser("event-prices", help="spread paths around rating events against matched peers")
     p.add_argument("--events", required=True, help="rating_events.csv")
@@ -1867,7 +2063,36 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--master", help="security master CSV (sovereign-master) filling kind, coupon and dates by ISIN")
     p.add_argument("--settlement", help="settlement date of the prices (default: the swaps' effective date, T+1)")
     p.add_argument("--out", required=True)
+    _corporate_table_args(p, terms_help="corporate_terms.csv: bonds of --bonds listed there are corporate bonds "
+                                        "priced by corporates (their maturity_date may be blank)")
+    p.add_argument("--frb-out", help="GoI FRBs of --bonds (their ISINs in the FRB terms) are measured apart and "
+                                     "written here: discount margins over the index and the curve")
+    _frb_args(p, store=True)
+    p.add_argument("--as-of", help="the FRBs' coupons as known at this time (India, YYYY-MM-DDTHH:MM; default: "
+                                   "everything in the inputs, a look-ahead for a past date)")
     p.set_defaults(func=_asset_swaps)
+
+    p = sub.add_parser("credit-spreads", help="corporate bond spreads to a fitted G-sec curve: G-spread, matched par "
+                                              "spread and z-spread, optionally against a price panel's peers")
+    p.add_argument("--prices", required=True,
+                   help="CSV: isin, clean_price or yield_pct, optional settlement_date; for --peer-panel also "
+                        "issuer_id and the peer columns (instrument_class, rating_bucket; tenor_bucket is computed)")
+    _corporate_table_args(p, terms_help="corporate_terms.csv: the bonds' terms", required=True)
+    p.add_argument("--nss-params", required=True,
+                   help="NSS curves CSV (date, beta0..beta3, tau1, tau2, t_min, t_max, settlement_date, curve) as "
+                        "curve-fit --nss-params appends")
+    p.add_argument("--curve", default="gsec", help="the curve's name in --nss-params (default gsec)")
+    p.add_argument("--date", help="the curve's mark date (needed when --nss-params holds several)")
+    p.add_argument("--settlement", help="settlement date of the prices without one (default: the curve's valuation "
+                                        "date)")
+    p.add_argument("--workout", choices=SPREAD_WORKOUTS, default="maturity",
+                   help="to maturity, to worst over calls (from a price), or SEBI's trigger rule (from a yield)")
+    p.add_argument("--peer-panel", help="price_panel.csv (price-panel): add each bond's peer median spread")
+    _add_peer_args(p)
+    p.add_argument("--project-calendar", action="store_true",
+                   help="treat weekdays of years without a holiday list (2027 on) as business days")
+    p.add_argument("--out", required=True)
+    p.set_defaults(func=_credit_spreads)
 
     p = sub.add_parser("policy-path", help="the repo-rate level after each MPC meeting implied by one day's OIS quotes")
     p.add_argument("--quotes", required=True, help="CSV: tenor and rate_pct, or end_date and rate_pct")
@@ -1967,10 +2192,25 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--basis", choices=return_engine.PNL_BASES, default="actual")
     p.add_argument("--reference", action="append", metavar="KIND=CURVE",
                    help="attribute a kind against a curve of --nss-params by its name (repeatable; e.g. sdl=sdl for "
-                        "S6; default every G-sec, bill, STRIPS and SDL against gsec, CP and CD against ois)")
+                        "S6; default every G-sec, bill, STRIPS, SDL and corporate bond against gsec, CP and CD "
+                        "against ois; GoI FRBs against none)")
     p.add_argument("--rate-basis", choices=return_engine.RATE_BASES, default="deal_day",
                    help="repo interest: the deal day's rate for every night (default) or each calendar day's latest "
                         "dealing rate, as repo-carry")
+    p.add_argument("--corporate-terms", help="corporate_terms.csv: ISINs listed there are corporate bonds (corporates)")
+    p.add_argument("--corporate-schedule", help="corporate_schedule.csv: due, payment and record dates and amounts")
+    p.add_argument("--corporate-options", help="corporate_options.csv: calls and puts, an exercise used only from its "
+                                               "exercised_public_from")
+    p.add_argument("--corporate-amortisation", help="corporate_amortisation.csv: principal by date")
+    p.add_argument("--corporate-steps", help="rating-linked coupon steps (corporates.read_step_rules)")
+    p.add_argument("--ratings", help="rating actions for --corporate-steps: agency, rating, public_from and isin or "
+                                     "issuer_id")
+    p.add_argument("--corporate-floating", help="frb_corp bonds' benchmark terms (floating.read_floating_terms)")
+    p.add_argument("--benchmark-fixings", help="their benchmark fixings, each with its public_from "
+                                               "(floating.read_fixings)")
+    _frb_args(p, store=False)
+    p.add_argument("--tbills-from-store", action="store_true",
+                   help="take the 182-day T-bill results for FRB coupons from --store's tbill_result table")
     p.add_argument("--out-dir", required=True)
     p.set_defaults(func=_returns)
 

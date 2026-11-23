@@ -3,6 +3,15 @@
 Each row is one ISIN on one day it traded. No prices are filled in for days
 without trades. Illiquidity is part of what the event study measures, so a
 missing day stays missing.
+
+By default the yields are the reported ones (``trades.isin_daily``). With
+``yield_source="recomputed"`` they are recomputed from each trade's price and
+the bond's terms (``trades.check_trade_yields``, then ``recomputed_trades``,
+``clean_trades`` and ``isin_daily_checked``): ``yield_pct`` and the spread
+then hold the value-weighted recomputed yield, and four columns are appended
+(``RECOMPUTED_COLUMNS``: the recomputed and the reported yield, the day's
+check of the reported yields, the workout date). The default output is
+unchanged.
 """
 
 from __future__ import annotations
@@ -18,6 +27,8 @@ PANEL_COLUMNS = (
     "tenor_bucket", "yield_pct", "benchmark_yield_pct", "spread_bps", "price", "volume_inr",
     "n_trades", "rating_notch", "rating_grade", "rating_bucket",
 )
+RECOMPUTED_COLUMNS = ("recomputed_yield_pct", "yield_check", "workout_date", "reported_yield_pct")
+YIELD_SOURCES = ("reported", "recomputed")
 
 
 def build_price_panel(
@@ -28,6 +39,7 @@ def build_price_panel(
     *,
     bond_compounding: str = "annual",
     min_tenor_years: float = 0.1,
+    yield_source: str = "reported",
 ) -> pd.DataFrame:
     """Join ISIN-day trades to the security master, benchmark curve and as-of ratings.
 
@@ -36,7 +48,15 @@ def build_price_panel(
     ``rating_events.rating_timeline``. ISINs missing from the security master
     are dropped. Spreads are left empty below ``min_tenor_years`` of remaining
     maturity, where yields are dominated by money-market noise.
+    ``yield_source="recomputed"``: ``daily`` comes from
+    ``trades.isin_daily_checked`` and ``RECOMPUTED_COLUMNS`` are appended.
     """
+    if yield_source not in YIELD_SOURCES:
+        raise ValueError(f"yield_source must be one of {YIELD_SOURCES}, not {yield_source!r}")
+    if yield_source == "recomputed":
+        missing = [c for c in RECOMPUTED_COLUMNS if c not in daily]
+        if missing:
+            raise ValueError(f"recomputed yields need trades.isin_daily_checked's daily frame (lacks {missing})")
     sec_cols = ["isin", "issuer_id", "instrument_class", "maturity_date"]
     sec = securities[sec_cols + (["sector"] if "sector" in securities else [])]
     df = daily.merge(sec, on="isin", how="inner")
@@ -60,7 +80,8 @@ def build_price_panel(
         on="date", by=["issuer_id", "instrument_class"], direction="backward",
     )
     df["rating_bucket"] = [rating_bucket(None if pd.isna(n) else int(n)) for n in df["rating_notch"]]
-    return df.sort_values(["date", "isin"]).reset_index(drop=True)[list(PANEL_COLUMNS)]
+    columns = list(PANEL_COLUMNS) + (list(RECOMPUTED_COLUMNS) if yield_source == "recomputed" else [])
+    return df.sort_values(["date", "isin"]).reset_index(drop=True)[columns]
 
 
 def read_price_panel(path) -> pd.DataFrame:

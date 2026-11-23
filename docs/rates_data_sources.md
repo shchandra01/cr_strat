@@ -497,7 +497,11 @@ What can be built now, with no licence:
 3. **Bond pricing engine.** Cash flows, price and yield, accrued interest,
    DV01 and convexity for G-secs, SDLs and T-bills, tested against RBI's
    auction price and yield pairs. Built in
-   [`bonds.py`](../src/cr_strat/bonds.py), with STRIPS, CMBs, CP and CD.
+   [`bonds.py`](../src/cr_strat/bonds.py), with STRIPS, CMBs, CP and CD;
+   listed corporate bonds (record dates, ex-interest, amortisation, calls
+   and puts, rating steps) in [`corporates.py`](../src/cr_strat/corporates.py)
+   and GoI and corporate FRBs in [`floating.py`](../src/cr_strat/floating.py),
+   from term tables the user keeps ([`conventions.md`](conventions.md)).
 4. **Daily store of RBI operations and money-market rates** from the RSS
    feed. Built: the parsers, in
    [`rbi_operations.py`](../src/cr_strat/rbi_operations.py) (Money Market
@@ -646,11 +650,21 @@ split into carry, roll-down, curve factors,
 rich/cheap, convexity, trading, costs, funding and OIS lines that sum to the
 NAV change, in [`returns.py`](../src/cr_strat/returns.py) and
 [`costs.py`](../src/cr_strat/costs.py), `cr-strat returns`, described in
-[`analytics.md`](analytics.md); it values only what `bonds` prices, so
-corporate bonds wait for a pricer; it waits for licensed marks, MIBOR and OIS
-quotes); S2 on
-the existing trade and price-panel code (the return engine covers its CP and
-CD); the event ledger for S4 (built on the
+[`analytics.md`](analytics.md); it values what `bonds`, `corporates` and
+`floating` price, corporate bonds with their exchange settlement, record dates
+and ex-interest accrual, amortisation, calls and puts once exercised, and
+rating steps and floating coupons only from when public, at the debenture
+stamp duty and exchange fees of the cost table; it waits for licensed marks,
+MIBOR and OIS quotes); S2 on the existing trade and price-panel code with the
+corporate bond pricer, a check of each reported trade's yield against the
+yield recomputed from its price and terms (`cr-strat trade-check`, and a price
+panel on recomputed yields on request), spreads to a fitted G-sec curve with
+peer matrices ([`credit_spreads.py`](../src/cr_strat/credit_spreads.py),
+`cr-strat credit-spreads`), asset swaps and FRB discount margins against OIS
+(`cr-strat asset-swaps`) and the return engine for its CP, CD and corporate
+bonds (all built and tested on synthetic data, described in
+[`analytics.md`](analytics.md); they wait for real prints, marks and the
+bonds' terms); the event ledger for S4 (built on the
 free auction files and the RBI store, tested on synthetic data: every auction,
 switch, buyback, redemption, open market and liquidity operation, calendar
 line, MPC meeting and macro release with the time from which it was public and

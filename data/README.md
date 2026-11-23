@@ -125,7 +125,7 @@ from what your clearing member gives you. FBIL's MIBOR and MIBOR-OIS need a
 subscription before they are kept as a history
 ([`docs/rates_data_sources.md`](../docs/rates_data_sources.md)).
 
-## Corporate bond and FRB terms: `cr-strat corp-price`, `frb-price`
+## Corporate bond and FRB terms: `cr-strat corp-price`, `frb-price` and the commands that use them
 
 Typed in by you from term sheets or, for listed ISINs from 18 Aug 2025,
 SEBI's centralised corporate bond database; none is shipped except the GoI FRB
@@ -151,6 +151,22 @@ Add RBI's coupon releases to `goi_frb_coupons.csv` (or a copy passed with
 `--coupons`) as they come: the shipped file lacks the coupons set from June to
 October 2026 for FRB 2028, 2031, 2033 and 2034, and the RBI store will hold the
 182-day results needed to compute them only from its first poll.
+
+The same tables feed `asset-swaps --terms` (corporate bonds) and `--frb-out`
+(GoI FRBs), `credit-spreads --terms`, `trade-check --terms`, `price-panel
+--yield-source recomputed --terms`, and `returns` (`--corporate-terms`,
+`--corporate-schedule`, `--corporate-options`, `--corporate-amortisation`,
+`--corporate-steps`, `--corporate-floating`, `--benchmark-fixings`, `--frb-terms`,
+`--frb-coupons`, `--tbills` or `--tbills-from-store`). Two more inputs:
+
+| File | Read by | Columns |
+|---|---|---|
+| Rating actions with times | `returns --ratings` (for `--corporate-steps`) | **agency**, **rating** (as `rating_scale` parses it, e.g. `CRISIL AA-/Negative`), **public_from** (each action used only from then), and **isin** or **issuer_id** (matching the terms' `issuer_id`) |
+| Corporate bond prices (one day) | `credit-spreads --prices` | **isin**, **clean_price** or **yield_pct**, settlement_date (default the curve's valuation date); with `--peer-panel` also issuer_id, instrument_class, rating_bucket (`tenor_bucket` is computed) |
+
+A trade's `rating_bucket` column (returns' trades file) or the terms'
+`rating_bucket` picks a corporate bond's half spread in the cost table (rows
+HS20-HS24; the cost table's optional `rating_bucket` column, `;` lists allowed).
 
 ## RBI press releases: saved pages and `pressreleases_rss.xml`
 

@@ -18,15 +18,15 @@ and ``max_years`` (residual maturity, or an OIS's tenor, in 365.25-day years; lo
 ``leg``, ``deal``), ``payer`` (``buyer``, ``seller``, ``both``, ``fund``: who pays a charge or duty), ``gst``
 (``yes``: the charge bears GST), ``source`` and ``status``.
 
-**Which rule applies** (``cost_rule``): among the rows of a component that match the instrument, venue, class,
-maturity and date, an exception naming the ISIN wins, then one naming the venue (so the zero CCIL charge and spread of
-auctions, OMOs and switches survive a user's newer schedule for all trades: a user overrides an exception only with a
-row naming the same venue or ISIN; UNVERIFIED ranking, for the user to confirm); among the rest the latest
-``effective_from`` wins; then the most specific row (a kind over a maturity bucket over a liquidity class: scores 4,
-2 and 1); then a user row over a default one. Two rows left equal that differ raise, naming both; no matching row at
-all raises, naming the component. A user row dated before a default row of the same component is superseded from the
-default's date: date the user's row on or after it, or pass ``replace_components`` to drop the defaults of the
-components the user's table gives.
+**Which rule applies** (``cost_rule``): among the rows of a component that match the instrument, venue, class, maturity
+and date, an exception naming the ISIN wins, then one naming the venue (so the zero CCIL charge and spread of auctions,
+OMOs and switches survive a user's newer schedule for all trades: a user overrides an exception only with a row naming
+the same venue or ISIN; UNVERIFIED ranking, for the user to confirm); among the rest the latest ``effective_from`` wins;
+then the most specific row (a kind over a rating bucket over a maturity bucket over a liquidity class, each outranking
+all those after it together); then a user row over a default one. Two rows left equal that differ raise, naming both; no
+matching row at all raises, naming the component. A user row dated before a default row of the same component is
+superseded from the default's date: date the user's row on or after it, or pass ``replace_components`` to drop the
+defaults of the components the user's table gives.
 
 **Amounts** (``CostBreakdown``, rupees the fund pays, positive):
 
@@ -59,6 +59,17 @@ charged to the fund on every OIS trade (base and payer U); before 1 Jul 2020 eac
 rates are held back (U). TREPS initial margin 0.50% of the net second-leg consideration from 5 Jul 2025 (V;
 held back before as U; who posts it and how is U). Income tax and TDS are left out: the P&L is pre-tax.
 
+**Corporate bonds and FRBs** (``kind`` ``corporate`` and ``frb``): half spreads for corporate bonds by rating bucket,
+4 bp of yield for AAA, 7.5 for AA+ and AA, 10 for AA-, 20 for A+ and below and for a trade without a bucket (U: no
+public source; a PSU's AAA paper, put at 2.5 bp in the same guesses, takes the AAA row unless the user gives an ISIN
+row); no clearing charge (U: listed corporate bond trades clear through an exchange's clearing corporation, whose
+charge was not found); the exchange's reporting and RFQ fee Rs 5 per crore of value, minimum 25, maximum 500 (P: NSE's
+page through a search summary); stamp duty of 0.0001% of the consideration on the buyer (P: the Finance Act 2019
+rate through secondary sources, the buyer paying on exchange-cleared trades), held back before 1 Jul 2020 (U). GoI
+FRBs as dated G-secs: CCIL's Rs 95 per crore (P: the schedule does not name FRBs), no dealing fee (U), no stamp duty
+(P), a half spread of 4.5 bp as an illiquid G-sec (U). Stamp duty on corporate bond repo (0.00001% in secondary
+sources) is not charged: ``repo_deal_costs`` does not know the collateral.
+
 **Limits.** No cost here was read off a published schedule for every date: CCIL's pages were read once by an earlier
 probe, the stamp duty schedule only through secondary sources (India Code returned errors), and no public source
 gives bid-offer for SDLs, bills, STRIPS, CP, CD or OIS. Market impact beyond the half spread is not modelled (a
@@ -78,9 +89,9 @@ from cr_strat.calendars import DATA_DIR
 from cr_strat.conventions import as_date
 
 DEFAULT_COSTS_CSV = DATA_DIR / "cost_defaults.csv"
-COST_COLUMNS = ("rule_id", "component", "kind", "venue", "liquidity", "isin", "min_years", "max_years",
-                "effective_from", "effective_to", "value", "unit", "minimum_rs", "maximum_rs", "per", "payer", "gst",
-                "source", "status")
+COST_COLUMNS = ("rule_id", "component", "kind", "venue", "liquidity", "rating_bucket", "isin", "min_years",
+                "max_years", "effective_from", "effective_to", "value", "unit", "minimum_rs", "maximum_rs", "per",
+                "payer", "gst", "source", "status")
 COMPONENTS = ("half_spread_bp", "ccil_settlement", "repo_leg_charge", "treps_charge", "platform_fee", "custody",
               "brokerage", "gst_rate", "stamp_duty", "treps_margin_pct")
 UNITS = ("bp_yield", "bp_rate", "rs_per_crore_face", "rs_per_crore_value", "rs_per_crore_repayment",
@@ -92,9 +103,13 @@ PAYERS = ("buyer", "seller", "both", "fund")
 STATUSES = ("V", "P", "U", "user")
 VENUES = ("ndsom", "otc", "rfq", "auction", "auction_nc", "omo", "switch", "when_issued")
 LIQUIDITY_CLASSES = ("liquid", "semi_liquid", "illiquid")
+RATING_BUCKETS = ("AAA", "AA+", "AA", "AA-", "A+", "A", "A-", "BBB", "SUB_IG", "D")  # rating_scale.rating_bucket
 REPO_SEGMENTS = ("treps", "market_repo")
 CRORE = 1e7
-_SCORE = {"isin": 100, "venue": 10, "kind": 4, "bucket": 2, "liquidity": 1}
+# Lexicographic weights (each above the sum of those after it): a rating bucket ranks below the kind, above the
+# maturity bucket and the class; for rows without a rating bucket the order is the one of the earlier weights
+# (isin 100, venue 10, kind 4, bucket 2, liquidity 1), so no existing choice changes.
+_SCORE = {"isin": 1000, "venue": 100, "kind": 16, "rating": 4, "bucket": 2, "liquidity": 1}
 _RULE_FIELDS = ("value", "unit", "minimum_rs", "maximum_rs", "per", "payer", "gst")
 
 
@@ -125,6 +140,15 @@ def _number(value, where: str, *, blank_ok: bool = True) -> float:
     if not math.isfinite(out):
         raise ValueError(f"{where}: {value!r} is not a finite number")
     return out
+
+
+def _ratings(cell: str, where: str) -> str:
+    """A ``;``-separated cell of rating buckets (``RATING_BUCKETS``, case kept), in notch order, joined again."""
+    parts = {p.strip().upper() for p in cell.split(";") if p.strip()}
+    bad = sorted(parts - set(RATING_BUCKETS))
+    if bad:
+        raise ValueError(f"{where}: rating_bucket {bad[0]!r} is not one of {RATING_BUCKETS}")
+    return ";".join(b for b in RATING_BUCKETS if b in parts)
 
 
 def _choices(cell: str, allowed: tuple[str, ...] | None, where: str) -> str:
@@ -265,6 +289,7 @@ def _check_rows(frame: pd.DataFrame, origin: str, what: str) -> list[dict]:
             "rule_id": rule_id, "component": component, "kind": _choices(_text(rec.get("kind")), None, where),
             "venue": _choices(_text(rec.get("venue")), VENUES, where),
             "liquidity": _choices(_text(rec.get("liquidity")), LIQUIDITY_CLASSES, where),
+            "rating_bucket": _ratings(_text(rec.get("rating_bucket")), where),
             "isin": _text(rec.get("isin")).upper(), "min_years": y0, "max_years": y1, "effective_from": start,
             "effective_to": end, "value": value, "unit": unit, "minimum_rs": lo, "maximum_rs": hi, "per": per,
             "payer": payer, "gst": gst_text == "yes", "source": source, "status": status, "origin": origin})
@@ -319,7 +344,7 @@ def _as_table(table) -> CostTable:
 
 def _score(rec: dict) -> int:
     return (_SCORE["isin"] * bool(rec["isin"]) + _SCORE["venue"] * bool(rec["venue"])
-            + _SCORE["kind"] * bool(rec["kind"])
+            + _SCORE["kind"] * bool(rec["kind"]) + _SCORE["rating"] * bool(rec.get("rating_bucket"))
             + _SCORE["bucket"] * (not (math.isnan(rec["min_years"]) and math.isnan(rec["max_years"])))
             + _SCORE["liquidity"] * bool(rec["liquidity"]))
 
@@ -330,14 +355,16 @@ def _tier(rec: dict) -> tuple[bool, bool]:
 
 
 def cost_rule(table, component: str, *, kind: str, on, venue: str | None = None, liquidity: str | None = None,
-              years: float | None = None, isin: str | None = None) -> CostRule:
-    """The rule of ``component`` for a ``kind`` (and ``venue``, ``liquidity``, residual ``years``, ``isin``) on ``on``.
+              years: float | None = None, isin: str | None = None, rating_bucket: str | None = None) -> CostRule:
+    """The rule of ``component`` for a ``kind`` (and ``venue``, ``liquidity``, residual ``years``, ``isin``,
+    ``rating_bucket``) on ``on``.
 
     Among the rows in force, an ISIN exception first and a venue exception next (a newer row that names neither
     does not cancel an older exception: only a row naming the same ISIN or venue, or the exception's own
-    ``effective_to``, ends it); then the latest ``effective_from``, then the most specific row, then a user row over a
-    default one; equal rows that differ raise, and so does the absence of any matching row. A ``kind``, ``venue`` or
-    ``liquidity`` cell may list several values with ``;``.
+    ``effective_to``, ends it); then the latest ``effective_from``, then the most specific row (kind, then rating
+    bucket, then maturity bucket, then liquidity class), then a user row over a default one; equal rows that differ
+    raise, and so does the absence of any matching row. A ``kind``, ``venue``, ``liquidity`` or ``rating_bucket``
+    cell may list several values with ``;``; a row naming rating buckets matches only a trade given one of them.
     """
     frame = _as_table(table)
     if component not in COMPONENTS:
@@ -348,6 +375,7 @@ def cost_rule(table, component: str, *, kind: str, on, venue: str | None = None,
     liquidity = None if liquidity is None or not str(liquidity).strip() else str(liquidity).strip().lower().replace(
         "-", "_")
     isin = None if isin is None or not str(isin).strip() else str(isin).strip().upper()
+    rating = None if rating_bucket is None or not str(rating_bucket).strip() else str(rating_bucket).strip().upper()
     matches = []
     for rec in frame.by_component[component]:
         if rec["effective_from"] > d or (rec["effective_to"] is not None and rec["effective_to"] < d):
@@ -360,6 +388,8 @@ def cost_rule(table, component: str, *, kind: str, on, venue: str | None = None,
             continue
         if rec["liquidity"] and (liquidity is None or liquidity not in rec["liquidity"].split(";")):
             continue
+        if rec.get("rating_bucket") and (rating is None or rating not in rec["rating_bucket"].split(";")):
+            continue
         if not (math.isnan(rec["min_years"]) and math.isnan(rec["max_years"])):
             if years is None or not math.isfinite(years):
                 continue
@@ -369,8 +399,8 @@ def cost_rule(table, component: str, *, kind: str, on, venue: str | None = None,
                 continue
         matches.append(rec)
     what = (f"{component} for a {kind}" + (f" ({isin})" if isin else "") + (f" on venue {venue}" if venue else "")
-            + (f", class {liquidity}" if liquidity else "") + (f", {years:.2f} years" if years is not None else "")
-            + f" on {d}")
+            + (f", class {liquidity}" if liquidity else "") + (f", rated {rating}" if rating else "")
+            + (f", {years:.2f} years" if years is not None else "") + f" on {d}")
     if not matches:
         raise ValueError(f"no cost rule gives the {what}: add a row to the cost table (the defaults start on "
                          "1 Jan 2015 and hold no brokerage)")
@@ -465,19 +495,23 @@ class _Ledger:
 def bond_trade_costs(table, *, kind: str, side, face: float, mid: float, dv01_per100: float, trade_date,
                      venue: str = "ndsom", liquidity: str | None = None, years: float | None = None,
                      accrued: float = 0.0, broker: str | None = None, isin: str | None = None,
-                     fill: float | None = None) -> CostBreakdown:
-    """Costs of a bond, bill, STRIP, CP or CD trade of ``face`` rupees at ``mid`` (clean, per 100) on ``trade_date``.
+                     fill: float | None = None, rating_bucket: str | None = None) -> CostBreakdown:
+    """Costs of a bond, bill, STRIP, CP, CD, corporate bond or FRB trade of ``face`` rupees at ``mid`` (clean, per
+    100) on ``trade_date``.
 
     Without ``fill`` the fill is ``mid`` plus or minus the half spread of the table (``fill_price``); with it, the
     spread cost is measured against ``mid`` (``F/100 x side x (fill - mid)``, a cost when positive). The
     consideration is ``F/100 x (fill + accrued)``. A trade with a ``broker`` needs a brokerage rule.
+    ``rating_bucket``: a corporate bond's rating bucket on the trade date (``rating_scale.rating_bucket``), for the
+    rows that name one.
     """
     s = _side(side)
     f = _number(face, "face", blank_ok=False)
     if not f > 0:
         raise ValueError(f"face must be a positive number of rupees, not {face!r}")
     ledger = _Ledger(table)
-    common = {"kind": kind, "on": trade_date, "venue": venue, "liquidity": liquidity, "years": years, "isin": isin}
+    common = {"kind": kind, "on": trade_date, "venue": venue, "liquidity": liquidity, "years": years, "isin": isin,
+              "rating_bucket": rating_bucket}
     notes = []
     if fill is None:
         h = ledger.rule("half_spread_bp", **common)
@@ -595,7 +629,8 @@ def years_between(start, end) -> float:
 
 
 __all__ = ["CHARGE_UNITS", "COMPONENTS", "COST_COLUMNS", "CRORE", "DEFAULT_COSTS_CSV", "LIQUIDITY_CLASSES", "PAYERS",
-           "PERS", "REPO_SEGMENTS", "STATUSES", "UNITS", "VENUES", "CostBreakdown", "CostRule", "CostTable",
+           "PERS", "RATING_BUCKETS", "REPO_SEGMENTS", "STATUSES", "UNITS", "VENUES", "CostBreakdown", "CostRule",
+           "CostTable",
            "bond_trade_costs",
            "charge", "cost_rule", "fill_price", "ois_trade_costs", "read_cost_table", "repo_deal_costs",
            "treps_margin", "unverified_rules", "years_between"]
