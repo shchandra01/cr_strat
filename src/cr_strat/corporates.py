@@ -71,6 +71,7 @@ from __future__ import annotations
 
 import bisect
 import calendar as _cal
+import difflib
 import math
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
@@ -107,6 +108,8 @@ STEP_COMBINE = ("worst", "best", "second_best")
 DEEMED_PERPETUAL_YEARS = 100  # SEBI MF master circular 10.4.2: perpetuals deemed to mature 100 years after issue
 PUT_FAVOUR_BP = 30.0  # SEBI MF master circular 10.3.4: a put favours the holder 30 bp above the coupon
 DATE_ONLY_TIME = time(23, 59, 59)  # UNVERIFIED: a notice or rating known only by its date counts from day's end
+EXPLICIT_GAP_DAYS = 3  # an explicit schedule's gaps may differ from whole months by this (month ends, Feb)
+RECORD_PAYMENT_DAYS = 7  # record dates this close to their due date are kept before the payment date
 INDIA = timezone(timedelta(hours=5, minutes=30))
 _EPS = 1e-9
 
@@ -124,13 +127,25 @@ def _anniversary_index(anchor: date, d: date) -> int:
     return k
 
 
+def _year_days(lo: date, hi: date, anchor: date) -> int:
+    """Days in the coupon year ``[lo, hi)``: its length, which is 366 exactly when it holds a 29 February. A 29
+    February anchor's anniversaries fall on 28 February in common years, so its years are counted 366 when they
+    hold a 29 February and 365 otherwise (SEBI 2016 para 3(b): 366 for the year holding 29 February; UNVERIFIED
+    reading for such an anchor, whose year lengths then differ from 365 and 366 by a day)."""
+    if not (anchor.month == 2 and anchor.day == 29):
+        return (hi - lo).days
+    holds = any(_cal.isleap(y) and lo <= date(y, 2, 29) < hi for y in range(lo.year, hi.year + 1))
+    return 366 if holds else 365
+
+
 def year_fraction_sebi(start, end, *, rule: str = "anniversary", anchor=None) -> float:
     """Years from ``start`` (included) to ``end`` (excluded) on SEBI's actual/actual, under ``rule``.
 
-    ``anniversary``: the sum, over the years between anniversaries of ``anchor`` (the deemed date of allotment;
-    a 29 February anchor falls on 28 February in other years) that the span overlaps, of the days in each over
-    that year's 365 or 366 days. ``calendar``: the same over calendar years. ``fixed365``: days / 365. The rules
-    agree for bonds allotted on 1 January (SEBI 2016's example: 182/366 and 184/366 for the two half-years of 2016).
+    ``anniversary``: the sum, over the years between anniversaries of ``anchor`` (the deemed date of allotment)
+    that the span overlaps, of the days in each over that year's 365 or 366 days (a 29 February anchor falls on
+    28 February in common years, and its years count 366 only when they hold a 29 February: ``_year_days``).
+    ``calendar``: the same over calendar years. ``fixed365``: days / 365. The rules agree for bonds allotted on 1
+    January (SEBI 2016's example: 182/366 and 184/366 for the two half-years of 2016).
     """
     a, b = as_date(start), as_date(end)
     if rule not in LEAP_YEAR_RULES:
@@ -223,7 +238,9 @@ class CallPut:
     ``notice_days``: notice the terms require (descriptive). ``portion``: share of the outstanding face it
     redeems (only 1 is built for exercise). ``exercised``: ``True`` once exercised, ``False`` once known not
     to be, ``None`` unknown; ``exercised_public_from``: when that became public (a bare date counts from
-    23:59:59, UNVERIFIED). ``source``: where the terms come from.
+    23:59:59, UNVERIFIED). ``source``: where the terms come from. ``record_date``: the record date of the
+    redemption by this option, when the notice gives one (default: the bond's rule, ``record_days`` before
+    ``date``); an exercise made public after it is refused.
     """
 
     kind: str
@@ -234,11 +251,16 @@ class CallPut:
     exercised: bool | None = None
     exercised_public_from: datetime | None = None
     source: str = ""
+    record_date: date | None = None
 
     def __post_init__(self) -> None:
         if self.kind not in OPTION_KINDS:
             raise ValueError(f"option kind must be one of {OPTION_KINDS}, not {self.kind!r}")
         object.__setattr__(self, "date", as_date(self.date))
+        if self.record_date is not None:
+            object.__setattr__(self, "record_date", as_date(self.record_date))
+            if self.record_date >= self.date:
+                raise ValueError(f"{self.kind} on {self.date}: its record date {self.record_date} must be before it")
         price = float(self.price)
         if not (math.isfinite(price) and price > 0):
             raise ValueError(f"{self.kind} on {self.date}: price must be a positive number, not {self.price!r}")
@@ -471,6 +493,14 @@ class CorporateBond(Bond):
                 raise ValueError(f"{where}: the first due date {dues[0]} is not after issue {issue}")
             if dues[-1] != mat:
                 raise ValueError(f"{where}: the last due date {dues[-1]} is not the maturity {mat}")
+            # every gap between due dates but the last (a stub) is one coupon period of the frequency: a frequency
+            # that disagrees with the dates would put coupons and the asset swap's matched rate on the wrong basis
+            for a, b in pairwise(dues[:-1]):
+                if abs((b - _shift_months(a, months)).days) > EXPLICIT_GAP_DAYS:
+                    raise ValueError(f"{where}: the due dates {a} and {b} are {(b - a).days} days apart, not one "
+                                     f"period of frequency {self.frequency} ({months} months): give the frequency "
+                                     "the dates follow (an irregular schedule is not built; a first or last stub "
+                                     "is)")
             return dues
         if self.due_dates:
             raise ValueError(f"{where}: due_dates are given but schedule is {self.schedule!r}; pass "
@@ -520,6 +550,14 @@ class CorporateBond(Bond):
                     raise ValueError(f"{where}: payment date {other} is more than 31 days from its due date {due}")
                 if name == "record_dates" and not other <= due:
                     raise ValueError(f"{where}: record date {other} is after its due date {due}")
+            bad = [(a, b) for a, b in pairwise(values) if not a < b]
+            if bad:
+                raise ValueError(f"{where}: {name} must increase with the due dates: {bad[0][1]} follows {bad[0][0]}")
+        if self.payment_dates and self.record_dates:
+            for due, pay, record in zip(dues, self.payment_dates, self.record_dates):
+                if not record < pay:
+                    raise ValueError(f"{where}: the record date {record} of the flow due {due} is not before its "
+                                     f"payment date {pay}")
 
     def _build_principal(self) -> None:
         where, dues, mat = self._where, self._dues, self.maturity
@@ -609,15 +647,18 @@ class CorporateBond(Bond):
         return self.calendar.adjust(due, c.redemption_roll if self._principal[k] > 0 else c.coupon_roll)
 
     def _record(self, k: int) -> date:
-        """Record date of period ``k``; never before the allotment, whose holder is the first on record."""
+        """Record date of period ``k``; never before the allotment, whose holder is the first on record, and
+        always before the payment date (a redemption paid early with a record date at the due date, say)."""
         if self.record_dates:
             return max(self.record_dates[k], self.issue_date)
         due = self._dues[k]
-        if not self._record_days:
-            return due
         day = due - timedelta(days=self._record_days)
         cal = self.record_calendar or self.calendar
-        return max(day if cal is None else cal.adjust(day, self._record_roll), self.issue_date)
+        record = max(day if cal is None or not self._record_days else cal.adjust(day, self._record_roll),
+                     self.issue_date)
+        if (due - record).days <= RECORD_PAYMENT_DAYS:  # only near the due date can a payment rolled back precede it
+            record = min(record, self._payment(k) - timedelta(days=1))
+        return record
 
     def _end(self, k: int) -> date:
         rule = self._red_interest if k == self._n - 1 else self._postponed
@@ -830,32 +871,39 @@ class CorporateBond(Bond):
 
     # ---- workouts
 
-    def workouts(self, settlement=None) -> list[tuple[str, date, float]]:
+    def workouts(self, settlement=None, *, as_of=None) -> list[tuple[str, date, float]]:
         """(kind, date, price) of the maturity and every option, by date; after ``settlement`` if given.
 
         An option is left out once its record date is before ``settlement`` (a buyer can no longer be paid by
-        it) or once it is known not to be exercised (``exercised=False``).
+        it) or once it is known by ``as_of`` not to be exercised (``exercised=False`` with
+        ``exercised_public_from`` on or before ``as_of``). Without ``as_of`` no decision is used: an option
+        stays a workout until the time a decision was public is given (rule 10: nothing before it was public).
         """
         s = None if settlement is None else as_date(settlement)
+        when = None if as_of is None else public_time(as_of, "as_of")
         out = []
         for o in self.options:
-            if o.exercised is False:
+            if o.exercised is False and when is not None and o.exercised_public_from <= when:
                 continue
-            if s is not None and not (o.date > s and self.record_date(o.date) >= s):
+            if s is not None and not (o.date > s and self.option_record_date(o) >= s):
                 continue
             out.append((o.kind, o.date, o.price))
         out.append(("maturity", self.maturity, self.redemption))
         return sorted(out, key=lambda w: (w[1], OPTION_KINDS.index(w[0]) if w[0] in OPTION_KINDS else 2))
 
-    def to_workout(self, when, price: float | None = None) -> CorporateBond:
+    def to_workout(self, when, price: float | None = None, *, record_date=None) -> CorporateBond:
         """The bond redeemed on ``when`` at ``price`` per 100 of the outstanding face.
 
         ``price`` defaults to the price of an option on that date (else 100). Coupons before ``when`` are
         unchanged; an exercise date between due dates pays the interest accrued to it (UNVERIFIED). The coupon
-        years keep the original anchor; options and amortisation from ``when`` on are dropped.
+        years keep the original anchor; options and amortisation from ``when`` on are dropped. ``record_date``:
+        the redemption's record date (default the bond's rule, or the option's own ``record_date``).
         """
         d = as_date(when)
-        if d == self.maturity and price is None:
+        if record_date is None:
+            given = [o.record_date for o in self.options if o.date == d and o.record_date is not None]
+            record_date = given[0] if given else None
+        if d == self.maturity and price is None and record_date is None:
             return self
         if not self.issue_date < d <= self.maturity:
             raise ValueError(f"{self._where}: workout date {d} is not after issue {self.issue_date} and on or before "
@@ -870,57 +918,67 @@ class CorporateBond(Bond):
             last = self.payment_dates[self._dues.index(d)] if d in self._dues else (
                 d if self.calendar is None else self.calendar.adjust(d, self.conventions.redemption_roll))
             payments = tuple(self.payment_dates[k] for k in keep) + (last,)
-        if self.record_dates:
+        if record_date is not None:
+            record_date = as_date(record_date)
+            if not record_date < d:
+                raise ValueError(f"{self._where}: the record date {record_date} of the redemption on {d} must be "
+                                 "before it")
+            records = tuple(self._record(k) for k in keep) + (record_date,)
+        elif self.record_dates:
             last_record = self.record_dates[self._dues.index(d)] if d in self._dues else min(
                 self.record_date(d), d)
             records = tuple(self.record_dates[k] for k in keep) + (last_record,)
         if not self.frequency:
-            dues, payments, records = (d,), (), ()
+            dues, payments = (d,), ()
+            records = () if record_date is None else (record_date,)
         return replace(self, maturity=d, schedule="explicit", first_coupon_date=None, due_dates=dues,
                        payment_dates=payments, record_dates=records, first_period="separate", redemption=float(price),
                        amortisation=tuple((a, p) for a, p in self.amortisation if a < d), options=(),
                        perpetual=False, anchor=self._anchor,
                        name=f"{self.name or self._where} to {d}")
 
-    def yields_to_workouts(self, settlement, clean_price: float) -> list[WorkoutYield]:
-        """Yield (percent, on the bond's basis) to maturity and to each option date still ahead, at a clean price."""
+    def yields_to_workouts(self, settlement, clean_price: float, *, as_of=None) -> list[WorkoutYield]:
+        """Yield (percent, on the bond's basis) to maturity and to each option date still ahead, at a clean price
+        (``workouts``: a decision not to exercise is used only from ``as_of`` on)."""
         s = as_date(settlement)
         return [WorkoutYield(kind, when, price, self.to_workout(when, price).yield_from_price(clean_price, s))
-                for kind, when, price in self.workouts(s)]
+                for kind, when, price in self.workouts(s, as_of=as_of)]
 
-    def yield_to_worst(self, settlement, clean_price: float, *, include_puts: bool = False) -> WorkoutYield:
+    def yield_to_worst(self, settlement, clean_price: float, *, include_puts: bool = False,
+                       as_of=None) -> WorkoutYield:
         """The lowest yield among maturity and the calls (and the puts with ``include_puts``); ties to the earliest."""
-        rows = [w for w in self.yields_to_workouts(settlement, clean_price) if include_puts or w.kind != "put"]
+        rows = [w for w in self.yields_to_workouts(settlement, clean_price, as_of=as_of)
+                if include_puts or w.kind != "put"]
         return min(rows, key=lambda w: (w.yield_pct, w.date))
 
-    def _prices(self, s: date, yield_pct: float, kinds: tuple[str, ...]) -> list[tuple[str, date, float]]:
+    def _prices(self, s: date, yield_pct: float, kinds: tuple[str, ...], as_of=None) -> list[tuple[str, date, float]]:
         return [(kind, when, self.to_workout(when, price).clean_price(yield_pct, s))
-                for kind, when, price in self.workouts(s) if kind in kinds]
+                for kind, when, price in self.workouts(s, as_of=as_of) if kind in kinds]
 
-    def price_to_worst(self, settlement, yield_pct: float) -> tuple[float, date, str]:
+    def price_to_worst(self, settlement, yield_pct: float, *, as_of=None) -> tuple[float, date, str]:
         """(clean price, date, kind): the lowest value at ``yield_pct`` over maturity and the calls."""
-        kind, when, price = min(self._prices(as_date(settlement), yield_pct, ("maturity", "call")),
+        kind, when, price = min(self._prices(as_date(settlement), yield_pct, ("maturity", "call"), as_of),
                                 key=lambda r: (r[2], r[1]))
         return price, when, kind
 
-    def price_to_best_put(self, settlement, yield_pct: float) -> tuple[float, date, str]:
+    def price_to_best_put(self, settlement, yield_pct: float, *, as_of=None) -> tuple[float, date, str]:
         """(clean price, date, kind): the highest value at ``yield_pct`` over maturity and the puts."""
-        kind, when, price = max(self._prices(as_date(settlement), yield_pct, ("maturity", "put")),
+        kind, when, price = max(self._prices(as_date(settlement), yield_pct, ("maturity", "put"), as_of),
                                 key=lambda r: (r[2], -r[1].toordinal()))
         return price, when, kind
 
-    def sebi_valuation(self, settlement, yield_pct: float) -> SebiValuation:
+    def sebi_valuation(self, settlement, yield_pct: float, *, as_of=None) -> SebiValuation:
         """Value at ``yield_pct`` by SEBI's rule for bonds with calls and puts (MF master circular 10.3.1).
 
         A put and a call on one date at one price make that date a deemed maturity. Else the call trigger is the
         call with the lowest value among calls and maturity, the put trigger the put with the highest value among
         puts and maturity: with neither the bond is valued to maturity, with one to it, with both to the earlier.
         AT1 bonds (``tier="at1"``) are valued to their first call ahead (SEBI since Aug 2024). Values per 100
-        original face, at the same yield to every date.
+        original face, at the same yield to every date. ``as_of``: as ``workouts`` (decisions from then on).
         """
         s = as_date(settlement)
         y = float(yield_pct)
-        works = self.workouts(s)
+        works = self.workouts(s, as_of=as_of)
         notes = []
         end_kind, end_date, end_price = "maturity", self.maturity, self.redemption
         call_terms = {(d, p) for k, d, p in works if k == "call"}
@@ -956,19 +1014,77 @@ class CorporateBond(Bond):
         return SebiValuation(s, y, clean, clean + bond.accrued_interest(s), key[1], kind, call_trigger, put_trigger,
                              prices, favours, "; ".join(notes))
 
-    def effective_bond(self, as_of) -> CorporateBond:
-        """The bond as known at ``as_of``: redeemed at the earliest option whose exercise was public by then."""
+    def option_record_date(self, option: CallPut) -> date:
+        """The record date of a redemption by ``option``: its own ``record_date``, else the bond's rule."""
+        return option.record_date if option.record_date is not None else self.record_date(option.date)
+
+    def check_exercises(self) -> None:
+        """Refuse an exercise whose notice became public after the record date of its redemption (the holder on
+        record must be known when it is made) or on or after the exercise date itself: either the time or the
+        record date is wrong, and the bond cannot be valued through it. A notice dated later than the bond's
+        rule allows needs the option's own ``record_date``."""
+        for o in self.options:
+            if not o.exercised:
+                continue
+            if o.exercised_public_from.date() >= o.date:
+                raise ValueError(f"{self._where}: the exercise of the {o.kind} on {o.date} is public only from "
+                                 f"{o.exercised_public_from:%Y-%m-%d %H:%M}, not before the exercise date")
+            record = self.option_record_date(o)
+            if o.exercised_public_from > datetime.combine(record, DATE_ONLY_TIME):
+                rule = ("its record_date" if o.record_date is not None else
+                        f"the bond's rule ({self._record_days} days before the exercise date)")
+                raise ValueError(f"{self._where}: the exercise of the {o.kind} on {o.date} is public only from "
+                                 f"{o.exercised_public_from:%Y-%m-%d %H:%M}, after the redemption's record date "
+                                 f"{record} by {rule}: give the record date the notice sets (record_date in "
+                                 "corporate_options) or check the notice's time")
+
+    def exercise_known(self, as_of) -> CallPut | None:
+        """The earliest option whose exercise was public by ``as_of`` (``check_exercises`` refuses a late one)."""
         when = public_time(as_of, "as_of")
         if when is None:
             raise ValueError("as_of is required")
         done = [o for o in self.options if o.exercised and o.exercised_public_from <= when]
         if not done:
-            return self
+            return None
         first = min(done, key=lambda o: o.date)
         if first.portion < 1:
             raise NotImplementedError(f"{self._where}: a partial exercise ({first.portion:g} on {first.date}) is not "
                                       "built; enter it as amortisation at par if the price is 100")
-        return self.to_workout(first.date, first.price)
+        self.check_exercises()
+        return first
+
+    def effective_bond(self, as_of) -> CorporateBond:
+        """The bond as known at ``as_of``: redeemed at the earliest option whose exercise was public by then."""
+        first = self.exercise_known(as_of)
+        if first is None:
+            return self
+        return self.to_workout(first.date, first.price, record_date=first.record_date)
+
+    def as_known(self, as_of) -> CorporateBond:
+        """The bond as known at ``as_of``: redeemed at an option whose exercise was public by then
+        (``effective_bond``), else without the options known by then not to be exercised. A decision made public
+        later stays in the terms unused (``workouts`` uses a decision only with an ``as_of``)."""
+        when = public_time(as_of, "as_of")
+        if when is None:
+            raise ValueError("as_of is required")
+        bond = self.effective_bond(when)
+        if bond is not self:
+            return bond
+        keep = tuple(o for o in self.options if not (o.exercised is False and o.exercised_public_from <= when))
+        return self if keep == self.options else replace(self, options=keep)
+
+    def calendar_projected(self, settlement=None) -> bool:
+        """True when a payment or record date of a flow after ``settlement`` (all flows without it) falls in a year
+        the payment calendar's holiday list does not cover: a lenient calendar rolls it on weekends only there."""
+        cals = [c for c in (self.calendar, self.record_calendar) if c is not None]
+        if not cals:
+            return False
+        k0 = 0 if settlement is None else bisect.bisect_right(self._dues, as_date(settlement))
+        if k0 >= self._n:
+            return False
+        first = self._dues[k0] - timedelta(days=self._record_days + 7)  # the first record date, rolls allowed
+        last = self._dues[-1] + timedelta(days=7)
+        return any(y not in c.years for c in cals for y in range(first.year, last.year + 1))
 
 
 # ---------------------------------------------------------------- constructors
@@ -1122,12 +1238,12 @@ def apply_rating_steps(bond: CorporateBond, ratings: pd.DataFrame, rule: StepRul
 TERMS_COLUMNS = ("isin", "issuer_id", "name", "kind", "instrument_class", "coupon_pct", "frequency", "schedule",
                  "first_period", "issue_date", "maturity_date", "first_coupon_date", "redemption_per100",
                  "face_value_rs", "conventions", "record_days", "record_roll", "leap_year_rule", "postponed_coupon",
-                 "redemption_interest", "flow_dates", "tier", "sector", "source", "status")
+                 "redemption_interest", "flow_dates", "tier", "sector", "rating_bucket", "source", "status")
 TERMS_REQUIRED = ("isin", "kind", "coupon_pct", "frequency", "issue_date")
 TERM_KINDS = ("corporate", "perpetual", "frb_corp")
 SCHEDULE_COLUMNS = ("isin", "due_date", "payment_date", "record_date", "kind", "amount_per100", "source")
 OPTION_COLUMNS = ("isin", "kind", "date", "price_per100", "notice_days", "portion", "exercised",
-                  "exercised_public_from", "source")
+                  "exercised_public_from", "record_date", "source")
 AMORTISATION_COLUMNS = ("isin", "date", "principal_per100", "basis", "source")
 STEP_COLUMNS = ("isin", "threshold", "step_bp_per_notch", "max_step_bp", "agencies", "combine", "effective",
                 "step_down", "source")
@@ -1147,17 +1263,24 @@ def _cell(value) -> str:
 def _rows_for(frame: pd.DataFrame | None, isin: str) -> list[dict]:
     if frame is None or frame.empty:
         return []
-    rows = frame.loc[frame["isin"].map(_cell) == isin].to_dict("records")
+    rows = frame.loc[frame["isin"].map(_cell).str.upper() == isin.strip().upper()].to_dict("records")
     return [{k: _cell(v) for k, v in r.items()} for r in rows]
+
+
+def normalise_isin(value) -> str:
+    """An ISIN as the term tables key it: stripped and upper-case (blank for a missing cell)."""
+    return _cell(value).upper()
 
 
 def read_term_table(source, columns: tuple[str, ...], required: tuple[str, ...], key: tuple[str, ...],
                     what: str) -> pd.DataFrame:
     """A CSV (path) or frame of text cells with ``columns``, blank rows dropped, one row per ``key``.
 
-    Headers are matched case-insensitively; optional columns missing from the file are added blank; extra
-    columns are kept. A key repeated with the same values is kept once; repeated with different values it is
-    refused, naming the key and both rows.
+    Headers are matched case-insensitively; optional columns missing from the file are added blank. A column
+    the table does not read is refused, naming the nearest known one (a misspelt optional column would
+    otherwise fall back to its default silently); a blank, unnamed column (a trailing comma) is dropped. ISINs
+    are stripped and upper-cased. A key repeated with the same values is kept once; repeated with different
+    values it is refused, naming the key and both rows.
     """
     if isinstance(source, pd.DataFrame):
         frame, name = source.copy(), what
@@ -1167,6 +1290,17 @@ def read_term_table(source, columns: tuple[str, ...], required: tuple[str, ...],
             raise FileNotFoundError(f"{what} CSV not found: {path}")
         frame, name = pd.read_csv(path, dtype=str, keep_default_na=False), str(path)
     frame.columns = [str(c).strip().lower() for c in frame.columns]
+    blank = [c for c in frame.columns if (not c or c.startswith("unnamed:"))
+             and all(not _cell(v) for v in frame[c])]
+    frame = frame.drop(columns=blank)
+    unknown = [c for c in frame.columns if c not in columns]
+    if unknown:
+        hints = []
+        for c in unknown:
+            close = difflib.get_close_matches(c, columns, n=1, cutoff=0.6)
+            hints.append(repr(c) + (f" (did you mean {close[0]!r}?)" if close else ""))
+        raise ValueError(f"{name}: unknown column {', '.join(hints)}: the {what} table reads only "
+                         f"{', '.join(columns)}")
     missing = [c for c in required if c not in frame]
     if missing:
         raise ValueError(f"{name}: needs columns {missing}")
@@ -1175,6 +1309,8 @@ def read_term_table(source, columns: tuple[str, ...], required: tuple[str, ...],
             frame[c] = ""
     for c in frame.columns:
         frame[c] = [_cell(v) for v in frame[c]]
+    if "isin" in frame:
+        frame["isin"] = frame["isin"].str.upper()
     frame = frame[frame.ne("").any(axis=1)].reset_index(drop=True)
     for c in required:
         blank = frame.index[frame[c] == ""].tolist()
@@ -1274,6 +1410,38 @@ def step_rule_from_row(row) -> StepRule:
 def default_calendar(conventions: CorporateConventions) -> BusinessCalendar:
     """The conventions' payment calendar, lenient beyond the years its holiday list covers (weekends only there)."""
     return calendar_for(conventions.payment_calendar_name).lenient()
+
+
+_WEEKDAYS = BusinessCalendar("weekdays", strict=False)
+
+
+def default_as_of(bond: CorporateBond, settlement, trade_date=None) -> datetime:
+    """00:00 on the trade date: ``trade_date`` if given, else ``settlement`` less the bond's settlement lag in
+    business days on its payment calendar (weekdays without one).
+
+    The default ``as_of`` of the batch functions (``price_corporates``, ``credit_spreads.spread_table``,
+    ``trades.check_trade_yields``, ``asset_swaps.asset_swap_table``): an exercise, or a decision not to
+    exercise, is used only once public before trading began that day, a trade's own time being rarely known
+    (UNVERIFIED default, conservative: a notice made public during the trade day counts from the next day; a
+    T+0 trade taken as T+1 counts from a day earlier still).
+    """
+    if trade_date is not None and not (isinstance(trade_date, float) and math.isnan(trade_date)) \
+            and trade_date is not pd.NaT and str(trade_date).strip():
+        return datetime.combine(as_date(trade_date), time(0, 0))
+    s = as_date(settlement)
+    cal = _WEEKDAYS if bond.calendar is None else bond.calendar.lenient()
+    return datetime.combine(cal.add_business_days(s, -bond.conventions.settlement_lag)
+                            if bond.conventions.settlement_lag else s, time(0, 0))
+
+
+def _as_of_for(bond: CorporateBond, rec: dict, s: date, as_of) -> datetime:
+    """A row's ``as_of``: the argument, else the row's ``as_of`` cell, else ``default_as_of`` (its trade date)."""
+    if as_of is not None:
+        return public_time(as_of, "as_of")
+    cell = rec.get("as_of")
+    if cell is not None and _cell(cell):
+        return public_time(_cell(cell), "as_of")
+    return default_as_of(bond, s, rec.get("trade_date"))
 
 
 def corporate_from_terms(row, *, schedule: pd.DataFrame | None = None, options: pd.DataFrame | None = None,
