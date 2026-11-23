@@ -1254,7 +1254,7 @@ def _frb_coupons(args: argparse.Namespace) -> int:
         announced = None if args.no_frb_coupons else (args.frb_coupons or FRB_COUPONS_CSV)
         curve = _projection_curve(args)
         tables = [goi_frb_rates(row, tbills, announced, as_of=as_of, allow_fewer=args.frb_allow_fewer,
-                                allow_stale=args.allow_stale, projection=args.projection,
+                                allow_stale=args.frb_allow_stale, projection=args.projection,
                                 curve=curve if row["index"] != "gsec5y_reset5y" else None)
                   for row in terms.to_dict("records")]
         rates = pd.concat(tables, ignore_index=True) if tables else pd.DataFrame(columns=list(FRB_RATE_COLUMNS))
@@ -2137,8 +2137,6 @@ def main(argv: list[str] | None = None) -> int:
                                    "everything in the inputs, a look-ahead for a past date)")
     p.add_argument("--isin", nargs="+", help="only these FRBs (default every FRB of the terms)")
     _frb_args(p, store=True)
-    p.add_argument("--allow-stale", action="store_true",
-                   help="project from a base more than one period old (flagged); otherwise such a coupon is unknown")
     _projection_args(p)
     p.add_argument("--out", required=True, help="the rates CSV (floating.FRB_RATE_COLUMNS)")
     p.set_defaults(func=_frb_coupons)

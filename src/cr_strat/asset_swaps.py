@@ -42,13 +42,13 @@ or ``curvefit``'s fitted G-sec curve, against which the same z-spread is a bond'
 bond maturing past an OIS curve's last node (5 years for FBIL's) is refused unless the curve allows extrapolation,
 and then ``extrapolated`` says so; a fitted curve extrapolates on its own and is flagged the same way.
 
-**Corporate bonds** (``corporates.CorporateBond``): the same four measures on the bond's own flows, on the dates it
-is priced on (due dates for settlements from 18 Aug 2025, payment dates before), a coupon past its record date left
-out. Two choices no source settles (UNVERIFIED): the matched OIS rate is restated to the bond's annual basis before
-the yield-yield spread (``k_match_basis="bond"``, the default for corporate bonds: an annual NCD yield against a
-semi-annual or simple rate carries a basis: 9.13 bp on a bond of ``docs/analytics.md``; ``"schedule"`` keeps the par rate on the floating
-schedule, as for G-secs), and an amortising bond's swap notional amortises with its face (``_period_faces``: the par
-rate of an OIS on that notional). ``asset_swap_table`` builds them from the corporate terms tables, as known at
+**Corporate bonds** (``corporates.CorporateBond``): the same four measures on the bond's own flows, on the dates it is
+priced on (due dates for settlements from 18 Aug 2025, payment dates before), a coupon past its record date left out.
+Two choices no source settles (UNVERIFIED): the matched OIS rate is restated to the bond's annual basis before the
+yield-yield spread (``k_match_basis="bond"``, the default for corporate bonds: an annual NCD yield against a semi-annual
+or simple rate carries a basis, 9.13 bp on a bond of ``docs/analytics.md``; ``"schedule"`` keeps the par rate on the
+floating schedule, as for G-secs), and an amortising bond's swap notional amortises with its face (``_period_faces``:
+the par rate of an OIS on that notional). ``asset_swap_table`` builds them from the corporate terms tables, as known at
 ``as_of`` (an exercise public by then redeems the bond at the option; default 00:00 on the trade date), and refuses a
 row whose coupon, kind or maturity contradicts the terms.
 

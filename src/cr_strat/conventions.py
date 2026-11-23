@@ -597,9 +597,9 @@ NCD = CorporateConventions(
 
 # Issues of 1 Dec 2013 to 31 Dec 2016: SEBI 2013 Annex A (copy) accrues a postponed coupon to its payment date
 # and starts the next period there (367 then 364 days, reproduced exactly: postponed_coupon VERIFIED). PARTLY
-# VERIFIED, an interpretation: the note that "redemption and accrued interest are payable on the immediately previous
-# working day" is read as interest accruing to that payment date (redemption_interest="to_payment"); the
-# illustration's figures do not test it.
+# VERIFIED, an interpretation: the circular's note that a redemption falling on a holiday is paid, with its accrued
+# interest, on the previous working day is read as interest accruing to that payment date
+# (redemption_interest="to_payment"); the illustration's figures do not test it.
 NCD_2013 = replace(NCD, name="Listed NCD (issued 1 Dec 2013 - 31 Dec 2016)", postponed_coupon="to_payment",
                    redemption_interest="to_payment")
 

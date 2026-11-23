@@ -439,7 +439,7 @@ def test_frb_price_command(capsys, tmp_path):
     assert "the coupon of the period from 2026-09-22 is not known" in capsys.readouterr().err
 
 
-# ---------------------------------------------------------------- fixes of the review (fixings as known, gaps, staleness)
+# -------------------------------------------------------------- fixes of the review (fixings as known, gaps, staleness)
 
 
 FRB2031 = load_frb_terms().set_index("isin").loc["IN0020180041"].to_dict() | {"isin": "IN0020180041"}
@@ -507,8 +507,8 @@ def test_a_stale_announced_coupon_is_not_projected():
     current = r.loc[D(2025, 10, 4)]
     assert current["status"] == "unknown" and "2021-10-04, more than one period before" in current["notes"]
     flagged = goi_frb_rates(frb2028, None, as_of="2026-01-14T18:00", allow_stale=True).set_index("period_start")
-    assert (flagged.loc[D(2025, 10, 4), "rate_pct"], flagged.loc[D(2025, 10, 4), "public_from_source"]) == (4.04,
-                                                                                                         "proxy")
+    stale_row = flagged.loc[D(2025, 10, 4)]
+    assert (stale_row["rate_pct"], stale_row["public_from_source"]) == (4.04, "proxy")
     later = goi_frb_rates(frb2028, None, as_of="2026-04-10T18:00").set_index("period_start")
     assert (later.loc[D(2026, 4, 4), "status"], later.loc[D(2026, 10, 4), "status"]) == ("announced", "projected")
 
@@ -579,6 +579,11 @@ def test_a_corporate_reset_is_fixed_only_on_its_own_published_fixing():
     assert gap["status"] == "unfixed" and gap["fixings_used"] == "2026-04-09"
     assert "the fixing of 2026-04-14 is not in the table: the latest, of 2026-04-09, is 3 business days older" in \
         gap["notes"]
+    passed = r.loc[D(2026, 10, 15)]  # fixing date 14 Oct 2026, passed, its value missing: a gap, noted
+    assert passed["status"] == "projected" and "the fixing of 2026-10-14 is not in the table" in passed["notes"]
+    future = corporate_frb_rates(quarterly, FloatingTerms("mibor", 1.0, 3, fixing_lag_days=1), daily,
+                                 as_of="2026-10-01T20:00").set_index("period_start").loc[D(2026, 10, 15)]
+    assert future["status"] == "projected" and "not in the table" not in future["notes"]  # still to come: no gap
 
 
 def test_coupons_as_known_are_quick_on_a_long_table():

@@ -680,7 +680,19 @@ dates of FY2026-27 as package data with the day each became public, a step
 model of overnight MIBOR and the back-out of the level after each meeting
 decided after the trade date, with what the quotes identify, in
 [`policy_path.py`](../src/cr_strat/policy_path.py), `cr-strat policy-path`);
-corporate cash-flow terms, primary data and fundamentals for S8 and S10.
+for S8 the secondary-market half (G-, par and z-spreads of corporate bonds
+to a fitted G-sec curve, to maturity, to worst or by SEBI's rule, and each
+bond's spread against its peers, in `credit_spreads.py`, on prints checked
+by `cr-strat trade-check`; built and tested on synthetic data, waiting for
+exchange trades and the bonds' terms), while its new-issue half is not built:
+no loader for the electronic bidding platform's results (BSE's issue-level
+file) and no new-issue concession measure; for S10 the carry of AA and A
+bonds in the return engine (coupons entitled at record dates, rating-linked
+coupon steps and costs by rating bucket as of each trade from rating actions
+with their times, funding at the RBI store's corporate bond repo rate),
+waiting for marks and rating histories under the agencies' terms; the
+corporate terms tables themselves are typed in by the user, and primary
+data and fundamentals for S8 and S10 remain.
 
 ## Pitfalls
 

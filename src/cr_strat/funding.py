@@ -6,13 +6,14 @@ included. ``source`` picks the overnight segment: ``triparty`` (TREPS, CCIL's tr
 ``market_repo`` (basket and special repo together), ``call`` (the weighted average call rate, WACR: the operating
 target and the free stand-in for overnight MIBOR, a whole-day average where FBIL's MIBOR averages a morning window),
 ``overnight`` (all segments) or ``corp_bond_repo`` (repo in corporate bonds: what a corporate bond or CP is lent
-against, dearer than G-sec repo: 5.70% against 5.55% on 13 Nov 2026 in the RBI store). A row is a dealing day when it carries a rate; weekend and holiday rows carry none
-and are never filled forward. A dealing day's rate runs to the next dealing day: a Friday's covers the weekend, and a
-Saturday row with a rate and a volume (money markets deal on some Saturdays) is a dealing day of its own. The SDF and
-MSF rates of each row bound the corridor (SDF = repo - 25 bp, MSF = repo + 25 bp, symmetric since the SDF replaced the
-fixed-rate reverse repo as the floor on 8 Apr 2022, RBI press release 2022-2023/41; the floor was 65 bp below repo in
-the pandemic years before; the framework of 30 Sep 2025 kept the corridor); a rate outside it is flagged ``below_sdf``
-or ``above_msf``, never clipped (lenders without SDF access have pushed overnight rates below it).
+against, dearer than G-sec repo: 5.70% against 5.55% on 13 Nov 2026 in the RBI store). A row is a dealing day when it
+carries a rate; weekend and holiday rows carry none and are never filled forward. A dealing day's rate runs to the next
+dealing day: a Friday's covers the weekend, and a Saturday row with a rate and a volume (money markets deal on some
+Saturdays) is a dealing day of its own. The SDF and MSF rates of each row bound the corridor (SDF = repo - 25 bp, MSF =
+repo + 25 bp, symmetric since the SDF replaced the fixed-rate reverse repo as the floor on 8 Apr 2022, RBI press release
+2022-2023/41; the floor was 65 bp below repo in the pandemic years before; the framework of 30 Sep 2025 kept the
+corridor); a rate outside it is flagged ``below_sdf`` or ``above_msf``, never clipped (lenders without SDF access have
+pushed overnight rates below it).
 ``quarter_end_day`` and ``fy_end_day`` come from the store: advance tax and GST outflows drain liquidity around
 quarter-ends and 31 March, and no stored history covers one yet.
 

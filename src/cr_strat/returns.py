@@ -50,35 +50,36 @@ refused before the run, naming the remedy: the option's ``record_date``); an FRB
 knows it (announced, computed from the three latest 182-day T-bill results public by then and dated before its fixing
 day, or projected flat and noted; a period that ends with its coupon still projected keeps that rate, so its coupon is
 paid at what was accrued, flagged ``unfixed``; a period it cannot project, from fewer than three results or from a base
-more than a period old, is refused, naming why, unless ``frb_allow_fewer`` or ``frb_allow_stale``). When the bond as known changes, the previous close's mark is
-restated on it (its yield from the same clean price) and the interest accrued to that close is restated at the new
-coupon in the ``coupon_reset`` line, ``F/100 (AI_new(prev) - AI_old(prev))``, nonzero only when a coupon becomes known
-after its period began (a fixing or rating action published late). A corporate coupon goes to the holder at the close
-of its record date (``CorporateBond.record_date``: 15 days before the due date under the SEBI conventions of
-``corporates``, a holiday moved to the preceding day; at the latest the day before the due date; a record date on a
-holiday takes the previous business day's close) and is a receivable until its payment date; a settlement after the
-record date is ex-interest, its accrued interest negative to the due date. A partial redemption is entitled the same
-way (``pull_to_par``: the principal booked at face against the clean price's fall), the mark of its record date,
-whose standard settlement is ex the principal, is restated to settle that day, and a stale mark held across that
-record date holds its yield rather than its price (which still holds the principal); positions keep the original face
-(``corporates`` prices per 100 original face; the notes give the outstanding face). The redemption closes the position
-at its record date's close into a receivable: trading is suspended after it, so a later settlement is refused and a
-mark whose standard settlement falls after it is restated to settle on the day itself. An exercised call or put
-redeems at its date and price once the exercise is public; an unexercised option changes no flow (the bond is valued
-to maturity and the mark carries the option). Costs (``costs``): the debenture stamp duty (0.0001% of the
-consideration, on the buyer), the exchange's fee (Rs 5 a crore of value, Rs 25 to Rs 500, GST extra), no CCIL charge,
-the half spread by the trade's ``rating_bucket``, else the bucket of the worst of each agency's latest rating public
-before the trade day (``MarketData.ratings``, rows of the ISIN or its issuer), else the terms' static
-``rating_bucket`` (noted: a rating typed in later would price earlier trades), else the widest (all UNVERIFIED); FRBs
-take the G-sec rows. Funding: neither is TREPS collateral here (corporate bonds are not on CCIL's list; FRBs are GoI
-dated securities but are taken as ineligible, UNVERIFIED and conservative); with a row for its kind in the user's
-haircut table a corporate bond is lent against in corporate bond repo (``FundingPolicy.corporate_segment``,
-``corp_bond_repo``: the RBI store's repo in corporate bonds, 15 bp over market repo on 13 and 16 Nov 2026; UNVERIFIED
-that a fund pays the segment's average), an FRB in market repo (``excess_segment``), without one not at all
-(equity-funded). Risk: an FRB's ``dv01`` in positions, the tenor buckets (at its next reset) and the hedge check is
-its rate DV01 (``floating.index_dv01``, the margin held), not its yield DV01, which is its spread DV01 and some
-hundred times larger. Attribution: a corporate bond's yield moves against the G-sec curve (``rich_cheap`` is its
-spread's change); an FRB has no default reference curve, so its price move is ``price_unattributed``.
+more than a period old, is refused, naming why, unless ``frb_allow_fewer`` or ``frb_allow_stale``). When the bond as
+known changes, the previous close's mark is restated on it (its yield from the same clean price) and the interest
+accrued to that close is restated at the new coupon in the ``coupon_reset`` line, ``F/100 (AI_new(prev) -
+AI_old(prev))``, nonzero only when a coupon becomes known after its period began (a fixing or rating action published
+late). A corporate coupon goes to the holder at the close of its record date (``CorporateBond.record_date``: 15 days
+before the due date under the SEBI conventions of ``corporates``, a holiday moved to the preceding day; at the latest
+the day before the due date; a record date on a holiday takes the previous business day's close) and is a receivable
+until its payment date; a settlement after the record date is ex-interest, its accrued interest negative to the due
+date. A partial redemption is entitled the same way (``pull_to_par``: the principal booked at face against the clean
+price's fall), the mark of its record date, whose standard settlement is ex the principal, is restated to settle that
+day, and a stale mark held across that record date holds its yield rather than its price (which still holds the
+principal); positions keep the original face (``corporates`` prices per 100 original face; the notes give the
+outstanding face). The redemption closes the position at its record date's close into a receivable: trading is suspended
+after it, so a later settlement is refused and a mark whose standard settlement falls after it is restated to settle on
+the day itself. An exercised call or put redeems at its date and price once the exercise is public; an unexercised
+option changes no flow (the bond is valued to maturity and the mark carries the option). Costs (``costs``): the
+debenture stamp duty (0.0001% of the consideration, on the buyer), the exchange's fee (Rs 5 a crore of value, Rs 25 to
+Rs 500, GST extra), no CCIL charge, the half spread by the trade's ``rating_bucket``, else the bucket of the worst of
+each agency's latest rating public before the trade day (``MarketData.ratings``, rows of the ISIN or its issuer), else
+the terms' static ``rating_bucket`` (noted: a rating typed in later would price earlier trades), else the widest (all
+UNVERIFIED); FRBs take the G-sec rows. Funding: neither is TREPS collateral here (corporate bonds are not on CCIL's
+list; FRBs are GoI dated securities but are taken as ineligible, UNVERIFIED and conservative); with a row for its kind
+in the user's haircut table a corporate bond is lent against in corporate bond repo
+(``FundingPolicy.corporate_segment``, ``corp_bond_repo``: the RBI store's repo in corporate bonds, 15 bp over market
+repo on 13 and 16 Nov 2026; UNVERIFIED that a fund pays the segment's average), an FRB in market repo
+(``excess_segment``), without one not at all (equity-funded). Risk: an FRB's ``dv01`` in positions, the tenor buckets
+(at its next reset) and the hedge check is its rate DV01 (``floating.index_dv01``, the margin held), not its yield DV01,
+which is its spread DV01 and some hundred times larger. Attribution: a corporate bond's yield moves against the G-sec
+curve (``rich_cheap`` is its spread's change); an FRB has no default reference curve, so its price move is
+``price_unattributed``.
 
 **Attribution** (A2). For each position and day, market lines on the start-of-day book from close to close: ``accrual``
 (accrued interest gained plus coupons entitled), ``pull_to_par`` (``F/100 (clean(y0, s_d) - clean(y0, s_prev))``), and
@@ -228,7 +229,6 @@ from cr_strat.floating import (
 )
 from cr_strat.funding import FUNDING_SOURCES, haircut, read_haircuts, treps_class, treps_shares
 from cr_strat.issuance import TENOR_BUCKETS, tenor_bucket
-from cr_strat.rating_scale import parse_rating, rating_bucket
 from cr_strat.ois import (
     MIBOR_OIS,
     OisCurve,
@@ -241,6 +241,7 @@ from cr_strat.ois import (
     ois_schedule,
     settlement_amounts,
 )
+from cr_strat.rating_scale import parse_rating, rating_bucket
 
 # ---------------------------------------------------------------- layouts
 
@@ -411,21 +412,21 @@ class FundingPolicy:
     """How each book is funded overnight (A1.5).
 
     ``segment``: the ``funding.funding_rates`` source of the main borrowing (``triparty``: TREPS); ``excess_segment``
-    for what CCIL's TREPS caps leave (``market_repo``); ``corporate_segment`` for what corporate bonds are lent
-    against (``corp_bond_repo``, repo in corporate bonds, dearer than G-sec repo: UNVERIFIED that a fund gets the
-    segment's average rate; ``spread_bp`` applies to it too), its interest in the ``funding_excess`` line. ``spread_bp`` over every rate of the cash borrowed (UNVERIFIED
-    default 0, as ``funding.carry``). ``sizing``: ``cash_need`` (borrow what the day's cash needs, rounded up to
-    ``lot_rs``, Rs 5 lakh, TREPS's lot) or ``fixed`` (keep the amount borrowed at each purchase, ``(1 - h)`` of its
-    consideration, as ``funding.carry``; cash may go negative at 0%). ``idle_cash_rate_pct`` on cash left over
-    (UNVERIFIED default 0). ``margin_pct``: TREPS initial margin as a percentage of the second leg (``None``: the cost
-    table's ``treps_margin_pct``; 0 to leave it out). ``on_shortfall``: ``raise`` when the cash need exceeds the
-    borrowing limit, or ``overdraft`` at ``overdraft_rate_pct`` (no default). ``projection="last"`` holds the last
-    dealing rate past the end of the funding table (counted and noted), for the funding and for the risk-free rate;
-    otherwise such a night is refused. ``rate_basis``: ``deal_day`` (default) charges every night of a deal the rate of
-    the day it was struck (the engine deals only on business days, so a deal struck on Thursday for Monday bears
-    Thursday's rate for four nights); ``calendar_day`` prices each calendar day at the rate of the latest dealing day
-    on or before it, as ``funding.carry`` does (a Saturday with a money-market rate prices itself and the Sunday;
-    UNVERIFIED choice: the two differ only on such Saturdays).
+    for what CCIL's TREPS caps leave (``market_repo``); ``corporate_segment`` for what corporate bonds are lent against
+    (``corp_bond_repo``, repo in corporate bonds, dearer than G-sec repo: UNVERIFIED that a fund gets the segment's
+    average rate; ``spread_bp`` applies to it too), its interest in the ``funding_excess`` line. ``spread_bp`` over
+    every rate of the cash borrowed (UNVERIFIED default 0, as ``funding.carry``). ``sizing``: ``cash_need`` (borrow what
+    the day's cash needs, rounded up to ``lot_rs``, Rs 5 lakh, TREPS's lot) or ``fixed`` (keep the amount borrowed at
+    each purchase, ``(1 - h)`` of its consideration, as ``funding.carry``; cash may go negative at 0%).
+    ``idle_cash_rate_pct`` on cash left over (UNVERIFIED default 0). ``margin_pct``: TREPS initial margin as a
+    percentage of the second leg (``None``: the cost table's ``treps_margin_pct``; 0 to leave it out). ``on_shortfall``:
+    ``raise`` when the cash need exceeds the borrowing limit, or ``overdraft`` at ``overdraft_rate_pct`` (no default).
+    ``projection="last"`` holds the last dealing rate past the end of the funding table (counted and noted), for the
+    funding and for the risk-free rate; otherwise such a night is refused. ``rate_basis``: ``deal_day`` (default)
+    charges every night of a deal the rate of the day it was struck (the engine deals only on business days, so a deal
+    struck on Thursday for Monday bears Thursday's rate for four nights); ``calendar_day`` prices each calendar day at
+    the rate of the latest dealing day on or before it, as ``funding.carry`` does (a Saturday with a money-market rate
+    prices itself and the Sunday; UNVERIFIED choice: the two differ only on such Saturdays).
     """
 
     segment: str = "triparty"

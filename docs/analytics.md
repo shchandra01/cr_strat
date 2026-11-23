@@ -748,38 +748,63 @@ cr-strat price-panel --trades data/out/trades_nse.csv --securities data/raw/secu
 ```
 
 Inputs. `--terms`, `--options`, `--amortisation` and `--schedule-file` are the corporate tables `corporates` reads
-(`corporate_terms.csv` and the rest, [`data/README.md`](../data/README.md)). In `asset-swaps`, a bond of `--bonds`
-whose ISIN is in `--terms` is built from it (its `maturity_date` may be blank; a value given in both that differs is
-refused), and with `--frb-out` the rows whose ISINs are GoI FRBs of the FRB terms (`--frb-terms`, default the shipped
-table) are measured apart, their coupons from the announced coupons (`--frb-coupons`, default the shipped table;
-`--no-frb-coupons` for none) and the 182-day T-bill results (`--tbills` CSV or an RBI store's `tbill_result`, each
-result's time from its file, else `--tbill-time` on its auction day, a rule), as known at `--as-of` (without it,
-everything in the inputs: a look-ahead for a past date, which the summary line says). Without `--frb-out` an FRB stays
-in the main table, refused there, and a note says so. `credit-spreads` takes the prices (`isin`, `clean_price` or
-`yield_pct`, optional `settlement_date`, default the curve's valuation date), one NSS curve of an `--nss-params` table
-(`--curve`, default `gsec`; `--date` when the table holds several days) and, with `--peer-panel` (a `price-panel`
-output), each bond's peer median and `relative_spread_bp` (the prices then need `issuer_id` and the peer columns;
-`tenor_bucket` is computed from the years to the workout). `trade-check` reads `load-trades` CSVs and appends the check
-columns; `--tolerance-bp` (default 1, UNVERIFIED) and `--workout` (`maturity` or `worst`) set the check. Each command
-exits 1 when no row could be measured, 2 on bad input or a missing file; the same inputs give the same bytes.
+(`corporate_terms.csv` and the rest, [`data/README.md`](../data/README.md)); a column a table does not define is
+refused, naming the closest one it does (a misspelt `redemption_pct` once redeemed a zero-coupon bond at 100 without a
+word), and ISINs are read in capitals. In `asset-swaps`, a bond of `--bonds` whose ISIN is in `--terms` is built from
+it (its `maturity_date` may be blank, and a file of FRBs alone needs no `maturity_date` column; a maturity,
+`coupon_pct` or `kind` given in both that differs from the terms is refused), and with `--frb-out` the rows whose ISINs
+are GoI FRBs of the FRB terms (`--frb-terms`, default the shipped table) are measured apart, their coupons from the
+announced coupons (`--frb-coupons`, default the shipped table; `--no-frb-coupons` for none) and the 182-day T-bill
+results (`--tbills` CSV or an RBI store's `tbill_result`, each result's time from its file, else `--tbill-time` on its
+auction day, a rule). The FRBs' coupons and the corporate bonds' exercises are as known at `--as-of`, by default 00:00
+on `--trade-date` (`--as-of all`: everything in the inputs, a look-ahead for a past date, which the summary line says;
+before the review that look-ahead was the default and moved FRB 2034's curve margin for 2 Jun 2025 by 49.5 bp). Without
+`--frb-out` an FRB stays in the main table, refused there, and a note says so. `credit-spreads` takes the prices
+(`isin`, `clean_price` or `yield_pct`, optional `settlement_date`, default the curve's valuation date, and optional
+`trade_date` or `as_of`), one NSS curve of an `--nss-params` table (`--curve`, default `gsec`; `--date` when the table
+holds several days) and, with `--peer-panel` (a `price-panel` output), each bond's peer median and
+`relative_spread_bp` (the prices then need `issuer_id` and the peer columns; `tenor_bucket` is computed from the years
+to the workout). `trade-check` reads `load-trades` CSVs and appends the check columns; `--tolerance-bp` (default 1,
+UNVERIFIED) and `--workout` (`maturity` or `worst`) set the check. In `corp-price --prices`, `credit-spreads` and
+`trade-check` the terms are as known at 00:00 on each row's trade date (its `trade_date`, else the settlement less the
+bond's settlement lag; `--as-of` sets one time for every row, an `as_of` column one per row): a notice made public
+during the trade day counts from the next day (UNVERIFIED, conservative: a trade's own time is rarely known).
+`--price-basis` reads a partly redeemed bond's prices per 100 of its original face (the default of `corp-price`,
+`credit-spreads` and `asset-swaps`, and of the engine's marks) or of the face still outstanding (the default of
+`trade-check` and `price-panel`, whose prints come from exchanges: UNVERIFIED). A payment or record date beyond the
+holiday list, rolled on weekends only, is flagged (`calendar_projected`) and warned of. Each command exits 1 when no row
+could be measured (`corp-price --prices` too), 2 on bad input or a missing file; the same inputs give the same bytes.
 
 **Asset swaps of corporate bonds.** The measures are the G-sec ones (yield-yield, par-par, proceeds and z-spread,
 [Method](#method-1)), on the flows a buyer settling that day receives: a settlement after a record date leaves the
 coming coupon out and pays a negative accrued interest, and the flows sit on due dates or on payment dates as the bond's
-`flow_dates` rule says. A corporate bond's yield is annual on actual/actual (SEBI's day count), so the matched OIS rate
-on the bond's schedule is restated to that basis before the yield-yield spread (`k_match_basis="bond"`, the default for
+`flow_dates` rule says. A corporate bond's yield compounds annually on actual days over 365 (an XIRR; its coupons
+accrue on SEBI's actual/actual), so the matched OIS rate on the bond's schedule is restated to that basis before the
+yield-yield spread (`k_match_basis="bond"`, the default for
 corporate bonds; `"schedule"` keeps the swap's basis): without it a semi-annual NCD priced on the curve shows 9.13 bp of
 yield-yield spread (0.04 bp with it, on the synthetic OIS curve of the tests). An amortising bond's par-par and proceeds
 spreads divide by an annuity whose notional is each period's outstanding face. Both are this build's readings of the
-textbook definitions (UNVERIFIED: no market convention for Indian corporate asset swaps was found).
+textbook definitions (UNVERIFIED: no market convention for Indian corporate asset swaps was found). A bond with an
+exercise public by `as_of` is measured to the exercise (`maturity_date` then gives the call date).
 
 **GoI FRBs.** An FRB's coupon follows its index, so it has no fixed-coupon asset swap: its spread is a discount
 margin. The index form (`floating.discount_margin_bp`) is the margin over a flat index that prices the bond, every
 coupon not yet fixed projected at index plus the bond's spread; the curve form is the parallel shift of the curve's
 continuously compounded zero rates that prices its flows (on an OIS curve, the FRB's spread over OIS), with a
 semi-annual variant. The spread DV01 is the price change per bp of margin, the index DV01 per bp of the projected
-index with the margin held (a floater's rate risk, small). The coupons are those `floating.goi_frb_rates` knows at
-`as_of`: announced, computed from the three latest 182-day results public by then, else projected flat.
+index with the margin held: a floater's rate risk, small and sitting at its next reset. Only the coupons of periods
+still to start move; the coupon in force is held, as it was fixed when its period began, even when the data lack it
+and it is projected (before the review it moved too, which turned the README's FRB 2033 example to -0.001489; it is
+0.003401 now). The coupons are those `floating.goi_frb_rates` knows at `as_of`: announced (an announcement more than
+14 days before its fixing day is refused as a typo); computed from the three latest 182-day results public by then and
+dated before the fixing day, once the last of them is within a week of that day or a week has passed since it (rules
+of thumb from the weekly auction calendar, UNVERIFIED: an auction cancelled in the fixing week no longer leaves the
+coupon projected for good); else projected (flat at the latest computable base, or at the base the latest announced
+coupon implies; `projection="forward"` from a curve), a fixing day already passed only from the results before it or
+the coupon announced for the period before; a base more than one period old is refused unless `allow_stale` (flagged
+`proxy`), and a period that ended still projected keeps its projection, flagged `unfixed`, so its coupon can be paid.
+`public_from_source` names each projection's base. `cr-strat frb-coupons` writes every FRB's periods as known at a time
+(`--as-of`, required; `--projection forward` with `--nss-params`).
 
 **Spreads to a fitted G-sec curve** (`credit_spreads`). The curve is any `curvefit` curve, here one row of the NSS table
 `curve-fit --nss-params` writes. The G-spread is the bond's yield less the curve's par yield at the workout date, the
@@ -795,42 +820,89 @@ workout then fixed at that date); `sebi` (from a yield, SEBI's trigger rule for 
 `CorporateBond.sebi_valuation`). The peer benchmark is `curves.SpreadBenchmark` on a price panel: by instrument class,
 rating bucket and tenor bucket, the median over issuers in a five-day window, the bond's own issuer left out, NaN below
 three issuers (UNVERIFIED choices, as in `curves`); the panel's spread is the yield less a benchmark curve's yield, the
-G-spread's measure when that benchmark is the par curve on the bond's basis.
+G-spread's measure when that benchmark is the par curve on the bond's basis. Each bond is taken as known at its row's
+`as_of` (default 00:00 on its trade date): a call exercised with a notice public by then is the workout
+(`exercised_call`, so a bond called for 15 Jan 2027 shows 7.000000% and a modified duration of 0.1625 to the call,
+where the bond to maturity gave 7.969392% and 4.9794), and a decision not to exercise counts only once public (before
+the review it counted always: a call declined in a notice of 1 Dec 2027 left the yield to worst of 20 Nov 2026 at
+8.827958% to maturity instead of 6.674500% to the call).
 
-**Trade check** (`trades.check_trade_yields`). For each trade the settlement is the one reported (else T+1 on the
-bond's calendar, noted), and the yield is recomputed from the price in every reading a reporter could have used: the
-price as clean or as dirty, the flows on due or payment dates, to maturity or to each call and put date at its price,
-and in the last coupon period the money-market rule or compounding. `recomputed_yield_pct` is the standard reading
-(clean, the bond's own flow dates, to maturity or with `workout="worst"` to worst); `nearest_reading` and
-`yield_diff_bp` say which reading the reported yield is closest to and by how much, and `yield_check` is `ok` within
-`tolerance_bp` (1 bp, UNVERIFIED), else `mismatch`; `no_terms`, `no_price`, `no_yield` or `error` (with the reason in
-`check_notes`, such as a settlement after the redemption record date). The trades keep their columns and order; only
-the check columns are appended. `price_panel` keeps the reported yields by default, its output unchanged; with
-`yield_source="recomputed"` its daily rows come from `isin_daily_checked` (the day's value-weighted recomputed yield,
-the value-weighted reported one beside it, the day's checks as counts such as `mismatch:1;ok:3`, the commonest workout
-date), and `RECOMPUTED_COLUMNS` are appended. The recomputation is upstream, trade by trade, so the day's yield is a
-weighted mean of recomputed yields rather than the yield of the day's weighted price (a deviation from the
-specification's wording, chosen because a weighted price of trades settling on different days has no single yield).
+**Trade check** (`trades.check_trade_yields`). For each trade the settlement is the one reported (else T+1 on the bond's
+calendar, noted), the terms are as known at 00:00 on its trade date (an exercise public by then makes the exercise the
+workout), and the yield is recomputed from the price in every reading a reporter could have used: the price as clean or
+as dirty, the flows on due or payment dates, to maturity or to each call and put date at its price, and in the last
+coupon period the money-market rule or compounding; a `yield_type` the report declares (YTM, YTC or YTP, as SEBI's
+reporting format has it) limits the workouts read to it. Reported prices are read as clean (the corporates
+specification's decision, UNVERIFIED: NSE's order-matching platform may print dirty prices) and, for a partly redeemed
+bond, per 100 of the face still outstanding (`price_basis="outstanding"`, the default here, UNVERIFIED: exchange
+part-redemption notices say trading continues on the reduced face value, read only through a search summary;
+`"original"` for per 100 of the original face). The specification's T14 print reported at 9%, 99.9031 per 100 of the 70
+outstanding, is then 8.999961% and `ok`, where the original-face reading gave -21.111863% and a mismatch (the same price
+typed per 100 original, 69.9321, is now `face_basis`). `recomputed_yield_pct` is the standard reading (clean, the bond's
+own flow dates, to maturity or with `workout="worst"` to worst); `nearest_reading` and `yield_diff_bp` say which reading
+the reported yield is closest to and by how much. `yield_check` is `ok` within `tolerance_bp` (1 bp, UNVERIFIED) of a
+clean reading; `dirty_price` when only a dirty reading matches, and then the recomputed yield reads the price as dirty
+(T19's dirty print: 8.2612262724%, where the clean reading's 5.957168% once entered the panel labelled `ok`);
+`face_basis` when only the other face basis matches, read on it; else `mismatch`; `no_terms`, `no_price`, `no_yield` or
+`error` (with the reason in `check_notes`, such as a settlement after the redemption record date). The trades keep their
+columns and order; only the check columns are appended. `price_panel` keeps the reported yields by default, its output
+unchanged; with `yield_source="recomputed"` its daily rows come from `isin_daily_checked` (the day's value-weighted
+recomputed yield, the value-weighted reported one beside it, the day's checks as counts such as `mismatch:1;ok:3` or
+`dirty_price:3`, the commonest workout date), the tenor, the benchmark yield and the tenor bucket are taken at that
+workout date rather than at maturity, and `RECOMPUTED_COLUMNS` are appended. T11's callable bond at 103 settling 15 Jan
+2027, at 6.34690720% to its 2029 call, is 2.0041 years and 25.6061 bp over a benchmark of 6.090846% in the `1-3y`
+bucket, where the maturity's tenor gave 7.0034 years and -77.56 bp. A bond without terms is left out of a recomputed
+panel (so S8 and S9 peer groups shrink to the bonds with typed terms), or kept on its reported yield with
+`yield_source="recomputed_where_known"`, its check `no_terms:N`. The ISIN-day rows leave out inter-scheme transfers
+(deal type IST, which the MF master circular's VWAY leaves out), in both panels. The recomputation is upstream, trade by
+trade, so the day's yield is a weighted mean of recomputed yields rather than the yield of the day's weighted price (a
+deviation from the specification's wording, chosen because a weighted price of trades settling on different days has no
+single yield).
 
 **What was checked, with the numbers** (`tests/test_credit_spreads.py`, `tests/test_trade_check.py`, the corporate and
 FRB tests of `tests/test_asset_swaps.py`, `tests/test_cli_credit.py`). The corporates specification's vectors, computed
 there by a scratch implementation independent of the repository's pricer, on the NSS curve (7.6, -2, -1, 2, 1.5, 8)
-valued 16 Nov 2026: T17-T18, the 8.95% NCD of 14 Dec 2030 at a clean 102.2591928939, gives a G-spread of 106.859149
-bp, a matched par spread of 106.504794 bp (par coupon 7.2065560908%, par yield 7.1961783336%), a z-spread of
-100.000000 bp and 103.788758 bp semi-annual, all to 1e-6 bp. The z-spread recovers shifts of -40, 0, 25 and 250 bp to
-1e-8 bp, and the par twin is worth par clean to 1e-10. T19 (the same bond and price): the payment-date reading is
-+0.503979 bp from the standard one and the dirty-price reading +256.9724 bp, both recognised; a semi-annual yield is
--16.3916 bp from every reading, a mismatch at 1 bp and `ok` at 20 bp. T11's callable bond (calls at par in 2029 and
-2030) at a dirty 103 on a coupon date: the reported 6.34690720% is recognised as the yield to the 2029 call, and the
-recomputed yield to worst is 6.34690720%. T16, settlement 14 Jun 2030 at 100: 8.5676481619% on the money-market rule,
-8.7506427110% compounded, both recognised. A corporate bond priced on the OIS curve has par-par, proceeds and z-spreads
-below 1e-9 bp (also settling ex-interest, and amortising, whose annuity matches the face-weighted sum to 1e-14); a
-semi-annual NCD on the curve shows under 0.1 bp of yield-yield spread on its basis and over 9 bp without the
-restatement. FRB T22 (FRB 2033 at 7.70% current and 7.73% projected, index 6.51%): accrued 1.2405555556, yield
-7.7250833578% and discount margin 121.508336 bp over the index at a clean 100. From the command line the same numbers
-come back (the T17 row of `credit-spreads`; corporate rows of `asset-swaps` equal to the library's to 1e-9 bp), and on
-G-sec-only inputs `asset-swaps` and `price-panel` write byte-identical files to the build before these changes (checked
-against the committed code).
+valued 16 Nov 2026: T17-T18, the 8.95% NCD of 14 Dec 2030 at a clean 102.2591928939, gives a G-spread of 106.859149 bp,
+a matched par spread of 106.504794 bp (par coupon 7.2065560908%, par yield 7.1961783336%), a z-spread of 100.000000 bp
+and 103.788758 bp semi-annual, all to 1e-6 bp. The z-spread recovers shifts of -40, 0, 25 and 250 bp to 1e-8 bp, and the
+par twin is worth par clean to 1e-10. T19 (the same bond and price): the payment-date reading is +0.503979 bp from the
+standard one and the dirty-price reading +256.9724 bp, both recognised (the dirty one as `dirty_price`, its yield read
+on the dirty price); a semi-annual yield is -16.3916 bp from every reading, a mismatch at 1 bp and `ok` at 20 bp. T11's
+callable bond (calls at par in 2029 and 2030) at a dirty 103 on a coupon date: the reported 6.34690720% is recognised as
+the yield to the 2029 call, and the recomputed yield to worst is 6.34690720%. T16, settlement 14 Jun 2030 at 100:
+8.5676481619% on the money-market rule, 8.7506427110% compounded, both recognised. A corporate bond priced on the OIS
+curve has par-par, proceeds and z-spreads below 1e-9 bp (also settling ex-interest, and amortising, whose annuity
+matches the face-weighted sum to 1e-14); a semi-annual NCD on the curve shows under 0.1 bp of yield-yield spread on its
+basis and over 9 bp without the restatement. FRB T22 (FRB 2033 at 7.70% current and 7.73% projected, index 6.51%):
+accrued 1.2405555556, yield 7.7250833578% and discount margin 121.508336 bp over the index at a clean 100. From the
+command line the same numbers come back (the T17 row of `credit-spreads`; corporate rows of `asset-swaps` equal to the
+library's to 1e-9 bp), and on G-sec-only inputs `asset-swaps` and `price-panel` write byte-identical files to the build
+before these changes (checked against the committed code).
+
+**Checked after the review** (the same test files and `tests/test_corporates.py`, `tests/test_floating.py`; each test
+fails on the code before the review). A call on 15 Jan 2028 declined in a notice public on 1 Dec 2027 stays a workout
+for 20 Nov 2026 (yield to worst at 103: 6.674500% to the call; SEBI value at 8%: 101.544778), and from the notice on the
+bond runs to maturity (8.827958%, 106.990293); `price_corporates`, `spread_table` and the trade check take the same
+time. A call exercised for 15 Jan 2027 with a notice public on 2 Nov 2026 values at 7% to 100.086466 with a modified
+duration of 0.1625, `exercised_call`, in `price_corporates`, `spread_table` (G-spread 129.84 bp to the call, against
+31.36 bp to maturity before) and the trade check. A schedule file of principal rows only now amortises the generated
+schedule: coupons of 9.0 on 1 Apr 2027, 2028 and 2029, a dirty price of 105.632453 at 9% on 20 Nov 2026 and 8.960553% at
+100, as through the amortisation table (it gave one coupon of 27.0 and 103.588877 before). An explicit schedule whose
+dates are semi-annual under `frequency=1` is refused (it moved the yield-yield spread by 9.2 bp). A redemption due Sun
+15 Dec 2024 and paid Fri 13 Dec with `record_days=0` is on record at the close of 12 Dec, the last settlement priced
+(108.976115 dirty at 8%). An options row keyed `ine000cl001` now reaches its bond (yield to worst 6.445028% to the 2029
+call, not 7.431602% to maturity). A misspelt `price_pre100` or `redemption_pct` is refused, naming `price_per100` or
+`redemption_per100`. In `asset_swap_table` a row whose `coupon_pct` (6.0 against the terms' 7.4) or `kind` contradicts
+the terms is refused. A bond allotted on 29 Feb 2024 pays 4.972678 for its first half-year (182/366) and 4.986301 for 28
+Feb to 29 Aug 2027 (182/365). FRB 2034 for a settlement of 2 Jun 2025 from `frb-price` without `--as-of`: 6.988717% and
+97.8717 bp over the index (as known at 00:00 on 30 May 2025), not 6.479798% and 100.9798 bp from RBI's announcement of
+Apr 2026; `asset-swaps` gives that FRB's current and next coupon as 6.99%. FRB 2031 with the 2 Dec 2026 auction not
+held: 7.40% `computed` from 17 Dec (a week after the fixing day), never re-projected from the auctions after 7 Dec. A
+corporate FRB reset on 2 Dec 2026 whose fixing is public on 3 Dec at 11:00 is `projected` at 7.70% at 09:00 and `fixed`
+at 7.90% at 12:00. A T-bill result public before its auction, a fixing public before its date and a coupon announced
+more than 14 days before its fixing day are refused. One FRB over 35 business days with 574 weekly results takes 0.8 s
+in the engine under a profiler (5.6 s before), four FRBs over 239 days 5.4 to 6.4 s in two runs (the review measured
+49.7 s).
 
 ## The return engine and costs
 
@@ -1077,10 +1149,15 @@ differences.
 - **The bond as known.** Each day at the valuation time, and at each trade's settlement check, the bond is rebuilt as
   known then: a `frb_corp` bond's benchmark fixings, a rating action under its step rule and a call's or put's exercise
   only from their `public_from`; a GoI FRB's coupons as `floating.goi_frb_rates` knows them (announced, computed from
-  the three latest 182-day T-bill results public by then, or projected flat and noted). A period whose coupon cannot be
-  projected (fewer than three results) is refused unless `frb_allow_fewer` (`--frb-allow-fewer`). When the bond as
-  known changes, the previous close's mark is restated on it (its yield from the same clean price), so the day's moves
-  compare like with like.
+  the three latest 182-day T-bill results public by then and dated before the fixing day, or projected flat and
+  noted). A period that ends with its coupon still projected keeps that rate (`unfixed`), so its coupon is paid at what
+  was accrued: FRB 2031's 7 Dec 2026 coupon at 6.52% with no T-bill results, Rs 32.6 lakh on Rs 10 crore, where the
+  engine stopped on the coupon date before the review (the next period then needs its announced coupon, or
+  `frb_allow_stale` to project it from the coupon of Dec 2025, two periods old). A period whose coupon cannot be
+  projected (fewer than three results, or a base more than one period old) is refused, naming why, unless
+  `frb_allow_fewer` (`--frb-allow-fewer`) or `frb_allow_stale` (`--frb-allow-stale`, flagged). When the bond as known
+  changes, the previous close's mark is restated on it (its yield from the same clean price), so the day's moves compare
+  like with like.
 - **The `coupon_reset` line.** When a coupon becomes known after its period began (a fixing or rating action published
   late), the interest accrued to the previous close is restated at the new rate:
   `coupon_reset = F/100 (AI_new(prev) - AI_old(prev))`. It is part of the NAV change and of the identity, and zero
@@ -1100,18 +1177,36 @@ differences.
   settle on the day itself.
 - **Calls and puts.** An exercised call or put redeems at its date and price once the exercise is public
   (`exercised_public_from` in `corporate_options`); before then, and for an option never exercised, the bond is valued
-  to maturity and the mark carries the option.
+  to maturity and the mark carries the option. An exercise public after its redemption's record date (15 days before
+  the exercise date by the bond's rule) or on or after the exercise date is refused before the run, naming the remedy:
+  the record date the notice sets (`record_date` in `corporate_options`, UNVERIFIED that a notice can set its own),
+  from which the redemption is entitled at that date's close. Before the review such a notice stopped the run on its
+  day with a message about the previous close's mark.
 - **Costs** (`costs`, cost table rows with their sources). Corporate bonds: the debenture stamp duty of 0.0001% of the
   consideration on the buyer (SD06), the exchange's fee of Rs 5 a crore of value, Rs 25 to Rs 500, GST extra (PF04), no
-  CCIL charge (CS07), and the half spread by rating bucket (HS20-HS24: 4 bp of yield for AAA, 7.5 for AA+ and AA, 10
-  for AA-, 20 below and without a bucket), the bucket from the trade's `rating_bucket`, else the terms', all UNVERIFIED
-  guesses. GoI FRBs: the G-sec rows (CCIL's charge CS06, no stamp duty SD07, a half spread of 4.5 bp HS25,
-  UNVERIFIED). The cost table's `rating_bucket` column ranks between the kind and the liquidity class in a rule's
-  specificity; a user table without the column reads as before.
+  CCIL charge (CS07), and the half spread by rating bucket (HS20-HS24: 4 bp of yield for AAA, 7.5 for AA+ and AA, 10 for
+  AA-, 20 below and without a bucket), all UNVERIFIED guesses. The bucket is the trade's `rating_bucket`, else that of
+  the worst of each agency's latest rating public before the trade day (`MarketData.ratings`, `--ratings`: rows of the
+  ISIN or its issuer), else the terms' static `rating_bucket`, noted, as a rating typed in later then prices earlier
+  trades (UNVERIFIED fallback), else the widest. A purchase on 20 Nov 2026 before a downgrade to A public on 25 Nov pays
+  HS20 (AAA) and a sale on 26 Nov HS23 (A); with the static bucket alone both paid HS23. GoI FRBs: the G-sec rows
+  (CCIL's charge CS06, no stamp duty SD07, a half spread of 4.5 bp HS25, UNVERIFIED). The cost table's `rating_bucket`
+  column ranks between the kind and the liquidity class in a rule's specificity; a user table without the column reads
+  as before.
 - **Funding.** Neither is TREPS collateral here: corporate bonds are not on CCIL's list, and GoI FRBs, which are GoI
   dated securities, are taken as ineligible too (UNVERIFIED and conservative: `treps_class` returns `ineligible`).
-  With a row for its kind in the user's haircut table a bond is lent against in market repo (`excess_segment`); without
-  one it is not lent against at all (equity-funded), and a shortfall says which bonds lend nothing and why.
+  With a row for its kind in the user's haircut table a corporate bond is lent against in corporate bond repo
+  (`FundingPolicy.corporate_segment`, `--corporate-source`, default `corp_bond_repo`: the RBI store's repo in corporate
+  bonds, 5.70% and 5.75% on 13 and 16 Nov 2026 against 5.55% and 5.60% in G-sec market repo; UNVERIFIED that a fund
+  pays the segment's average, `--funding-spread-bp` applies to it too), its interest in the `funding_excess` line; an
+  FRB in market repo (`excess_segment`). Before the review both took the G-sec market repo rate. Without a haircut row
+  a bond is not lent against at all (equity-funded), and a shortfall says which bonds lend nothing and why.
+- **Risk.** An FRB's `dv01` in positions, in the tenor buckets (at its next reset) and in the hedge check is its rate
+  DV01, `floating.index_dv01` with the margin held: Rs 344 per bp for Rs 10 crore of FRB 2031 bought at 100.25 on 20
+  Nov 2026, in the `0-1y` bucket. Its yield DV01, which equals its spread DV01 (Rs 41,746 there, some hundred times
+  larger), was used before the review, so a pay-fixed OIS of up to 105% of it passed the `hedge_only` test.
+  `traded_dv01` uses the same rate DV01. The spread DV01 is not reported by the engine (`frb-price` and
+  `frb_asset_swap_table` give it).
 - **Attribution.** A corporate bond is attributed against the G-sec curve (`DEFAULT_REFERENCE` maps `corporate` to
   `gsec`; `rich_cheap` is then its spread's change). An FRB has no default reference curve, so its price move is
   `price_unattributed`: its DV01 to its yield treats the projected coupons as fixed and would overstate its rate risk
@@ -1122,16 +1217,17 @@ Inputs (`cr-strat returns`): `--corporate-terms`, `--corporate-schedule`, `--cor
 `public_from`, and `isin` or `issuer_id`), `--corporate-floating` with `--benchmark-fixings` (each fixing with its
 `public_from`); for GoI FRBs `--frb-terms`, `--frb-coupons` or `--no-frb-coupons`, and the 182-day results from
 `--tbills` (a CSV) or `--tbills-from-store` (the `--store`'s `tbill_result`), with `--tbill-time` for results without
-a time. The access presets are unchanged.
+a time, `--frb-allow-fewer` and `--frb-allow-stale`; `--corporate-source` for the repo segment corporate bonds are lent
+against. The access presets are unchanged.
 
 **What was checked, with the numbers** (`tests/test_returns_credit.py`, the returns test of `tests/test_cli_credit.py`;
 synthetic data, every run's identity checked).
 
-- *A corporate bond through its record date.* A 9% annual NCD maturing 15 Dec 2030: its 15 Dec 2026 coupon's record
-  date is 30 Nov. Rs 10 crore held from 20 Nov, bought settling on the record date itself (27 Nov), and bought settling
-  20 Nov and sold settling 3 Dec all receive the Rs 90 lakh coupon as a receivable from 1 Dec, paid 15 Dec; a purchase
-  settling 2 Dec does not, and pays the clean price plus a negative accrued interest of -9 x 13/365 per 100. Each
-  book's accrual is the days held at 9% over 365 to 1e-12 relative.
+- *A corporate bond through its record date.* A 9% annual NCD maturing 15 Dec 2030: its 15 Dec 2026 coupon's record date
+  is 30 Nov. Rs 10 crore held from 20 Nov, bought on 27 Nov settling on the record date itself (30 Nov), and bought
+  settling 20 Nov and sold settling 3 Dec all receive the Rs 90 lakh coupon as a receivable from 1 Dec, paid 15 Dec; a
+  purchase settling 2 Dec does not, and pays the clean price plus a negative accrued interest of -9 x 13/365 per 100.
+  Each book's accrual is the days held at 9% over 365 to 1e-12 relative.
 - *An FRB through a reset.* FRB 2031 with synthetic weekly results: the 7 Jun-7 Dec coupon is 6.66% (20 May, 27 May
   and 3 Jun results, mean 5.66%, plus 1.00%), the coupon from 7 Dec 7.18% (18 Nov, 25 Nov and 2 Dec), the 7 Dec cash
   Rs 33.3 lakh on Rs 10 crore, the accrued interest 30E/360 to 1e-12 relative, and no `coupon_reset` (every coupon
@@ -1159,7 +1255,8 @@ synthetic data, every run's identity checked).
   at the flat projection of 7.50%, and 17 Dec restates that day at 7.80% (Rs 821.92 on Rs 10 crore) before accruing at
   it.
 - *Funding, costs and refusals.* A corporate book on TREPS without a haircut row is refused, naming why; with a 10%
-  row it borrows in `market_repo` only. A corporate purchase pays SD06's stamp duty (0.0001% of the consideration, the
+  row it borrows in `corp_bond_repo` only (at 5.72% on the synthetic table; in `market_repo` when
+  `corporate_segment="market_repo"`). A corporate purchase pays SD06's stamp duty (0.0001% of the consideration, the
   buyer), PF04's fee (Rs 5 a crore of value) and its GST at 18%, takes HS20 by its terms' AAA bucket or HS22 by the
   trade's AA-, and may settle T+0; refusals name a settlement after the redemption record date, an FRB with no terms
   ("no pricer in bonds.py"), a coupon or kind that differs from the terms, and an FRB coupon nothing fixes or projects.
@@ -1191,12 +1288,16 @@ As the specification's A0 sets it out; each book's lines sum to its NAV change, 
 | Strategy | Book | Lines that carry its thesis | Before real use |
 |---|---|---|---|
 | S1 asset swaps | long G-sec or SDL, paying fixed in MIBOR-OIS on a DV01-matched notional (`asset_swaps.hedge_notional`), funded in TREPS or market repo | the carry: `accrual` + `pull_to_par` + `funding_repo` (+ `funding_excess`) + `ois_carry`, as `funding.carry` computes it; the spread's move: `rich_cheap` plus the `curve_*` lines less the `ois_curve_*` lines, with `roll_down` against `ois_roll_down` | marks, MIBOR fixings and OIS quotes (licensed); the access preset's repo and OIS rights |
-| S2 front end (CP and CD only) | CP or CD against the OIS curve | `accrual` + `pull_to_par` less funding (market repo: CP and CD are not TREPS collateral); `rich_cheap` against OIS | CP and CD marks and OIS curves (licensed); corporate bonds need a pricer first |
+| S1 with GoI FRBs | long FRB funded in market repo (a haircut row for `frb`), its spread over OIS or the G-sec curve read by `frb_asset_swap_table` (discount margins, spread and index DV01) | `accrual` at each coupon as known, `coupon_reset` when a coupon becomes known after it began, `pull_to_par`, `funding_excess`; the price move stays in `price_unattributed` (no default reference curve); `dv01` the rate DV01 at the next reset, against which an OIS hedge is judged | FRB marks (CCIL's trades or FBIL's valuation, licensed); RBI's FRB coupon history typed in (the shipped table holds 15 of the 55 half-years begun for FRB 2028 to 2034) or the 182-day T-bill results from the RBI store's polls, with RBI's permission to keep them (`data_enquiries.md` letter 3) |
+| S2 front end | CP and CD against the OIS curve; AAA corporate bonds against OIS (`--reference corporate=ois`) or the G-sec curve (the default) | `accrual` + `pull_to_par` less funding (CP and CD in market repo, corporate bonds in corporate bond repo, `corp_bond_repo`: none is TREPS collateral); corporate coupons and principal entitled at their record dates (`receivables`); `rich_cheap` against the reference curve | CP, CD and corporate bond marks (exchange trades, NSE's or BSE's, or agency valuations: licensed, `data_enquiries.md` letters 4 to 7 and 9) and OIS curves (FBIL, licensed); the bonds' terms tables typed in from term sheets; haircut rows for each kind |
 | S3 rich/cheap | long cheap against short rich bonds (DV01-neutral pairs, `curvefit.bond_pairs`), or long cheap against OIS | `rich_cheap`; the `curve_*` lines should net to about zero | traded marks and daily fitted curves; shorts (`bank_or_pd`) or an OIS leg |
 | S4 auction cycle | auction purchases (`venue` `auction`, at the cut-off) sold into the market, when-issued sales | `trading` and `spread_cost` on the days around the auction, `rich_cheap` | the event ledger's auction table (`auctions_from_events`); marks |
 | S5 long end | 10 years against 30 to 50 years, DV01-neutral | `curve_slope` and `curve_curvature`, `roll_down`, the long leg's `convexity` | as S3; curves to 40 or 50 years (`extrapolated` flags a maturity past them) |
 | S6 SDLs | SDLs against G-secs or each other | `rich_cheap` against an SDL curve (`--reference sdl=sdl`) or the G-sec curve | SDL marks; an SDL curve fitted with `curve-fit --kinds sdl --curve-name sdl` |
 | S7 policy path | OIS receivers or payers on MPC views | `ois_carry`, `ois_roll_down`, `ois_curve_*`; the MPC dates from the event ledger for event windows | OIS quotes and fixings (licensed); the preset's OIS purpose |
+| S8 credit relative value | long corporate bonds cheap to their peers, against the G-sec curve | `rich_cheap` (the spread's change against the G-sec curve), `accrual`, `pull_to_par`, `funding_excess` (corporate bond repo); the screen is `credit-spreads` (G-, par and z-spreads to a fitted curve, to maturity, worst or SEBI's rule; `relative_spread_bp` against the peer median of the price panel) | exchange trades or agency valuations (licensed) and the terms tables; the price panel on recomputed yields; rating histories under each agency's terms (`data_sources.md`). Not built: the new-issue half: no loader for the electronic bidding platform's results (BSE's issue-level file, letter 5) and no new-issue concession measure (the cut-off yield less the same-day peer or matrix yield at its tenor) |
+| S9 forced selling | bonds bought from forced sellers after a rating crosses a mandate threshold, held for the recovery | `trading` (the fill against the mark), then `rich_cheap` and `accrual`; the events from `rating-events`, the paths from `event-prices` on a price panel of recomputed yields (`trade-check` flags the prints; inter-scheme transfers are left out of the daily yields) | exchange trades (licensed), rating actions with their times (agency terms: ICRA and India Ratings forbid a database, CARE, Brickwork and Acuité need consent), mutual fund holdings; a panel limited to bonds with terms unless `recomputed_where_known` |
+| S10 rating carry | AA and A bonds held for their spread, funded in corporate bond repo | `accrual` (with rating-linked coupon steps from when the action was public), `pull_to_par`, `funding_excess` at `corp_bond_repo`; costs by rating bucket as of each trade (HS20-HS24, UNVERIFIED) | as S8, plus each issuer's rating timeline (`--ratings`) and the corporate bond repo rates in the RBI store; the fund's own repo terms for AA and A paper (dearer than the segment's average, UNVERIFIED) |
 
 ### Conventions and their sources
 
@@ -1423,7 +1524,7 @@ new issue's ISIN and the cut-off as its mark) although the auction table's resul
 23:59:59 (the event ledger's `end_of_day` rule): RBI publishes results in the afternoon, but when a bidder may act on
 its allotment is a choice not yet made (the master and the auction lines stay cut).
 
-**Not built:** corporate bonds (S2's AAA bonds), FRBs and inflation-indexed bonds (no pricer: refused); CSA, clearing
+**Not built:** inflation-indexed bonds (no pricer: refused); CSA, clearing
 margin or charges on OIS; security-wise repo rates (a short's special rate is the user's, constant over the short); a
 key-rate DV01 table (DV01 is by tenor bucket); funding lines allocated to positions (they stay at book level;
 `positions.funded` shares the borrowing for reporting); the tradable universe from the issuance ledger (a strategy's
@@ -1441,6 +1542,19 @@ before keeping one: `docs/data_enquiries.md`), the fund's own haircut table and 
 restricted), and its cost terms in place of the U rows; and the access preset must be the fund's. The smallest set for
 S1 is CCIL's trades (or FBIL's valuation) for the bonds plus FBIL's MIBOR and MIBOR-OIS
 ([`rates_data_sources.md`](rates_data_sources.md), What each strategy needs; Licences below).
+
+Corporate bonds and FRBs need more. The trade check, the recomputed price panel and `credit-spreads` need exchange
+trades: NSE's Corporate Bond Market Data (₹3,40,000 a year per site, no history product) or BSE's
+([`data_enquiries.md`](data_enquiries.md), letters 4 and 5). Engine marks need traded prices or agency valuations (ICRA
+Analytics and CRISIL, whose average mutual funds mark to, NSE Data & Analytics, FIMMDA's matrices: letters 6, 7 and 9),
+each under a licence that allows storing and back-testing. The terms tables are the user's, typed in from term sheets or
+the depositories' security data (NSDL's India Bond Info, letter 10), and so is the rating history `--ratings` and the
+cost buckets read: rating actions with their times come from the agencies, under terms that differ (ICRA and India
+Ratings forbid building a database; CARE, Brickwork and Acuité need written consent;
+[`data_sources.md`](data_sources.md)). Corporate FRBs need their benchmark's fixings with times (MIBOR is FBIL's and
+licensed; a T-bill benchmark comes from RBI), GoI FRBs RBI's coupon history or its 182-day T-bill results, kept only
+with RBI's permission (letter 3); the shipped coupon table covers 15 of the 55 half-years begun for FRB 2028 to 2034.
+FBIL's OIS and MIBOR serve as for S1 (`--reference corporate=ois`, asset swaps), and its T-bill and CD curves for S2.
 
 ## The S4 event ledger and supply measures
 
@@ -1763,7 +1877,8 @@ real T-bill calendar typed into `--calendar-lines`.
 **Not built:** trading by participant category, an S4 need of [`rates_data_sources.md`](rates_data_sources.md)
 (CCIL's licensed data: no input or column yet; once it arrives it would join the windows by date and security, as the
 price panel does); a parser for RBI's T-bill calendar (its lines are typed into a table); the price responses on real
-prices (built, waiting for a panel); a pricer for FRBs (no DV01); parsers for switch and buyback announcements; the
+prices (built, waiting for a panel); FRB DV01 (`floating` prices FRBs, but the ledger does not call it); parsers for
+switch and buyback announcements; the
 state calendar by state.
 
 **Before real use.** The ledger runs on free data, but keeping that data is not settled: RBI grants no reuse licence
@@ -1801,6 +1916,15 @@ keeping a history); and the haircut table and CCIL classes the user keeps. The e
 releases and FIMMDA's compiled auction files, for which FIMMDA states no terms: ask both before keeping a history
 (`docs/data_enquiries.md`, letters 3 and 9). Its price paths, concessions and residual moves need a CCIL or FBIL price
 panel under the licences of the curve fit, and trading by participant category CCIL's data.
+
+The corporate bond and FRB parts (`corporates`, `floating`, `credit_spreads`, the trade check and the engine's
+corporate lines) need the licences of Before real use above: exchange trades (NSE's Corporate Bond Market Data or BSE's
+data, letters 4 and 5) or agency valuations (ICRA Analytics, CRISIL, NSE Data & Analytics, FIMMDA; letters 6, 7 and 9)
+for prices; each rating agency's consent for a stored history of its actions (ICRA and India Ratings forbid database
+building, CARE, Brickwork and Acuité need written consent: [`data_sources.md`](data_sources.md)); FBIL's subscription
+for MIBOR-linked fixings, OIS and its T-bill and CD curves; and RBI's permission to keep a history of its T-bill results
+and FRB coupon releases (letter 3). Until then they run on synthetic data and the few facts typed in with their
+sources.
 
 ## Open questions
 

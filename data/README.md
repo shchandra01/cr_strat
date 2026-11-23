@@ -84,7 +84,19 @@ column, pass `--trade-date`. If the value header has no unit, pass
 `--amount-unit`. The `_report.csv` lists the header it mapped to each field;
 check it on the first file from each venue.
 
-Prices are per 100 of face value and yields are in percent, as reported.
+Prices are per 100 of face value and yields are in percent, as reported. A
+header that names a type next to the yield or the deal ("Yield Type", "Deal
+Type", as in SEBI's reporting format) is kept as `yield_type` (YTM, YTC, YTP)
+or `deal_type` (Direct, Brokered, IST), never read as the yield itself; the
+daily rows leave inter-scheme transfers (IST) out, as the mutual-fund master
+circular leaves them out of its weighted average yield, and `trade-check`
+reads only the workouts a declared yield type names. `trade-check` and
+`price-panel --yield-source recomputed` read a partly redeemed bond's prints
+per 100 of the face still outstanding (`--price-basis outstanding`,
+UNVERIFIED: exchange part-redemption notices say trading continues on the
+reduced face value, read only through a search summary; `original` for the
+other reading), and prices as clean (a print that matches only as a dirty
+price is flagged `dirty_price`).
 
 ## Benchmark curve: `gsec_par_curve.csv` (or an OIS curve)
 
@@ -128,17 +140,22 @@ subscription before they are kept as a history
 ## Corporate bond and FRB terms: `cr-strat corp-price`, `frb-price` and the commands that use them
 
 Typed in by you from term sheets or, for listed ISINs from 18 Aug 2025,
-SEBI's centralised corporate bond database; none is shipped except the GoI FRB
-files. All are CSV with ISO dates and one row per key: a key given twice with
-different values is refused, an exact repeat kept once, blank rows dropped
-(`corporates.read_term_table`). The rules each column switches are in
+SEBI's centralised corporate bond database, or from the depositories' security
+data (NSDL's India Bond Info, under its terms: `docs/data_enquiries.md` letter
+10); none is shipped except the GoI FRB files. All are CSV with ISO dates and
+one row per key: a key given twice with different values is refused, an exact
+repeat kept once, blank rows and blank unnamed columns dropped, ISINs read in
+capitals (`corporates.read_term_table`). Only the columns listed below are
+read: any other column is refused, naming the closest listed one (a misspelt
+`redemption_pct` would otherwise leave the bond redeeming at 100). The terms
+table may also carry `rating_bucket`, which the return engine's costs read. The rules each column switches are in
 [`docs/conventions.md`](../docs/conventions.md#corporate-bonds-and-floating-rate-bonds).
 
 | File | Key | Columns (required in bold) |
 |---|---|---|
 | `corporate_terms.csv` | isin | **isin**, issuer_id, name, **kind** (`corporate`, `perpetual`, `frb_corp`), instrument_class, **coupon_pct**, **frequency** (0, 1, 2, 4, 12), schedule (`forward`, `backward`, `month_start`), first_period (`separate`, `clubbed`), **issue_date** (deemed allotment), maturity_date (blank only for a perpetual: 100 years), first_coupon_date, redemption_per100, face_value_rs, conventions (`ncd`, `ncd_2013`, `ncd_pre2013`; blank: by the issue date), record_days, record_roll, leap_year_rule, postponed_coupon, redemption_interest, flow_dates, tier (`at1`, `tier2`), sector, source, status |
-| `corporate_schedule.csv` | isin, due_date, kind | **isin**, **due_date**, payment_date, record_date, kind (`coupon`, `principal`, `redemption`), amount_per100 (checked against the rules: a difference above 1e-6 per 100 is refused), source |
-| `corporate_options.csv` | isin, kind, date | **isin**, **kind** (`call`, `put`), **date**, price_per100 (100), notice_days, portion (1), exercised (`yes`, `no`, blank), exercised_public_from (needed with exercised), source |
+| `corporate_schedule.csv` | isin, due_date, kind | **isin**, **due_date**, payment_date, record_date, kind (`coupon`, `principal`, `redemption`), amount_per100 (checked against the rules: a difference above 1e-6 per 100 is refused), source. Rows of a bond that are all `principal` amortise its generated schedule (as `corporate_amortisation.csv`); otherwise the rows are its whole schedule and must list every due date, one period of `frequency` apart (a first or last stub allowed, 3 days' slack), with payment and record dates in order and each record date before its payment date |
+| `corporate_options.csv` | isin, kind, date | **isin**, **kind** (`call`, `put`), **date**, price_per100 (100), notice_days, portion (1), exercised (`yes`, `no`, blank), exercised_public_from (needed with exercised; a `no` too counts only from then), record_date (the record date the exercise notice sets; without it, 15 days before the date by the bond's rule, and a notice public after that is refused), source |
 | `corporate_amortisation.csv` | isin, date | **isin**, **date** (a due date), **principal_per100**, basis (`face`, `quantity`), source |
 | `corporate_steps.csv` | isin | **isin**, **threshold** (a grade such as `AA`), **step_bp_per_notch**, max_step_bp, agencies (`;` list), combine (`worst`, `best`, `second_best`), effective (`next_period`, `from_event`), step_down, source |
 | `corporate_floating.csv` | isin | **isin**, **benchmark**, **spread_pct**, **reset_months**, fixing_lag_days, lookback, floor_pct, cap_pct, decimals, source |
@@ -148,9 +165,17 @@ different values is refused, an exact repeat kept once, blank rows dropped
 | `src/cr_strat/data/goi_frb_coupons.csv` (shipped) | isin, period_start | **isin**, **period_start**, period_end (exclusive), **rate_pct**, announced (RBI's release time or date; blank: estimated as 00:00 on the fixing day), source, status |
 
 Add RBI's coupon releases to `goi_frb_coupons.csv` (or a copy passed with
-`--coupons`) as they come: the shipped file lacks the coupons set from June to
-October 2026 for FRB 2028, 2031, 2033 and 2034, and the RBI store will hold the
-182-day results needed to compute them only from its first poll.
+`--coupons`) as they come. The shipped file is thin: of the half-years begun by
+19 Nov 2026 it holds FRB 2028's coupon for 2 of 11, FRB 2031's for 3 of 18, FRB
+2033's for 3 of 14 and FRB 2034's for 7 of 12 (FRB 2035's two five-yearly
+coupons cover 14 of its 44), none of the coupons set from June to October 2026
+for the first four among them, and the RBI store holds the 182-day results
+needed to compute coupons only from its first poll. A period with neither is
+`unknown`, and a back-test across it is refused unless allowed to project from
+an older base (`--frb-allow-stale`, flagged). An announced time more than 14
+days before the fixing day, and a T-bill result public before its auction, are
+refused as typos. `cr-strat frb-coupons --as-of T` writes every FRB's coupon
+for each period as known at `T`.
 
 The same tables feed `asset-swaps --terms` (corporate bonds) and `--frb-out`
 (GoI FRBs), `credit-spreads --terms`, `trade-check --terms`, `price-panel
@@ -162,11 +187,14 @@ The same tables feed `asset-swaps --terms` (corporate bonds) and `--frb-out`
 | File | Read by | Columns |
 |---|---|---|
 | Rating actions with times | `returns --ratings` (for `--corporate-steps`) | **agency**, **rating** (as `rating_scale` parses it, e.g. `CRISIL AA-/Negative`), **public_from** (each action used only from then), and **isin** or **issuer_id** (matching the terms' `issuer_id`) |
-| Corporate bond prices (one day) | `credit-spreads --prices` | **isin**, **clean_price** or **yield_pct**, settlement_date (default the curve's valuation date); with `--peer-panel` also issuer_id, instrument_class, rating_bucket (`tenor_bucket` is computed) |
+| Corporate bond prices (one day) | `credit-spreads --prices`, `corp-price --prices` | **isin**, **clean_price** or **yield_pct** (each row from whichever it has), settlement_date (default the curve's valuation date), trade_date and as_of (the time the terms are known at, default 00:00 on the trade date, else on the settlement less T+1); with `--peer-panel` also issuer_id, instrument_class, rating_bucket (`tenor_bucket` is computed). Prices of a partly redeemed bond are per 100 of the original face unless `--price-basis outstanding` |
 
-A trade's `rating_bucket` column (returns' trades file) or the terms'
-`rating_bucket` picks a corporate bond's half spread in the cost table (rows
-HS20-HS24; the cost table's optional `rating_bucket` column, `;` lists allowed).
+A trade's `rating_bucket` column (returns' trades file) picks a corporate
+bond's half spread in the cost table (rows HS20-HS24; the cost table's optional
+`rating_bucket` column, `;` lists allowed); without it, the worst of each
+agency's latest rating public before the trade day (`--ratings`), else the
+terms' `rating_bucket`, noted (a rating typed in later then prices earlier
+trades).
 
 ## RBI press releases: saved pages and `pressreleases_rss.xml`
 

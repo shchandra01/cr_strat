@@ -273,12 +273,17 @@ def test_frb_coupons_command(tmp_path, capsys):
                  str(out_path)]) == 0
     assert "1 GoI FRBs" in capsys.readouterr().out
     rates = pd.read_csv(out_path)
-    assert set(rates["isin"]) == {"IN0020180041"} and rates.columns.tolist()[:4] == ["isin", "period_start",
-                                                                                        "period_end", "fixing_day"]
+    assert set(rates["isin"]) == {"IN0020180041"}
+    assert rates.columns.tolist()[:4] == ["isin", "period_start", "period_end", "fixing_day"]
     row = rates.set_index("period_start").loc["2026-06-07"]
     assert (row["status"], row["rate_pct"]) == ("projected", 6.52)
     assert main(["frb-coupons", "--out", str(out_path)]) == 2  # a time is required
     assert "--as-of is required" in capsys.readouterr().err
+    stale = ["frb-coupons", "--as-of", "2026-01-14T18:00", "--isin", "IN0020210160", "--out", str(out_path)]
+    assert main(stale) == 0  # FRB 2028's only base then is the coupon announced for Oct 2021
+    assert "announced 1, computed 0, projected 0, unfixed 1, unknown 12" in capsys.readouterr().out
+    assert main([*stale, "--frb-allow-stale"]) == 0  # the flag reaches goi_frb_rates
+    assert "projected 6, unfixed 7, unknown 0" in capsys.readouterr().out
     nss = _csv(tmp_path / "nss.csv", [rt.nss_params_row(CURVE, date(2026, 11, 13))])
     assert main(["frb-coupons", "--as-of", "2026-11-19T20:00", "--isin", "IN0020180041", "--projection", "forward",
                  "--nss-params", nss, "--out", str(out_path)]) == 0

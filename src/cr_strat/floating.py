@@ -47,8 +47,8 @@ exp(-dm tau_j)``, ``tau`` actual days / 365 from settlement, ``DF`` relative to 
 reverse; ``spread_dv01`` the fall in price for a one basis point rise in ``dm``; ``index_dv01`` the change for a
 one basis point rise in the projected index with ``dm`` held (the projected coupons of periods still to start move,
 the known ones and the coupon in force do not: it was fixed when its period began, even if the data lack it), the
-FRB's rate risk, which sits at its next reset; ``spread_duration`` the spread DV01 per unit of dirty price. Reset dates are not deemed maturities (SEBI MF master
-circular 6.18.18).
+FRB's rate risk, which sits at its next reset; ``spread_duration`` the spread DV01 per unit of dirty price. Reset
+dates are not deemed maturities (SEBI MF master circular 6.18.18).
 
 **Corporate FRBs** are ``corporates.CorporateBond`` objects whose ``rate_steps`` hold the fixings:
 ``corporate_frb_rates`` reads a ``FloatingTerms`` (benchmark, spread, reset interval, fixing lag, look-back average,
@@ -64,8 +64,8 @@ licensed: none is shipped. Day count as for NCDs (SEBI actual/actual).
 Shipped facts: ``data/goi_frb_terms.csv`` (the five outstanding GoI FRBs) and ``data/goi_frb_coupons.csv`` (coupons
 typed in from RBI releases read through copies and search summaries, each row with its status). The coupons cover few
 past periods: of the half-years begun by 19 Nov 2026, FRB 2028 2 of 11, FRB 2031 3 of 18, FRB 2033 3 of 14, FRB 2034
-7 of 12 (FRB 2035's two five-yearly coupons 14 of 44): a back-test needs RBI's coupon history typed in, or the 182-day
-results. Not built: RBI's FRB coupon releases are not parsed (no saved sample), the meaning of RBI's printed FRB
+7 of 12 (FRB 2035 14 of 44, from its two five-yearly coupons): a back-test needs RBI's coupon history typed in, or the
+182-day results. Not built: RBI's FRB coupon releases are not parsed (no saved sample), the meaning of RBI's printed FRB
 auction yield is not known, FRB DV01 in the event ledger. The return engine values FRBs (``returns``).
 """
 
@@ -259,9 +259,8 @@ def _as_datetime(value) -> datetime | None:
 
 def _records(table: pd.DataFrame, column: str) -> list[tuple[date, float, datetime]]:
     """(auction date, yield, public time) of every result with a yield in ``column``, by auction date."""
-    rows = [(as_date(a), float(v), _as_datetime(p)) for a, v, p in zip(table["auction_date"], table[column],
-                                                                          table["public_from"])
-            if v is not None and math.isfinite(float(v))]
+    triples = zip(table["auction_date"], table[column], table["public_from"])
+    rows = [(as_date(a), float(v), _as_datetime(p)) for a, v, p in triples if v is not None and math.isfinite(float(v))]
     return sorted(rows, key=lambda r: r[0])
 
 
@@ -463,9 +462,9 @@ def goi_frb_rates(terms, tbills=None, announced=FRB_COUPONS_CSV, *, as_of=None, 
                              f"{fixing_day}: check the time")
     latest = max([r[2] for r in records] + [a["public"] for a in rows_announced], default=None)
     seen = cutoff if cutoff is not None else latest  # the time the inputs are known at
-    fix = dict(spread=spread, records=records, dates=dates, cutoff=cutoff, latest=max((r[2] for r in records),
-                                                                                       default=None),
-               n=n, decimals=decimals, yield_kind=kind, yield_decimals=4)
+    fix = {"spread": spread, "records": records, "dates": dates, "cutoff": cutoff,
+           "latest": max((r[2] for r in records), default=None), "n": n, "decimals": decimals, "yield_kind": kind,
+           "yield_decimals": 4}
     flat, flat_note = None, ""
     if projection == "flat" and tbill_index and records:
         try:
@@ -484,8 +483,8 @@ def goi_frb_rates(terms, tbills=None, announced=FRB_COUPONS_CSV, *, as_of=None, 
                "base_pct": math.nan, "spread_pct": spread, "status": "unknown", "public_from": None,
                "public_from_source": "", "auctions": "", "notes": ""}
         notes = [] if cutoff is not None else [NO_AS_OF_NOTE]
-        known = [a for a in rows_announced if a["start"] <= start and (start < a["end"] if a["end"] else
-                                                                        start == a["start"])]
+        known = [a for a in rows_announced
+                 if a["start"] <= start and (start < a["end"] if a["end"] else start == a["start"])]
         ann = known[-1] if known else None
         if ann is not None:
             when = ann["public"]
@@ -554,7 +553,8 @@ def _announced_base(announced: list[dict], cutoff: datetime | None, start: date,
     else:
         stale = ""
     base = b["rate"] - spread
-    return (round(base + spread, 10), base), f"flat at the base implied by the coupon announced for {b['start']}" + stale
+    note = f"flat at the base implied by the coupon announced for {b['start']}"
+    return (round(base + spread, 10), base), note + stale
 
 
 def _passed_rate(index: str, fixing: date, start: date, pending: FrbFixing | None, fix: dict,
@@ -697,7 +697,7 @@ class GoiFloatingRateBond(Bond):
         try:
             return self._rates[start][0]
         except KeyError:
-            why = dict((as_date(st), note) for st, note in self.missing).get(start)
+            why = {as_date(st): note for st, note in self.missing}.get(start)
             raise ValueError(f"{self._where}: no rate for the coupon period from {start}; pass it in rates "
                              f"(goi_frb_rates gives them){f': {why}' if why else ''}") from None
 
@@ -1019,8 +1019,10 @@ def corporate_frb_rates(bond: CorporateBond, terms: FloatingTerms, fixings: pd.D
     step = terms.reset_months // months
     starts = [bond.issue_date, *bond.due_schedule[:-1]][::step]
     cutoff = None if as_of is None else public_time(as_of, "as_of")
-    cal = calendar if calendar is not None else (bond.calendar.lenient() if bond.calendar is not None
-                                                  else BusinessCalendar("weekdays", strict=False))
+    if calendar is not None:
+        cal = calendar
+    else:
+        cal = bond.calendar.lenient() if bond.calendar is not None else BusinessCalendar("weekdays", strict=False)
     table = read_fixings(fixings)
     mine = table.loc[table["benchmark"] == terms.benchmark].sort_values("date").to_dict("records")
     public = [r for r in mine if cutoff is None or r["public_from"] <= cutoff]
@@ -1042,6 +1044,8 @@ def corporate_frb_rates(bond: CorporateBond, terms: FloatingTerms, fixings: pd.D
                        and not (cutoff is None or r["public_from"] <= cutoff)]
             if waiting:
                 notes.append(f"the fixing of {waiting[-1]} is not public yet")
+            elif not over:
+                pass  # the fixing date is still ahead: no gap to report
             elif spacing <= 1:
                 expected = _expected_fixing(fixing_date, spacing, cal)
                 if last < expected:
