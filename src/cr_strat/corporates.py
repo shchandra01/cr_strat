@@ -132,8 +132,8 @@ STEP_COMBINE = ("worst", "best", "second_best")
 DEEMED_PERPETUAL_YEARS = 100  # SEBI MF master circular 10.4.2: perpetuals deemed to mature 100 years after issue
 PUT_FAVOUR_BP = 30.0  # SEBI MF master circular 10.3.4: a put favours the holder 30 bp above the coupon
 DATE_ONLY_TIME = time(23, 59, 59)  # UNVERIFIED: a notice or rating known only by its date counts from day's end
-EXPLICIT_GAP_DAYS = 3  # an explicit schedule's gaps may differ from whole months by this (month ends, Feb)
-RECORD_PAYMENT_DAYS = 7  # record dates this close to their due date are kept before the payment date
+EXPLICIT_GAP_DAYS = 3  # UNVERIFIED: an explicit schedule's gaps may differ from whole months by this (month ends, Feb)
+RECORD_PAYMENT_DAYS = 7  # UNVERIFIED: record dates this close to their due date are kept before the payment date
 INDIA = timezone(timedelta(hours=5, minutes=30))
 _EPS = 1e-9
 

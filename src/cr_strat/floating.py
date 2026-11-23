@@ -108,8 +108,9 @@ WAY_TOLERANCE = 2e-4  # printed WAY against the WAY from the printed WAP: both h
 AUCTION_WEEK_DAYS = 7  # UNVERIFIED: 182-day T-bills are auctioned weekly; a later auction can fall within 7 days,
 # and a week after the fixing day every result of an auction held before it is taken as published
 GAP_NOTE_DAYS = 10  # consecutive auctions used further apart than this are noted (an incomplete table?)
-ANNOUNCE_LEAD_DAYS = 14  # a coupon announced more than this before its fixing day is refused (its auctions were not
-# all held then): a typo in the time, as is a T-bill result public before its auction or a fixing before its date
+ANNOUNCE_LEAD_DAYS = 14  # UNVERIFIED bound: a coupon announced more than this before its fixing day is refused (its
+# auctions were not all held then): a typo in the time, as is a T-bill result public before its auction or a fixing
+# before its date
 NO_AS_OF_NOTE = "as_of not given: every announcement and result in the inputs is used (a look-ahead for a past date)"
 _TOL = 1e-12
 

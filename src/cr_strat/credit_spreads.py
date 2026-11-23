@@ -45,7 +45,9 @@ The G-spread's tenor is the workout's Act/365F years and its basis conversion is
 the matched par bond is risk-free by construction, so the par spread holds credit, liquidity and the option a
 callable bond carries (to worst, the workout is fixed at the date the price implies). Peer matrices from traded
 spreads carry the panel's selection: few trades, rating buckets as of the trade date, a five-day window by default
-(UNVERIFIED choices, as in ``curves``).
+(UNVERIFIED choices, as in ``curves``). For S8 only the secondary-market half is built: there is no loader for the
+electronic bidding platform's results and no new-issue concession measure (the cut-off yield less the same-day peer or
+matrix yield at its tenor), which need BSE's issue-level bidding data.
 """
 
 from __future__ import annotations
