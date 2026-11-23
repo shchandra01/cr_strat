@@ -53,14 +53,18 @@ TRADE_COLUMNS = (
     "trade_date", "isin", "price", "yield_pct", "amount_inr", "n_trades", "venue",
     "settlement_date", "source_file",
 )
+OPTIONAL_TRADE_COLUMNS = ("deal_type", "yield_type")  # kept when a file has them (SEBI's format: Ch. XVI Table 1)
+EXCLUDED_DEAL_TYPES = ("IST",)  # inter-scheme transfers: left out of the daily yields (MF master circular 10.2.3)
 DAILY_COLUMNS = (
     "date", "isin", "yield_pct", "price", "volume_inr", "n_trades", "yield_min", "yield_max", "venues",
 )
 CHECK_COLUMNS = (
     "settlement_used", "recomputed_yield_pct", "workout_date", "workout_kind", "standard_diff_bp", "nearest_reading",
-    "nearest_yield_pct", "yield_diff_bp", "yield_check", "check_notes",
+    "nearest_yield_pct", "yield_diff_bp", "yield_check", "known_as_of", "calendar_projected", "check_notes",
 )
-CHECK_STATUSES = ("ok", "mismatch", "no_terms", "no_price", "no_yield", "error")
+CHECK_STATUSES = ("ok", "dirty_price", "face_basis", "mismatch", "no_terms", "no_price", "no_yield", "error")
+PRICE_BASIS = "outstanding"  # UNVERIFIED: a print of a partly redeemed bond is per 100 of the face still outstanding
+YIELD_TYPES = {"YTM": "maturity", "YTC": "call", "YTP": "put"}  # SEBI's reporting format (Ch. XVI Table 1)
 CHECKED_DAILY_COLUMNS = ("reported_yield_pct", "recomputed_yield_pct", "yield_check", "workout_date")
 WORKOUT_RULES = ("maturity", "worst")
 TOLERANCE_BP = 1.0  # UNVERIFIED default: a reported yield within 1 bp of a reading counts as that reading
@@ -71,6 +75,12 @@ def _classify_header(text: str) -> str | None:
     t = text.lower()
     if re.search(r"\bisin\b", t):
         return "isin"
+    if re.search(r"\btype\b", t):  # SEBI's reporting format (NCS master circular Ch. XVI Table 1): deal and yield types
+        if "yield" in t:
+            return "yield_type"
+        if "deal" in t:
+            return "deal_type"
+        return None
     if "settle" in t:
         return "settlement_date"
     if re.search(r"maturity|coupon|issue\s*date|record|face\s*value", t):
@@ -144,6 +154,9 @@ def load_trades(
             "amount_inr": col("amount").map(to_number) * (mult if mult is not None else np.nan),
             "n_trades": col("n_trades").map(to_number),
         })
+        for field in OPTIONAL_TRADE_COLUMNS:
+            if field in colmap:
+                df[field] = col(field).map(cell_str).str.strip()
         if "trade_date" in colmap:
             df["trade_date"] = parse_date_column(col("trade_date"))
         else:
@@ -172,7 +185,7 @@ def load_trades(
         frames.append(df[keep])
 
     trades = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-    trades = trades.reindex(columns=list(TRADE_COLUMNS))
+    trades = trades.reindex(columns=list(TRADE_COLUMNS) + [c for c in OPTIONAL_TRADE_COLUMNS if c in trades])
     return trades, pd.DataFrame(report)
 
 
@@ -181,7 +194,8 @@ def read_trades(source) -> pd.DataFrame:
     if isinstance(source, pd.DataFrame):
         df = source.copy()
     elif isinstance(source, (str, Path)):
-        df = pd.read_csv(source, dtype={"isin": str, "venue": str, "source_file": str})
+        df = pd.read_csv(source, dtype={"isin": str, "venue": str, "source_file": str, "deal_type": str,
+                                        "yield_type": str})
     else:
         return pd.concat([read_trades(s) for s in source], ignore_index=True)
     for col in ("trade_date", "settlement_date"):
@@ -222,9 +236,23 @@ def clean_trades(
     return df.reset_index(drop=True)
 
 
+def is_excluded_deal(value) -> bool:
+    """True for a deal type the daily yields leave out (``EXCLUDED_DEAL_TYPES``: an inter-scheme transfer, written
+    ``IST`` or in words)."""
+    text = cell_str(value).strip().upper()
+    words = re.sub(r"[^A-Z]+", " ", text).split()
+    return text in EXCLUDED_DEAL_TYPES or ("INTER" in " ".join(words) and "SCHEME" in " ".join(words))
+
+
 def isin_daily(trades: pd.DataFrame) -> pd.DataFrame:
-    """One row per ISIN and trade date: value-weighted yield and price over non-outlier trades."""
+    """One row per ISIN and trade date: value-weighted yield and price over non-outlier trades.
+
+    A trade whose ``deal_type`` is an inter-scheme transfer (``is_excluded_deal``) is left out, as the
+    mutual-fund rule leaves it out of the traded yields it values with (SEBI's MF master circular, 10.2.3); files
+    without the column are unaffected."""
     df = trades[~trades.get("outlier", pd.Series(False, index=trades.index)).astype(bool)].copy()
+    if "deal_type" in df:
+        df = df[~df["deal_type"].map(is_excluded_deal)]
     weight = df["amount_inr"].where(df["amount_inr"] > 0)
     # Equal weights within an ISIN-day when any trade lacks a size.
     has_all = weight.notna().groupby([df["trade_date"], df["isin"]]).transform("all")
@@ -258,60 +286,109 @@ def _blank(value) -> bool:
         return False
 
 
-def _readings(bond, s: date, price: float, workout: str):
-    """(standard yield, workout date, workout kind, [(reading, yield)]) of one trade's price; standard first."""
-    from cr_strat.corporates import CorporateBond
+def declared_workout(value) -> str | None:
+    """The workout a reported yield type names (``YTM``, ``YTC``, ``YTP`` or in words): ``maturity``, ``call``,
+    ``put``; ``None`` when blank or not recognised."""
+    text = re.sub(r"[^A-Z]+", " ", cell_str(value).upper()).strip()
+    if not text:
+        return None
+    if text in YIELD_TYPES:
+        return YIELD_TYPES[text]
+    for word, kind in (("CALL", "call"), ("PUT", "put"), ("MATURITY", "maturity")):
+        if word in text.split():
+            return kind
+    return None
+
+
+def _readings(bond, s: date, price: float, workout: str, price_basis: str = PRICE_BASIS):
+    """(standard yield, workout date, workout kind, [(reading, yield, basis, end)]) of one trade's price.
+
+    ``basis``: how the price was read: ``(clean or dirty, face basis)``; the standard reading is a clean price on
+    ``price_basis``. A partly redeemed bond is read on both face bases. ``end``: ``maturity``, ``call`` or ``put``."""
+    from cr_strat.corporates import CorporateBond, price_factor
 
     if not isinstance(bond, CorporateBond):
         raise TypeError("the trade check reads corporates.CorporateBond terms")
+    f_std = price_factor(bond, s, price_basis)
+    bases = [(price_basis, f_std)]
+    other = "original" if price_basis == "outstanding" else "outstanding"
+    f_other = price_factor(bond, s, other)
+    if abs(f_other - f_std) > 1e-12:
+        bases.append((other, f_other))
     target, kind, when = bond, "maturity", bond.maturity
     if workout == "worst":
-        w = bond.yield_to_worst(s, price)
+        w = bond.yield_to_worst(s, price * f_std)
         if w.date != bond.maturity:
             target, kind, when = bond.to_workout(w.date, w.price), w.kind, w.date
-    standard = target.yield_from_price(price, s)
+    standard = target.yield_from_price(price * f_std, s)
     own = "due" if bond.uses_due_dates(s) else "payment"
-    ends = [("maturity", bond)] + [(f"{k} {d}", bond.to_workout(d, p)) for k, d, p in bond.workouts(s)
-                                   if k != "maturity"]
+    ends = [("maturity", "maturity", bond)] + [(f"{k} {d}", k, bond.to_workout(d, p)) for k, d, p in bond.workouts(s)
+                                               if k != "maturity"]
     out = []
-    for end_name, end_bond in ends:
-        for dates in (own, "payment" if own == "due" else "due"):
-            dated = end_bond if dates == own else replace(end_bond, flow_dates=dates)
-            for rule in ("mm", "compound"):
-                ruled = dated if rule == "mm" else replace(dated, conventions=replace(dated.conventions,
-                                                                                      final_period="compound"))
-                for basis in ("clean", "dirty"):
-                    try:
-                        y = (ruled.yield_from_price(price, s) if basis == "clean"
-                             else ruled.yield_from_dirty_price(price, s))
-                    except (ValueError, RuntimeError):
-                        continue
-                    name = "/".join(x for x in (basis, f"{dates} dates", end_name,
-                                                "compounded" if rule == "compound" else "") if x)
-                    out.append((name, y))
+    for basis, f in bases:
+        for end_name, end_kind, end_bond in ends:
+            for dates in (own, "payment" if own == "due" else "due"):
+                dated = end_bond if dates == own else replace(end_bond, flow_dates=dates)
+                for rule in ("mm", "compound"):
+                    ruled = dated if rule == "mm" else replace(dated, conventions=replace(dated.conventions,
+                                                                                          final_period="compound"))
+                    for quote in ("clean", "dirty"):
+                        try:
+                            y = (ruled.yield_from_price(price * f, s) if quote == "clean"
+                                 else ruled.yield_from_dirty_price(price * f, s))
+                        except (ValueError, RuntimeError):
+                            continue
+                        name = "/".join(x for x in (f"per 100 {basis} face" if basis != price_basis else "", quote,
+                                                    f"{dates} dates", end_name,
+                                                    "compounded" if rule == "compound" else "") if x)
+                        out.append((name, y, (quote, basis), end_kind))
     seen, unique = set(), []
-    for name, y in out:  # the same yield under several names (no money-market flow, say): keep the first, simplest
-        key = round(y, 12)
+    for item in out:  # the same yield under several names (no money-market flow, say): keep the first, simplest
+        key = round(item[1], 12)
         if key not in seen:
             seen.add(key)
-            unique.append((name, y))
+            unique.append(item)
     return standard, when, kind, unique
+
+
+def _reread(bond, s: date, price: float, workout: str, quote: str, f: float) -> float:
+    """The standard yield (own dates, to maturity or to worst) of a price read as ``quote`` on face factor ``f``."""
+    target = bond
+    clean = price * f if quote == "clean" else price * f - bond.accrued_interest(s)
+    if workout == "worst":
+        w = bond.yield_to_worst(s, clean)
+        if w.date != bond.maturity:
+            target = bond.to_workout(w.date, w.price)
+    return target.yield_from_price(clean, s) if quote == "clean" else target.yield_from_dirty_price(price * f, s)
 
 
 def check_trade_yields(trades: pd.DataFrame, terms, *, schedule=None, options=None, amortisation=None,
                        tolerance_bp: float = TOLERANCE_BP, workout: str = "maturity", calendar="default",
-                       rates: dict | None = None) -> pd.DataFrame:
+                       rates: dict | None = None, as_of=None, price_basis: str = PRICE_BASIS) -> pd.DataFrame:
     """``trades`` (``TRADE_COLUMNS``: ``isin``, ``price``, ``yield_pct``, ``trade_date``, ``settlement_date``) with
     ``CHECK_COLUMNS`` appended: each trade's yield recomputed from its price and the bond's terms (module docstring).
 
     ``terms``: the corporate terms table (``corporates.read_corporate_terms``' layout) with its optional schedule,
-    options and amortisation tables; ``rates``: rate steps by ISIN for ``frb_corp`` rows. ``recomputed_yield_pct``
-    is the standard reading (clean price, the bond's own flow dates, to maturity or to worst); ``nearest_reading``
-    and ``yield_diff_bp`` (reported less nearest) say which reading the reported yield matches, ``yield_check`` how
-    well. The trades keep their order and columns.
+    options and amortisation tables; ``rates``: rate steps by ISIN for ``frb_corp`` rows. Each bond is taken as
+    known at ``as_of`` (``CorporateBond.as_known``: exercises, and decisions not to exercise, public by then): one
+    time for every trade, else a trade's ``as_of`` cell, else 00:00 on its trade date (UNVERIFIED default: a
+    print's time is not known, so a notice made public that day counts from the next). ``price_basis``: prices per
+    100 of the face ``outstanding`` at settlement (default, UNVERIFIED: exchanges trade a partly redeemed bond on
+    its reduced face) or of the ``original`` face; the other basis is a reading too. ``recomputed_yield_pct`` is
+    the standard reading (clean price, the bond's own flow dates, to maturity or to worst); ``nearest_reading``
+    and ``yield_diff_bp`` (reported less nearest) say which reading the reported yield matches, ``yield_check``
+    how well: ``ok`` on the standard price reading; ``dirty_price`` or ``face_basis`` when it matches only with
+    the price read as dirty or on the other face basis, the recomputed yield then taken from the price read so;
+    ``mismatch`` beyond ``tolerance_bp``. A trade's ``yield_type`` (YTM, YTC, YTP: SEBI's reporting format)
+    limits the readings to that workout when the bond has one. The trades keep their order and columns.
     """
     from cr_strat.corporates import (
+        PRICE_BASES,
+        _as_of_for,
         corporate_from_terms,
+        normalise_isin,
+        price_factor,
+        public_time,
         read_amortisation,
         read_corporate_options,
         read_corporate_schedule,
@@ -320,25 +397,31 @@ def check_trade_yields(trades: pd.DataFrame, terms, *, schedule=None, options=No
 
     if workout not in WORKOUT_RULES:
         raise ValueError(f"workout must be one of {WORKOUT_RULES}, not {workout!r}")
+    if price_basis not in PRICE_BASES:
+        raise ValueError(f"price_basis must be one of {PRICE_BASES}, not {price_basis!r}")
     tol = float(tolerance_bp)
     if not (math.isfinite(tol) and tol >= 0):
         raise ValueError(f"tolerance_bp must be a number >= 0, not {tolerance_bp!r}")
     missing = [c for c in ("isin", "price", "yield_pct", "trade_date") if c not in trades]
     if missing:
         raise ValueError(f"the trades lack {missing}")
+    when_all = None if as_of is None else public_time(as_of, "as_of")
     table = read_corporate_terms(terms)
     sched = None if schedule is None else read_corporate_schedule(schedule)
     opts = None if options is None else read_corporate_options(options)
     amort = None if amortisation is None else read_amortisation(amortisation)
     by_isin = {r["isin"]: r for r in table.to_dict("records")}
+    rates = None if rates is None else {normalise_isin(k): v for k, v in rates.items()}
     bonds: dict[str, object] = {}
+    known: dict[tuple, object] = {}
     fallback = mumbai_settlement_calendar().lenient()
     rows = []
     for rec in trades.to_dict("records"):
         out = dict.fromkeys(CHECK_COLUMNS, math.nan) | {"settlement_used": None, "workout_date": None,
                                                         "workout_kind": "", "nearest_reading": "",
+                                                        "known_as_of": None, "calendar_projected": None,
                                                         "check_notes": ""}
-        isin = "" if _blank(rec.get("isin")) else str(rec["isin"]).strip().upper()
+        isin = "" if _blank(rec.get("isin")) else normalise_isin(rec["isin"])
         notes = []
         try:
             if isin not in by_isin:
@@ -356,31 +439,60 @@ def check_trade_yields(trades: pd.DataFrame, terms, *, schedule=None, options=No
                     bonds[isin] = bond
                 except (ValueError, TypeError, NotImplementedError) as exc:
                     bonds[isin] = exc
-            bond = bonds[isin]
-            if isinstance(bond, Exception):
-                raise bond
+            base = bonds[isin]
+            if isinstance(base, Exception):
+                raise base
             if _blank(rec.get("settlement_date")):
-                cal = bond.calendar or fallback
-                s = cal.settlement_date(as_date(rec["trade_date"]), bond.conventions.settlement_lag)
-                notes.append(f"settlement taken as T+{bond.conventions.settlement_lag}")
+                cal = base.calendar or fallback
+                s = cal.settlement_date(as_date(rec["trade_date"]), base.conventions.settlement_lag)
+                notes.append(f"settlement taken as T+{base.conventions.settlement_lag}")
             else:
                 s = as_date(rec["settlement_date"])
             out["settlement_used"] = s
+            when = _as_of_for(base, rec, s, when_all)
+            out["known_as_of"] = when
+            if (isin, when) not in known:
+                known[(isin, when)] = base.as_known(when)
+            bond = known[(isin, when)]
+            out["calendar_projected"] = bond.calendar_projected(s)
+            exercised = ""
+            if bond.maturity != base.maturity:
+                done = [o.kind for o in base.options if o.date == bond.maturity and o.exercised]
+                exercised = f"exercised_{done[0]}" if done else "exercised"
+                notes.append(f"redeemed on {bond.maturity} by an exercise public by {when:%Y-%m-%d %H:%M}")
             if _blank(rec.get("price")):
                 out["yield_check"] = "no_price"
                 rows.append(out | {"check_notes": "; ".join(notes)})
                 continue
             price = float(rec["price"])
-            standard, when, kind, readings = _readings(bond, s, price, workout)
-            out.update(recomputed_yield_pct=standard, workout_date=when, workout_kind=kind)
+            standard, end_date, kind, readings = _readings(bond, s, price, workout, price_basis)
+            out.update(recomputed_yield_pct=standard, workout_date=end_date,
+                       workout_kind=exercised if exercised and kind == "maturity" else kind)
             if _blank(rec.get("yield_pct")):
                 out["yield_check"] = "no_yield"
             else:
                 reported = float(rec["yield_pct"])
-                name, y = min(readings, key=lambda r: abs(r[1] - reported))
+                declared = declared_workout(rec.get("yield_type"))
+                pool = readings
+                if declared is not None:
+                    pool = [r for r in readings if r[3] == declared]
+                    if not pool:
+                        notes.append(f"yield type {cell_str(rec.get('yield_type'))} names a {declared} the bond "
+                                     "does not have ahead: every reading compared")
+                        pool = readings
+                name, y, (quote, basis), _ = min(pool, key=lambda r: abs(r[1] - reported))
+                within = abs(reported - y) * 100 <= tol + 1e-9
+                status = "mismatch"
+                if within:
+                    status = "ok" if (quote, basis) == ("clean", price_basis) else (
+                        "dirty_price" if quote == "dirty" else "face_basis")
+                if status in ("dirty_price", "face_basis"):  # the price was quoted so: recompute it read that way
+                    standard = _reread(bond, s, price, workout, quote, price_factor(bond, s, basis))
+                    out["recomputed_yield_pct"] = standard
+                    notes.append(f"the reported yield matches the price read as {quote} per 100 {basis} face: the "
+                                 "recomputed yield reads it so")
                 out.update(standard_diff_bp=(reported - standard) * 100, nearest_reading=name, nearest_yield_pct=y,
-                           yield_diff_bp=(reported - y) * 100,
-                           yield_check="ok" if abs(reported - y) * 100 <= tol + 1e-9 else "mismatch")
+                           yield_diff_bp=(reported - y) * 100, yield_check=status)
         except (ValueError, TypeError, NotImplementedError, RuntimeError) as exc:
             out.update(yield_check="error")
             notes.append(str(exc))
@@ -393,15 +505,26 @@ def check_trade_yields(trades: pd.DataFrame, terms, *, schedule=None, options=No
     return result
 
 
-def recomputed_trades(checked: pd.DataFrame) -> pd.DataFrame:
-    """Checked trades with ``yield_pct`` the recomputed yield and the reported one kept as ``reported_yield_pct``;
-    trades without a recomputed yield (no terms, no price, an error) are left out. Feed it to ``clean_trades``
-    (outliers on the recomputed yields) and then ``isin_daily_checked``."""
+RECOMPUTED_FALLBACKS = ("drop", "reported")
+
+
+def recomputed_trades(checked: pd.DataFrame, *, without_terms: str = "drop") -> pd.DataFrame:
+    """Checked trades with ``yield_pct`` the recomputed yield and the reported one kept as ``reported_yield_pct``.
+    Feed it to ``clean_trades`` (outliers on the recomputed yields) and then ``isin_daily_checked``.
+
+    Trades without a recomputed yield (no price, an error) are left out. Trades of bonds without terms
+    (``no_terms``) are left out too (``without_terms="drop"``, the default: a recomputed panel then covers only
+    the bonds whose terms are typed in, and peer groups shrink to them), or kept on their reported yield
+    (``"reported"``: ``recomputed_yield_pct`` stays blank and the check ``no_terms`` says which)."""
     if "recomputed_yield_pct" not in checked:
         raise ValueError("check the trades first (check_trade_yields)")
-    keep = checked[checked["recomputed_yield_pct"].notna()].copy()
+    if without_terms not in RECOMPUTED_FALLBACKS:
+        raise ValueError(f"without_terms must be one of {RECOMPUTED_FALLBACKS}, not {without_terms!r}")
+    unchecked = (checked["yield_check"] == "no_terms") & checked["yield_pct"].notna()
+    use = checked["recomputed_yield_pct"].notna() | (unchecked if without_terms == "reported" else False)
+    keep = checked[use].copy()
     keep["reported_yield_pct"] = keep["yield_pct"]
-    keep["yield_pct"] = keep["recomputed_yield_pct"]
+    keep["yield_pct"] = keep["recomputed_yield_pct"].where(keep["recomputed_yield_pct"].notna(), keep["yield_pct"])
     return keep.reset_index(drop=True)
 
 
@@ -428,7 +551,11 @@ def isin_daily_checked(trades: pd.DataFrame) -> pd.DataFrame:
         return pd.Series({"yield_check": check, "workout_date": mode[0][0] if mode else None})
 
     keys = live.rename(columns={"trade_date": "date"})
+    if "deal_type" in keys:
+        keys = keys[~keys["deal_type"].map(is_excluded_deal)]
     extra = keys.groupby(["date", "isin"])[["yield_check", "workout_date"]].apply(summary).reset_index()
     out = daily.merge(rep, on=["date", "isin"], how="left").merge(extra, on=["date", "isin"], how="left")
-    out["recomputed_yield_pct"] = out["yield_pct"]
+    # a day of trades kept on their reported yields (no terms) has no recomputed yield
+    unchecked = out["yield_check"].fillna("").str.fullmatch(r"no_terms:\d+")
+    out["recomputed_yield_pct"] = out["yield_pct"].where(~unchecked)
     return out[[*DAILY_COLUMNS, *CHECKED_DAILY_COLUMNS]]

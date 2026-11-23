@@ -54,6 +54,7 @@ FRB DV01 in the event ledger and FRBs in the return engine come next.
 
 from __future__ import annotations
 
+import bisect
 import math
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta
@@ -87,8 +88,12 @@ CORPORATE_RATE_COLUMNS = ("period_start", "fixing_date", "fixings_used", "fixing
                           "public_from", "notes")
 TBILL_TENOR_DAYS = 182
 WAY_TOLERANCE = 2e-4  # printed WAY against the WAY from the printed WAP: both have 4 decimals
-AUCTION_WEEK_DAYS = 7  # UNVERIFIED: 182-day T-bills are auctioned weekly; a later auction can fall within 7 days
+AUCTION_WEEK_DAYS = 7  # UNVERIFIED: 182-day T-bills are auctioned weekly; a later auction can fall within 7 days,
+# and a week after the fixing day every result of an auction held before it is taken as published
 GAP_NOTE_DAYS = 10  # consecutive auctions used further apart than this are noted (an incomplete table?)
+ANNOUNCE_LEAD_DAYS = 14  # a coupon announced more than this before its fixing day is refused (its auctions were not
+# all held then): a typo in the time, as is a T-bill result public before its auction or a fixing before its date
+NO_AS_OF_NOTE = "as_of not given: every announcement and result in the inputs is used (a look-ahead for a past date)"
 _TOL = 1e-12
 
 
@@ -180,6 +185,9 @@ def tbill_way_table(results, *, tenor_days: int = TBILL_TENOR_DAYS, default_time
         if cut is None and cut_price is not None:
             cut = way_from_wap(cut_price, days)
         when, how = _result_time(rec, default_time, f"{where} ({auction})")
+        if when < datetime.combine(auction, time(0, 0)):
+            raise ValueError(f"{where}: the {days}-day result of {auction} is public from {when:%Y-%m-%d %H:%M}, "
+                             "before the auction itself: check the time")
         row = {"auction_date": auction, "tenor_days": days, "way_pct": math.nan if way is None else way,
                "cutoff_pct": math.nan if cut is None else cut, "wap": math.nan if wap is None else wap,
                "cutoff_price": math.nan if cut_price is None else cut_price, "public_from": when,
@@ -232,29 +240,25 @@ def _as_datetime(value) -> datetime | None:
     return value.to_pydatetime() if isinstance(value, pd.Timestamp) else value
 
 
-def goi_frb_fixing(fixing_day, spread_pct: float, tbills, *, as_of=None, n: int = 3, decimals: int | None = 2,
-                   include_fixing_day: bool = False, yield_kind: str = "way", allow_fewer: bool = False,
-                   yield_decimals: int | None = 4) -> FrbFixing:
-    """The coupon fixed on ``fixing_day``: the mean of the last ``n`` 182-day yields before it, rounded, plus spread.
+def _records(table: pd.DataFrame, column: str) -> list[tuple[date, float, datetime]]:
+    """(auction date, yield, public time) of every result with a yield in ``column``, by auction date."""
+    rows = [(as_date(a), float(v), _as_datetime(p)) for a, v, p in zip(table["auction_date"], table[column],
+                                                                          table["public_from"])
+            if v is not None and math.isfinite(float(v))]
+    return sorted(rows, key=lambda r: r[0])
 
-    Only results public by ``as_of`` are used (all of them without it). Fewer than ``n`` are refused unless
-    ``allow_fewer``. Each yield is taken as RBI prints it, to ``yield_decimals`` (4; a WAY computed from a WAP
-    is rounded so, UNVERIFIED), and the mean is exact in decimals. ``decimals``: the base's rounding, half up
-    (``None``: unrounded). The coupon is ``computed`` when ``n`` results are used and the last of them is within
-    a week of the fixing day (no weekly auction can still come before it), else ``projected``.
-    """
-    day = as_date(fixing_day)
-    if yield_kind not in YIELD_KINDS:
-        raise ValueError(f"yield_kind must be one of {YIELD_KINDS}, not {yield_kind!r}")
-    n = as_int(n, "n", minimum=1)
-    spread = _num(spread_pct, "spread_pct") or 0.0
-    table = _tbills(tbills)
-    column = "way_pct" if yield_kind == "way" else "cutoff_pct"
-    cutoff = None if as_of is None else public_time(as_of, "as_of")
-    usable = [r for r in table.to_dict("records")
-              if (r["auction_date"] <= day if include_fixing_day else r["auction_date"] < day)
-              and math.isfinite(r[column]) and (cutoff is None or _as_datetime(r["public_from"]) <= cutoff)]
-    used = usable[-n:]
+
+def _fixing(day: date, spread: float, records: list, dates: list, *, cutoff: datetime | None, latest,
+            n: int, decimals: int | None, include_fixing_day: bool, yield_kind: str, allow_fewer: bool,
+            yield_decimals: int | None) -> FrbFixing:
+    """``goi_frb_fixing`` on records sorted by auction date (``_records``) and their dates (bisected)."""
+    hi = bisect.bisect_right(dates, day) if include_fixing_day else bisect.bisect_left(dates, day)
+    used, i = [], hi - 1
+    while i >= 0 and len(used) < n:
+        if cutoff is None or records[i][2] <= cutoff:
+            used.append(records[i])
+        i -= 1
+    used.reverse()
     notes = []
     if len(used) < n:
         if not allow_fewer or not used:
@@ -263,11 +267,11 @@ def goi_frb_fixing(fixing_day, spread_pct: float, tbills, *, as_of=None, n: int 
                              f"{n} are needed (allow_fewer=True projects from fewer, flagged)")
         notes.append(f"only {len(used)} of {n} auctions")
     for a, b in pairwise(used):
-        if (b["auction_date"] - a["auction_date"]).days > GAP_NOTE_DAYS:
-            notes.append(f"{(b['auction_date'] - a['auction_date']).days} days between the auctions of "
-                         f"{a['auction_date']} and {b['auction_date']}: is the table complete?")
+        if (b[0] - a[0]).days > GAP_NOTE_DAYS:
+            notes.append(f"{(b[0] - a[0]).days} days between the auctions of {a[0]} and {b[0]}: is the table "
+                         "complete?")
     places = None if yield_decimals is None else as_int(yield_decimals, "yield_decimals", minimum=0)
-    yields = tuple(float(r[column]) if places is None else round_half_up(float(r[column]), places) for r in used)
+    yields = tuple(r[1] if places is None else round_half_up(r[1], places) for r in used)
     exact = sum(Decimal(repr(y)) for y in yields) / Decimal(len(yields))
     mean = float(exact)
     if decimals is None:
@@ -275,12 +279,44 @@ def goi_frb_fixing(fixing_day, spread_pct: float, tbills, *, as_of=None, n: int 
     else:
         base = float(exact.quantize(Decimal(1).scaleb(-as_int(decimals, "decimals", minimum=0)),
                                     rounding=ROUND_HALF_UP))
-    last = used[-1]["auction_date"]
-    gap = (day - last).days
-    complete = len(used) == n and (gap <= AUCTION_WEEK_DAYS if not include_fixing_day else gap < AUCTION_WEEK_DAYS)
-    return FrbFixing(day, tuple(r["auction_date"] for r in used), yields, mean, base, spread,
-                     round(base + spread, 10), "computed" if complete else "projected",
-                     _as_datetime(max(r["public_from"] for r in used)), yield_kind, "; ".join(notes))
+    gap = (day - used[-1][0]).days
+    in_week = gap <= AUCTION_WEEK_DAYS if not include_fixing_day else gap < AUCTION_WEEK_DAYS
+    seen = cutoff if cutoff is not None else latest  # the time the results stand at
+    late = seen is not None and seen >= datetime.combine(day + timedelta(days=AUCTION_WEEK_DAYS), time(0, 0))
+    complete = len(used) == n and (in_week or late)
+    if complete and not in_week:
+        notes.append(f"no auction in the {gap} days before the fixing day (one not held?): taken as complete a week "
+                     "after it")
+    return FrbFixing(day, tuple(r[0] for r in used), yields, mean, base, spread, round(base + spread, 10),
+                     "computed" if complete else "projected", max(r[2] for r in used), yield_kind, "; ".join(notes))
+
+
+def goi_frb_fixing(fixing_day, spread_pct: float, tbills, *, as_of=None, n: int = 3, decimals: int | None = 2,
+                   include_fixing_day: bool = False, yield_kind: str = "way", allow_fewer: bool = False,
+                   yield_decimals: int | None = 4) -> FrbFixing:
+    """The coupon fixed on ``fixing_day``: the mean of the last ``n`` 182-day yields before it, rounded, plus spread.
+
+    Only results public by ``as_of`` are used (all of them without it). Fewer than ``n`` are refused unless
+    ``allow_fewer``. Each yield is taken as RBI prints it, to ``yield_decimals`` (4; a WAY computed from a WAP
+    is rounded so, UNVERIFIED), and the mean is exact in decimals. ``decimals``: the base's rounding, half up
+    (``None``: unrounded). The coupon is ``computed`` when ``n`` results are used and either the last of them is
+    within a week of the fixing day (no weekly auction can still come before it) or ``as_of`` (without it, the
+    latest result's public time) is a week or more past the fixing day (every auction held before the fixing day
+    has been published by then: UNVERIFIED rule of thumb; an auction not held leaves a gap, noted); else
+    ``projected``.
+    """
+    day = as_date(fixing_day)
+    if yield_kind not in YIELD_KINDS:
+        raise ValueError(f"yield_kind must be one of {YIELD_KINDS}, not {yield_kind!r}")
+    n = as_int(n, "n", minimum=1)
+    spread = _num(spread_pct, "spread_pct") or 0.0
+    table = _tbills(tbills)
+    records = _records(table, "way_pct" if yield_kind == "way" else "cutoff_pct")
+    cutoff = None if as_of is None else public_time(as_of, "as_of")
+    latest = max((r[2] for r in records), default=None)
+    return _fixing(day, spread, records, [r[0] for r in records], cutoff=cutoff, latest=latest, n=n,
+                   decimals=decimals, include_fixing_day=include_fixing_day, yield_kind=yield_kind,
+                   allow_fewer=allow_fewer, yield_decimals=yield_decimals)
 
 
 def forward_tbill_yield(curve, fixing_day, tenor_days: int = TBILL_TENOR_DAYS) -> float:
@@ -359,15 +395,24 @@ def _reset_day(start: date, issue: date, reset_months: int) -> date:
 
 
 def goi_frb_rates(terms, tbills=None, announced=FRB_COUPONS_CSV, *, as_of=None, projection: str = "flat",
-                  curve=None, n: int = 3, include_fixing_day: bool = False, allow_fewer: bool = False) -> pd.DataFrame:
+                  curve=None, n: int = 3, include_fixing_day: bool = False, allow_fewer: bool = False,
+                  allow_stale: bool = False) -> pd.DataFrame:
     """Each coupon period's rate of one GoI FRB as known at ``as_of`` (``FRB_RATE_COLUMNS``).
 
     ``terms``: a row of ``load_frb_terms``. ``tbills``: 182-day results (``tbill_way_table`` or its input).
     ``announced``: announced coupons (the shipped file by default; ``None`` for none). Each period is
-    ``announced`` (its release public by ``as_of``), else ``computed`` from the T-bill results, else
-    ``projected`` (``flat`` or ``forward`` with ``curve``), else ``unknown`` (a past period nothing fixes: NaN).
-    An unknown release time is estimated as 00:00 on the fixing day (``public_from_source`` ``estimated``).
-    A computed coupon that differs from the announced one is noted. Without ``as_of`` everything known is used.
+    ``announced`` (its release public by ``as_of``), else ``computed`` from the T-bill results (``goi_frb_fixing``),
+    else ``projected``, else ``unfixed`` (a period that has ended with neither: its projected rate kept, so its
+    coupon can be paid, flagged), else ``unknown`` (nothing to project from: NaN). A period whose fixing day has
+    passed is projected only from the results dated before that day (``auctions`` names them; computed a week
+    after the fixing day at the latest), else from the coupon announced for the period before it; one still to be
+    fixed from the latest base (``flat``: the latest ``n`` results public by then, else the latest announced
+    coupon; ``forward``: ``curve``'s forward rate). A base more than one period older than the period in force at
+    the fixing day (or at ``as_of``, for one still ahead) is stale: refused unless ``allow_stale`` (flagged). A
+    coupon announced more than ``ANNOUNCE_LEAD_DAYS`` before its fixing day is refused. An unknown release time is
+    estimated as 00:00 on the fixing day (``public_from_source`` ``estimated``). A computed coupon that differs
+    from the announced one is noted. Without ``as_of`` everything in the inputs is used, as known at the latest
+    time they hold, and every row says so (``NO_AS_OF_NOTE``).
     """
     terms = dict(terms)
     isin = str(terms["isin"]).strip()
@@ -378,6 +423,7 @@ def goi_frb_rates(terms, tbills=None, announced=FRB_COUPONS_CSV, *, as_of=None, 
         raise ValueError(f"projection must be one of {PROJECTIONS}, not {projection!r}")
     if projection == "forward" and (curve is None or index == "gsec5y_reset5y"):
         raise ValueError(f"{isin}: a forward projection needs curve= and a T-bill index")
+    n = as_int(n, "n", minimum=1)
     spread = _num(terms.get("spread_pct"), f"{isin} spread_pct") or 0.0
     decimals = _num(terms.get("decimals"), f"{isin} decimals")
     decimals = 2 if decimals is None else as_int(decimals, "decimals", minimum=0)
@@ -386,42 +432,55 @@ def goi_frb_rates(terms, tbills=None, announced=FRB_COUPONS_CSV, *, as_of=None, 
     cutoff = None if as_of is None else public_time(as_of, "as_of")
     table = None if tbills is None else _tbills(tbills)
     kind = "way" if index == "tbill182_way_avg3" else "cutoff"
+    tbill_index = index != "gsec5y_reset5y"
+    records = [] if table is None or not tbill_index else _records(table, "way_pct" if kind == "way" else "cutoff_pct")
+    dates = [r[0] for r in records]
     rows_announced = _announced_rows(announced, isin)
     for a in rows_announced:  # an unknown release time is estimated as 00:00 on the fixing day (UNVERIFIED)
-        a["public"] = a["when"] or datetime.combine(_reset_day(a["start"], issue, reset_months), time(0, 0))
-    flat_base, flat_note = None, ""
-    if projection == "flat" and index != "gsec5y_reset5y" and table is not None and not table.empty:
+        fixing_day = _reset_day(a["start"], issue, reset_months)
+        a["public"] = a["when"] or datetime.combine(fixing_day, time(0, 0))
+        if a["when"] is not None and a["when"] < datetime.combine(fixing_day - timedelta(days=ANNOUNCE_LEAD_DAYS),
+                                                                  time(0, 0)):
+            raise ValueError(f"{isin}: the coupon for the period from {a['start']} is announced from "
+                             f"{a['when']:%Y-%m-%d %H:%M}, more than {ANNOUNCE_LEAD_DAYS} days before its fixing day "
+                             f"{fixing_day}: check the time")
+    latest = max([r[2] for r in records] + [a["public"] for a in rows_announced], default=None)
+    seen = cutoff if cutoff is not None else latest  # the time the inputs are known at
+    fix = dict(spread=spread, records=records, dates=dates, cutoff=cutoff, latest=max((r[2] for r in records),
+                                                                                       default=None),
+               n=n, decimals=decimals, yield_kind=kind, yield_decimals=4)
+    flat, flat_note = None, ""
+    if projection == "flat" and tbill_index and records:
         try:
-            tomorrow = (cutoff.date() if cutoff else table["auction_date"].max()) + timedelta(days=1)
-            f = goi_frb_fixing(tomorrow, spread, table, as_of=cutoff, n=n, decimals=decimals, yield_kind=kind,
-                               allow_fewer=allow_fewer, include_fixing_day=True)
-            flat_base = f.base_pct
-            flat_note = (f"flat at the base of the auctions of {', '.join(str(a) for a in f.auctions)}"
-                         + (f" ({f.notes})" if f.notes else ""))
+            tomorrow = (cutoff.date() if cutoff else records[-1][0]) + timedelta(days=1)
+            flat = _fixing(tomorrow, include_fixing_day=True, allow_fewer=allow_fewer, **fix)
+            flat_note = (f"flat at the base of the auctions of {', '.join(str(a) for a in flat.auctions)}"
+                         + (f" ({flat.notes})" if flat.notes else ""))
         except ValueError as exc:
             flat_note = f"no T-bill base: {exc}"
+    periods = frb_periods(terms)
+    starts = [p[0] for p in periods]
     out = []
-    for start, end in frb_periods(terms):
+    for start, end in periods:
         fixing = _reset_day(start, issue, reset_months)
         rec = {"isin": isin, "period_start": start, "period_end": end, "fixing_day": fixing, "rate_pct": math.nan,
                "base_pct": math.nan, "spread_pct": spread, "status": "unknown", "public_from": None,
                "public_from_source": "", "auctions": "", "notes": ""}
-        notes = []
+        notes = [] if cutoff is not None else [NO_AS_OF_NOTE]
         known = [a for a in rows_announced if a["start"] <= start and (start < a["end"] if a["end"] else
                                                                         start == a["start"])]
         ann = known[-1] if known else None
         if ann is not None:
             when = ann["public"]
             if cutoff is None or when <= cutoff:
-                rec.update(rate_pct=ann["rate"], base_pct=ann["rate"] - spread if index != "gsec5y_reset5y"
-                           else math.nan, status="announced", public_from=when,
-                           public_from_source=ann["how"])
+                rec.update(rate_pct=ann["rate"], base_pct=ann["rate"] - spread if tbill_index else math.nan,
+                           status="announced", public_from=when, public_from_source=ann["how"])
                 if ann["how"] == "estimated":
                     notes.append("release time unknown: estimated as 00:00 on the fixing day")
-        if index != "gsec5y_reset5y" and table is not None:
+        pending = None
+        if tbill_index and records:
             try:
-                f = goi_frb_fixing(fixing, spread, table, as_of=cutoff, n=n, decimals=decimals, yield_kind=kind,
-                                   include_fixing_day=include_fixing_day)
+                f = _fixing(fixing, include_fixing_day=include_fixing_day, allow_fewer=False, **fix)
             except ValueError:
                 f = None
             if f is not None and f.status == "computed":
@@ -435,42 +494,121 @@ def goi_frb_rates(terms, tbills=None, announced=FRB_COUPONS_CSV, *, as_of=None, 
                                auctions=";".join(str(a) for a in f.auctions))
                     if f.notes:
                         notes.append(f.notes)
+            elif f is not None:
+                pending = f
         if rec["status"] == "unknown":
-            started = cutoff is not None and datetime.combine(fixing, time(0, 0)) <= cutoff
-            ended = cutoff is not None and end <= cutoff.date()
-            if not ended:
-                rate, note = _projected_rate(index, projection, curve, fixing, spread, flat_base, flat_note,
-                                             rows_announced, cutoff)
-                if rate is not None:
-                    rec.update(rate_pct=rate[0], base_pct=rate[1], status="projected")
-                    notes.append(note)
-                    if started:
-                        notes.append(f"the coupon fixed on {fixing} is not in the data: projected")
-        rec["notes"] = "; ".join(notes)
+            passed = seen is not None and seen >= datetime.combine(fixing, time(0, 0))
+            ended = seen is not None and end <= seen.date()
+            if passed:
+                rate, note, used, how = _passed_rate(index, fixing, start, pending, fix, include_fixing_day,
+                                                     allow_fewer, rows_announced, cutoff, starts, spread, allow_stale,
+                                                     flat, flat_note)
+            else:
+                rate, note, used, how = _projected_rate(index, projection, curve, fixing, start, spread, flat,
+                                                        flat_note, rows_announced, cutoff, seen, starts,
+                                                        reset_months, allow_stale)
+            if rate is not None:
+                rec.update(rate_pct=rate[0], base_pct=rate[1], status="unfixed" if ended else "projected",
+                           auctions=used, public_from_source=how)
+                if ended:
+                    note += f"; the period ended on {end} without its coupon in the data: the projection is kept"
+            notes.append(note)
+        rec["notes"] = "; ".join(x for x in notes if x)
         out.append(rec)
     return pd.DataFrame(out, columns=list(FRB_RATE_COLUMNS))
 
 
-def _projected_rate(index: str, projection: str, curve, fixing: date, spread: float, flat_base: float | None,
-                    flat_note: str, announced: list[dict], cutoff: datetime | None
-                    ) -> tuple[tuple[float, float] | None, str]:
-    """((rate, base), note) of a projected coupon, or (None, "") when nothing to project from is known."""
+def _announced_base(announced: list[dict], cutoff: datetime | None, start: date, ref: date, starts: list[date],
+                    spread: float, allow_stale: bool) -> tuple[tuple[float, float] | None, str]:
+    """((rate, base), note) flat at the base implied by the latest coupon announced (by ``cutoff``) for a period
+    before ``start``: fresh when it is the coupon of the period in force at ``ref`` or of the one before it."""
+    public = [a for a in announced if (cutoff is None or a["public"] <= cutoff) and a["start"] < start]
+    if not public:
+        return None, "nothing to project from (no coupon announced before it, no T-bill base)"
+    b = public[-1]
+    j = max(bisect.bisect_right(starts, ref) - 1, 0)
+    fresh_from = starts[max(j - 1, 0)]
+    if b["start"] < fresh_from:
+        if not allow_stale:
+            return None, (f"the newest coupon announced by then is for the period from {b['start']}, more than one "
+                          f"period before the one in force on {ref} ({starts[j]}): too old to project from (add "
+                          "RBI's coupons or the T-bill results, or allow_stale=True projects from it, flagged)")
+        stale = f"; a stale base, announced for {b['start']} (allow_stale)"
+    else:
+        stale = ""
+    base = b["rate"] - spread
+    return (round(base + spread, 10), base), f"flat at the base implied by the coupon announced for {b['start']}" + stale
+
+
+def _passed_rate(index: str, fixing: date, start: date, pending: FrbFixing | None, fix: dict,
+                 include_fixing_day: bool, allow_fewer: bool, announced: list[dict], cutoff: datetime | None,
+                 starts: list[date], spread: float, allow_stale: bool, flat: FrbFixing | None, flat_note: str
+                 ) -> tuple[tuple[float, float] | None, str, str, str]:
+    """((rate, base), note, auctions, source) of a period whose fixing day has passed without its coupon known: from
+    the results dated before the fixing day only (``before_fixing``), else from the coupon announced for the period
+    before it (``previous_coupon``); with ``allow_stale``, from a stale coupon or flat at later results
+    (``proxy``)."""
+    if index == "gsec5y_reset5y":
+        public = [a for a in announced if (cutoff is None or a["public"] <= cutoff) and a["start"] < start]
+        if not public:
+            return None, "nothing to project from (no coupon announced before it)", "", ""
+        return (public[-1]["rate"], math.nan), f"flat at the coupon announced for {public[-1]['start']}", "", \
+            "previous_coupon"
+    f = pending
+    if f is None and allow_fewer and fix["records"]:
+        try:
+            f = _fixing(fixing, include_fixing_day=include_fixing_day, allow_fewer=True, **fix)
+        except ValueError:
+            f = None
+    if f is not None:
+        gap = (fixing - f.auctions[-1]).days
+        note = (f"the coupon fixed on {fixing}, from the auctions of {', '.join(str(a) for a in f.auctions)} (the last "
+                f"{gap} days before it: a later result may still be published; computed a week after the fixing day)"
+                + (f" ({f.notes})" if f.notes else ""))
+        return (f.coupon_pct, f.base_pct), note, ";".join(str(a) for a in f.auctions), "before_fixing"
+    rate, note = _announced_base(announced, cutoff, start, fixing, starts, spread, allow_stale)
+    if rate is not None:
+        return rate, f"the coupon fixed on {fixing} is not in the data: {note}", "", (
+            "proxy" if "stale base" in note else "previous_coupon")
+    if allow_stale and flat is not None:
+        return (round(flat.base_pct + spread, 10), flat.base_pct), (
+            f"the coupon fixed on {fixing} is not in the data and no result before it is: {flat_note}, auctions after "
+            "its fixing day (a proxy, allow_stale)"), "", "proxy"
+    return None, f"the coupon fixed on {fixing} is not in the data: {note}" + (
+        "" if not flat_note else "; later T-bill results are not used for it (allow_stale=True takes them as a proxy)"
+    ), "", ""
+
+
+def _projected_rate(index: str, projection: str, curve, fixing: date, start: date, spread: float,
+                    flat: FrbFixing | None, flat_note: str, announced: list[dict], cutoff: datetime | None,
+                    seen: datetime | None, starts: list[date], reset_months: int, allow_stale: bool
+                    ) -> tuple[tuple[float, float] | None, str, str, str]:
+    """((rate, base), note, auctions, source) of a coupon still to be fixed, or (None, why, "", "") when nothing to
+    project from is known: ``forward``, ``flat`` at the latest T-bill base, else at the latest announced coupon's base
+    (``announced_base``)."""
     if index == "gsec5y_reset5y":
         public = [a for a in announced if cutoff is None or a["public"] <= cutoff]
         if not public:
-            return None, ""
-        return (public[-1]["rate"], math.nan), f"flat at the coupon announced for {public[-1]['start']}"
+            return None, "nothing to project from (no coupon announced by then)", "", ""
+        return (public[-1]["rate"], math.nan), f"flat at the coupon announced for {public[-1]['start']}", "", \
+            "announced_base"
     if projection == "forward" and fixing >= curve.valuation_date:
         base = forward_tbill_yield(curve, fixing)
-        return (round(base + spread, 10), base), "forward projection, unrounded"
-    if flat_base is not None:
-        return (round(flat_base + spread, 10), flat_base), flat_note
-    public = [a for a in announced if cutoff is None or a["public"] <= cutoff]
-    if not public:
-        return None, ""
-    base = public[-1]["rate"] - spread
-    note = f"flat at the base implied by the coupon announced for {public[-1]['start']}"
-    return (round(base + spread, 10), base), note + (f"; {flat_note}" if flat_note else "")
+        return (round(base + spread, 10), base), "forward projection, unrounded", "", "forward"
+    ref = fixing if seen is None else min(fixing, seen.date())
+    if flat is not None:
+        if _shift_months(flat.auctions[-1], reset_months) >= ref:
+            return (round(flat.base_pct + spread, 10), flat.base_pct), flat_note, "", "flat"
+        if allow_stale:
+            return (round(flat.base_pct + spread, 10), flat.base_pct), flat_note + "; a stale base (allow_stale)", \
+                "", "flat"
+        flat_note = (f"the latest T-bill base (auctions to {flat.auctions[-1]}) is more than a period old on {ref}: "
+                     "too old to project from")
+    rate, note = _announced_base(announced, cutoff, start, ref, starts, spread, allow_stale)
+    tail = f"; {flat_note}" if flat_note else ""
+    if rate is None:
+        return None, note + tail, "", ""
+    return rate, note + tail, "", "announced_base"
 
 
 # ---------------------------------------------------------------- the GoI FRB
@@ -496,6 +634,7 @@ class GoiFloatingRateBond(Bond):
     index_pct: float | None = None
     isin: str = ""
     name: str = ""
+    missing: tuple[tuple, ...] = ()
 
     def __post_init__(self) -> None:
         set_ = object.__setattr__
@@ -541,8 +680,9 @@ class GoiFloatingRateBond(Bond):
         try:
             return self._rates[start][0]
         except KeyError:
+            why = dict((as_date(st), note) for st, note in self.missing).get(start)
             raise ValueError(f"{self._where}: no rate for the coupon period from {start}; pass it in rates "
-                             "(goi_frb_rates gives them)") from None
+                             f"(goi_frb_rates gives them){f': {why}' if why else ''}") from None
 
     def coupon_rate(self, settlement) -> float:
         """The rate (percent a year) of the coupon period holding ``settlement``."""
@@ -589,22 +729,27 @@ class GoiFloatingRateBond(Bond):
 
 
 def goi_frb_bond(terms, rates: pd.DataFrame, *, calendar: BusinessCalendar | None = None) -> GoiFloatingRateBond:
-    """A ``GoiFloatingRateBond`` from a terms row and ``goi_frb_rates``' rows (periods without a rate are left out).
+    """A ``GoiFloatingRateBond`` from a terms row and ``goi_frb_rates``' rows (periods without a rate are left out,
+    their notes kept in ``missing`` for the refusal that pricing through them gives).
 
-    ``index_pct`` is the base of the projected periods when they share one (the flat projection).
+    ``index_pct`` is the base of the projected periods still to be fixed when they share one (the flat projection);
+    a period whose fixing day has passed is left out of it (its coupon no longer follows the index).
     """
     terms = dict(terms)
     known = rates.loc[rates["rate_pct"].notna()]
-    projected = known.loc[known["status"] == "projected", "base_pct"].dropna()
+    ahead = known.loc[(known["status"] == "projected")
+                      & ~known["public_from_source"].isin(("before_fixing", "previous_coupon", "proxy"))]
+    projected = ahead["base_pct"].dropna()
     index = float(projected.iloc[-1]) if not projected.empty and projected.nunique() == 1 else None
     rows = tuple((r["period_start"], float(r["rate_pct"]), r["status"], r["public_from"])
                  for r in known.to_dict("records"))
+    missing = tuple((r["period_start"], r["notes"]) for r in rates.loc[rates["rate_pct"].isna()].to_dict("records"))
     return GoiFloatingRateBond(as_date(terms["maturity_date"]), as_date(terms["issue_date"]),
                                _num(terms.get("spread_pct"), "spread_pct") or 0.0, rows,
                                first_coupon_date=as_date(terms["first_coupon_date"]) if _present(
                                    terms.get("first_coupon_date")) else None,
                                calendar=calendar, index_pct=index, isin=str(terms["isin"]).strip(),
-                               name=str(terms.get("name", "") or ""))
+                               name=str(terms.get("name", "") or ""), missing=missing)
 
 
 # ---------------------------------------------------------------- discount margin

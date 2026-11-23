@@ -61,8 +61,13 @@ import pandas as pd
 from cr_strat.asset_swaps import z_spread
 from cr_strat.conventions import as_date, convert_yield
 from cr_strat.corporates import (
+    PRICE_BASES,
     CorporateBond,
+    _as_of_for,
     corporate_from_terms,
+    normalise_isin,
+    price_factor,
+    public_time,
     read_amortisation,
     read_corporate_options,
     read_corporate_schedule,
@@ -74,7 +79,7 @@ from cr_strat.curves import SpreadBenchmark
 SPREAD_COLUMNS = ("isin", "settlement_date", "clean_price", "accrued", "dirty_price", "workout_date", "workout_kind",
                   "years_to_workout", "yield_pct", "curve_yield_pct", "g_spread_bp", "par_coupon_pct",
                   "par_yield_pct", "par_spread_bp", "z_spread_bp", "z_spread_sa_bp", "curve_id", "extrapolated",
-                  "error")
+                  "calendar_projected", "known_as_of", "error")
 WORKOUTS = ("maturity", "worst", "sebi")
 FLOW_DATES = ("due", "payment")
 PEER_KEYS = ("instrument_class", "rating_bucket", "tenor_bucket")
@@ -301,33 +306,44 @@ def _blank(value) -> bool:
 
 
 def spread_table(frame: pd.DataFrame, terms, curve, *, workout: str = "maturity", settlement=None, schedule=None,
-                 options=None, amortisation=None, rates: dict | None = None, calendar="default") -> pd.DataFrame:
+                 options=None, amortisation=None, rates: dict | None = None, calendar="default", as_of=None,
+                 price_basis: str = "original") -> pd.DataFrame:
     """``spread_measures`` for every row of ``frame`` (``SPREAD_COLUMNS``, in the frame's order).
 
     ``frame``: ``isin``, ``clean_price`` or ``yield_pct``, optional ``settlement_date`` (default ``settlement``).
     ``terms``: the corporate terms table (``corporates.read_corporate_terms``' layout, a frame or CSV), with the
     optional schedule, options and amortisation tables; ``rates``: rate steps by ISIN for ``frb_corp`` rows (their
     spread is then the fixed-coupon measure of the coupons as known: a discount margin is the usual measure).
-    ``workout``: ``maturity``, ``worst`` (from a price) or ``sebi`` (SEBI's trigger rule, from a yield). A row that
-    cannot be measured keeps NaN and the reason in ``error``.
+    ``workout``: ``maturity``, ``worst`` (from a price) or ``sebi`` (SEBI's trigger rule, from a yield). Each bond
+    is taken as known at ``as_of`` (``corporates.CorporateBond.as_known``: an exercise public by then redeems it at
+    the option, workout kind ``exercised_call`` or ``exercised_put``; a decision not to exercise drops the option):
+    one time for every row, else the row's ``as_of`` cell, else 00:00 on its trade date (``corporates.default_as_of``;
+    never everything known). ``price_basis``: a clean price per 100 ``original`` face (default) or per 100 of the
+    face ``outstanding`` at settlement (``corporates.price_factor``); the outputs stay per 100 original face. A row
+    that cannot be measured keeps NaN and the reason in ``error``.
     """
     if workout not in WORKOUTS:
         raise ValueError(f"workout must be one of {WORKOUTS}, not {workout!r}")
+    if price_basis not in PRICE_BASES:
+        raise ValueError(f"price_basis must be one of {PRICE_BASES}, not {price_basis!r}")
     if not isinstance(frame, pd.DataFrame):
         raise TypeError("frame must be a DataFrame")
     if "isin" not in frame or not ({"clean_price", "yield_pct"} & set(frame.columns)):
         raise ValueError("the prices need isin and clean_price or yield_pct")
+    when_all = None if as_of is None else public_time(as_of, "as_of")
     table = read_corporate_terms(terms)
     sched = None if schedule is None else read_corporate_schedule(schedule)
     opts = None if options is None else read_corporate_options(options)
     amort = None if amortisation is None else read_amortisation(amortisation)
     by_isin = {r["isin"]: r for r in table.to_dict("records")}
+    rates = None if rates is None else {normalise_isin(k): v for k, v in rates.items()}
     bonds: dict[str, CorporateBond | Exception] = {}
     rows = []
     for rec in frame.to_dict("records"):
-        isin = str(rec.get("isin") or "").strip()
+        isin = normalise_isin(rec.get("isin"))
         out = dict.fromkeys(SPREAD_COLUMNS, math.nan) | {"isin": isin, "workout_kind": "", "curve_id": "",
-                                                         "extrapolated": None, "error": ""}
+                                                         "extrapolated": None, "calendar_projected": None,
+                                                         "known_as_of": None, "error": ""}
         try:
             if isin not in bonds:
                 try:
@@ -344,14 +360,21 @@ def spread_table(frame: pd.DataFrame, terms, curve, *, workout: str = "maturity"
                     bonds[isin] = bond
                 except (ValueError, TypeError, NotImplementedError) as exc:
                     bonds[isin] = exc
-            bond = bonds[isin]
-            if isinstance(bond, Exception):
-                raise bond
+            base = bonds[isin]
+            if isinstance(base, Exception):
+                raise base
             given = rec.get("settlement_date")
             if _blank(given) and settlement is None:
                 raise ValueError("no settlement date: give settlement_date or settlement=")
             s = as_date(settlement if _blank(given) else given)
             out["settlement_date"] = s
+            when = _as_of_for(base, rec, s, when_all)
+            out["known_as_of"] = when
+            bond = base.as_known(when)
+            exercised = ""
+            if bond.maturity != base.maturity:
+                done = [o.kind for o in base.options if o.date == bond.maturity and o.exercised]
+                exercised = f"exercised_{done[0]}" if done else "exercised"
             clean = rec.get("clean_price")
             y = rec.get("yield_pct")
             if workout == "sebi":
@@ -369,8 +392,13 @@ def spread_table(frame: pd.DataFrame, terms, curve, *, workout: str = "maturity"
                         clean = bond.price_to_worst(s, float(y))[0]
                     else:
                         clean = bond.clean_price(float(y), s)
+                else:
+                    clean = float(clean) * price_factor(bond, s, price_basis)
                 m = spread_measures(bond, s, float(clean), curve, workout=workout)
+            if exercised and m["workout_kind"] == "maturity":
+                m["workout_kind"] = exercised
             out.update(m)
+            out["calendar_projected"] = bond.calendar_projected(s)
         except (ValueError, TypeError, NotImplementedError) as exc:
             out["error"] = str(exc)
         rows.append(out)

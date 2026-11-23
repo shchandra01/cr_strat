@@ -1399,7 +1399,8 @@ def _trade_check(args: argparse.Namespace) -> int:
     if daily is not None:
         _write(daily, Path(args.daily_out))
     counts = checked["yield_check"].value_counts()
-    print("yield checks: " + ", ".join(f"{status} {int(counts.get(status, 0))}" for status in CHECK_STATUSES)
+    shown = [st for st in CHECK_STATUSES if st not in ("dirty_price", "face_basis") or counts.get(st, 0)]
+    print("yield checks: " + ", ".join(f"{status} {int(counts.get(status, 0))}" for status in shown)
           + f" (tolerance {args.tolerance_bp:g} bp, recomputed to {args.workout})")
     mismatched = checked[checked["yield_check"] == "mismatch"]
     worst = mismatched.assign(_size=mismatched["yield_diff_bp"].abs()).sort_values(

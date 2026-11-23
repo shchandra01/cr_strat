@@ -63,8 +63,13 @@ from cr_strat.bonds import DiscountInstrument, FixedRateBond, ZeroCouponBond
 from cr_strat.calendars import BusinessCalendar, calendar_for
 from cr_strat.conventions import CONVENTIONS, BondConventions, DiscountConventions, as_date, convert_yield
 from cr_strat.corporates import (
+    PRICE_BASES,
     CorporateBond,
+    _as_of_for,
     corporate_from_terms,
+    normalise_isin,
+    price_factor,
+    public_time,
     read_amortisation,
     read_corporate_options,
     read_corporate_schedule,
@@ -437,7 +442,7 @@ def _same(a, b) -> bool:
 
 
 def asset_swap_table(frame: pd.DataFrame, curve, settlement=None, *, terms=None, schedule=None, options=None,
-                     amortisation=None) -> pd.DataFrame:
+                     amortisation=None, as_of=None, price_basis: str = "original") -> pd.DataFrame:
     """``asset_swap`` for every row of ``frame``: one row per bond (``ASW_COLUMNS``), sorted by maturity and ISIN.
 
     Columns: ``isin``, ``maturity_date``, ``clean_price`` (or ``yield_pct``, priced with ``bonds``), ``kind``
@@ -446,16 +451,23 @@ def asset_swap_table(frame: pd.DataFrame, curve, settlement=None, *, terms=None,
     row that cannot be measured keeps NaN and the reason in ``error`` (a bond past the curve, say). A row whose ISIN
     is in ``terms`` (the corporate terms table, with its ``schedule``, ``options`` and ``amortisation`` tables) is a
     corporate bond built from them (its ``maturity_date`` may then be blank; ``k_match_pct`` is restated to its
-    annual basis); a floating-rate one is refused, pointing to ``frb_asset_swap_table``.
+    annual basis), taken as known at ``as_of`` (``corporates.CorporateBond.as_known``: an exercise public by then
+    redeems it at the option, whose date is then its ``maturity_date``; default 00:00 on the row's trade date,
+    ``corporates.default_as_of``); a ``coupon_pct``, ``kind`` or ``maturity_date`` of the row that contradicts the
+    terms is refused; its clean price is per 100 ``original`` face, or ``outstanding`` face with ``price_basis``. A
+    floating-rate one is refused, pointing to ``frb_asset_swap_table``.
     """
     if not isinstance(frame, pd.DataFrame):
         raise TypeError("frame must be a DataFrame")
+    if price_basis not in PRICE_BASES:
+        raise ValueError(f"price_basis must be one of {PRICE_BASES}, not {price_basis!r}")
     corp = read_corporate_terms(terms) if terms is not None else None
     by_isin = {} if corp is None else {r["isin"]: r for r in corp.to_dict("records")}
     sched = None if schedule is None else read_corporate_schedule(schedule)
     opts = None if options is None else read_corporate_options(options)
     amort = None if amortisation is None else read_amortisation(amortisation)
-    missing = [c for c in ("isin",) + (() if by_isin else ("maturity_date",)) if c not in frame]
+    when_all = None if as_of is None else public_time(as_of, "as_of")
+    missing = [c for c in ("isin",) + (() if by_isin or frame.empty else ("maturity_date",)) if c not in frame]
     if missing or not ({"clean_price", "yield_pct"} & set(frame.columns)):
         raise ValueError("the bonds need isin, maturity_date and clean_price or yield_pct; missing "
                          f"{missing or 'a price'}")
@@ -471,18 +483,22 @@ def asset_swap_table(frame: pd.DataFrame, curve, settlement=None, *, terms=None,
         out.update(isin=rec.get("isin"), kind=rec.get("kind") or "gsec", coupon_pct=rec.get("coupon_pct", math.nan),
                    extrapolated=None, calendar_projected=None, error="")
         try:
-            isin = str(rec.get("isin") or "").strip()
+            isin = normalise_isin(rec.get("isin"))
             if isin in by_isin:
                 row = by_isin[isin]
                 if row["kind"] == "frb_corp":
                     raise ValueError(f"{isin} is a floating-rate bond: its spread is a discount margin "
                                      "(asset_swaps.frb_asset_swap_table, floating.discount_margin_bp)")
-                bond, kind = corporate_from_terms(row, schedule=sched, options=opts, amortisation=amort,
+                base, kind = corporate_from_terms(row, schedule=sched, options=opts, amortisation=amort,
                                                   where=where), "corporate"
-                out["coupon_pct"] = bond.coupon_pct
-                if not _blank(rec.get("maturity_date")) and as_date(rec["maturity_date"]) != bond.maturity:
-                    raise ValueError(f"maturity_date {rec['maturity_date']} differs from the terms' {bond.maturity}")
-                out["maturity_date"] = bond.maturity
+                out["coupon_pct"] = base.coupon_pct
+                if not _blank(rec.get("maturity_date")) and as_date(rec["maturity_date"]) != base.maturity:
+                    raise ValueError(f"maturity_date {rec['maturity_date']} differs from the terms' {base.maturity}")
+                if not _blank(rec.get("coupon_pct")) and abs(float(rec["coupon_pct"]) - base.coupon_pct) > 1e-9:
+                    raise ValueError(f"coupon_pct {rec['coupon_pct']} differs from the terms' {base.coupon_pct:g}")
+                if not _blank(rec.get("kind")) and str(rec["kind"]).strip().lower() != "corporate":
+                    raise ValueError(f"kind {rec['kind']!r} differs from the terms: {isin} is a corporate bond there")
+                out["maturity_date"] = base.maturity
             elif "maturity_date" not in rec:
                 raise ValueError("maturity_date is missing (and the ISIN is not in the corporate terms)")
             else:
@@ -494,8 +510,13 @@ def asset_swap_table(frame: pd.DataFrame, curve, settlement=None, *, terms=None,
                                  "date")
             s = as_date(given if given is not None else default)
             out["settlement_date"] = s
+            factor = 1.0
             if isin not in by_isin:
                 bond, kind = instrument_from_row(rec, where)
+            else:  # the bond as known at as_of: an exercise public by then redeems it at the option
+                bond = base.as_known(_as_of_for(base, rec, s, when_all))
+                out["maturity_date"] = bond.maturity
+                factor = price_factor(bond, s, price_basis)
             out["kind"] = kind
             clean = rec.get("clean_price")
             if _blank(clean):
@@ -504,6 +525,8 @@ def asset_swap_table(frame: pd.DataFrame, curve, settlement=None, *, terms=None,
                     raise ValueError("no clean_price or yield_pct")
                 clean = (bond.price(float(y), s, rounded=False) if isinstance(bond, DiscountInstrument)
                          else bond.clean_price(float(y), s))
+            else:
+                clean = float(clean) * factor
             m = asset_swap(bond, s, float(clean), curve)
             for name in ASW_COLUMNS:
                 if hasattr(m, name):

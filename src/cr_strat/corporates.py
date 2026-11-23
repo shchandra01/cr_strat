@@ -170,7 +170,7 @@ def year_fraction_sebi(start, end, *, rule: str = "anniversary", anchor=None) ->
     while x < b:
         lo, hi = _shift_months(anchor, 12 * k), _shift_months(anchor, 12 * (k + 1))
         nxt = min(b, hi)
-        total += (nxt - x).days / (hi - lo).days
+        total += (nxt - x).days / _year_days(lo, hi, anchor)
         x, k = nxt, k + 1
     return total
 
@@ -1249,7 +1249,8 @@ STEP_COLUMNS = ("isin", "threshold", "step_bp_per_notch", "max_step_bp", "agenci
                 "step_down", "source")
 AMORTISATION_BASES = ("face", "quantity")
 AMOUNT_TOLERANCE = 1e-6  # a schedule's typed amount must match the computed one within this, per 100 face
-PRICED_COLUMNS = (*ANALYTICS_COLUMNS, "workout_date", "workout_kind", "call_trigger", "put_trigger", "error")
+PRICED_COLUMNS = (*ANALYTICS_COLUMNS, "workout_date", "workout_kind", "call_trigger", "put_trigger",
+                  "calendar_projected", "known_as_of", "error")
 _YES = {"yes", "y", "true", "1"}
 _NO = {"no", "n", "false", "0"}
 
@@ -1451,16 +1452,18 @@ def corporate_from_terms(row, *, schedule: pd.DataFrame | None = None, options: 
     """A ``CorporateBond`` from a terms row and the ISIN's rows of the schedule, options and amortisation tables.
 
     ``conventions``: ``ncd``, ``ncd_2013`` or ``ncd_pre2013`` (blank: by the issue date, ``ncd_conventions``).
-    A ``perpetual`` row without a maturity is deemed to mature 100 years after issue. Schedule rows make the
-    schedule explicit; their ``principal`` rows are amortisation, and every ``amount_per100`` typed is checked
-    against the computed amount (beyond ``AMOUNT_TOLERANCE`` refused, naming both, unless ``check_amounts`` is
-    off). ``calendar``: ``"default"`` loads the conventions' payment calendar, lenient beyond its years;
-    ``None`` rolls nothing. ``frb_corp`` rows give the initial coupon; ``floating.corporate_frb_rates`` adds
-    the fixings.
+    A ``perpetual`` row without a maturity is deemed to mature 100 years after issue. Schedule rows with a coupon
+    row (kind ``coupon`` or blank) make the schedule explicit, listing every due date; rows of a coupon bond that
+    are only ``principal`` and ``redemption`` rows are its amortisation on the generated schedule (they may not
+    carry payment or record dates, which need every due date). Every ``amount_per100`` typed is checked against
+    the computed amount (beyond ``AMOUNT_TOLERANCE`` refused, naming both, unless ``check_amounts`` is off).
+    ``calendar``: ``"default"`` loads the conventions' payment calendar, lenient beyond its years; ``None`` rolls
+    nothing. ``frb_corp`` rows give the initial coupon; ``floating.corporate_frb_rates`` adds the fixings.
+    ISINs are matched stripped and upper-case.
     """
     rec = {k: ("" if v is None or (isinstance(v, float) and math.isnan(v)) else str(v).strip())
            for k, v in dict(row).items()}
-    isin = rec.get("isin", "")
+    isin = rec.get("isin", "").upper()
     where = where or isin or "terms row"
     try:
         kind = rec.get("kind", "") or "corporate"
@@ -1498,7 +1501,7 @@ def corporate_from_terms(row, *, schedule: pd.DataFrame | None = None, options: 
                                                                              "notice_days", minimum=0),
                                 _number(o.get("portion", ""), "portion", default=1.0),
                                 _flag(o.get("exercised", ""), "exercised"), o.get("exercised_public_from") or None,
-                                o.get("source", "")))
+                                o.get("source", ""), as_date(o["record_date"]) if o.get("record_date") else None))
         amort = []
         for a in _rows_for(amortisation, isin):
             basis = a.get("basis", "") or "face"
@@ -1506,6 +1509,9 @@ def corporate_from_terms(row, *, schedule: pd.DataFrame | None = None, options: 
                 raise ValueError(f"amortisation basis must be one of {AMORTISATION_BASES}, not {basis!r}")
             amort.append((as_date(a["date"]), _number(a["principal_per100"], "principal_per100")))
         sched = sorted(_rows_for(schedule, isin), key=lambda r: as_date(r["due_date"]))
+        # rows of a coupon bond with no coupon row are its amortisation, not a schedule of their own
+        principal_only = bool(sched) and frequency != 0 and all(r.get("kind") in ("principal", "redemption")
+                                                                for r in sched)
         due_dates, payments, records, typed = [], [], [], []
         for r in sched:
             d = as_date(r["due_date"])
@@ -1516,6 +1522,9 @@ def corporate_from_terms(row, *, schedule: pd.DataFrame | None = None, options: 
                     amort.append((d, _number(r["amount_per100"], "amount_per100")))
             if r.get("amount_per100"):
                 typed.append((d, r.get("kind") or "coupon", _number(r["amount_per100"], "amount_per100")))
+            if principal_only and (r.get("payment_date") or r.get("record_date")):
+                raise ValueError(f"the schedule's {r['kind']} row due {d} gives a payment or record date, but the "
+                                 "schedule has no coupon rows: list every due date (coupon rows too) to give them")
             if due_dates and due_dates[-1] == d:
                 continue
             due_dates.append(d)
@@ -1524,6 +1533,8 @@ def corporate_from_terms(row, *, schedule: pd.DataFrame | None = None, options: 
         for label, values in (("payment_date", payments), ("record_date", records)):
             if any(v is not None for v in values) and any(v is None for v in values):
                 raise ValueError(f"schedule {label} is given for some due dates but not all")
+        if principal_only:
+            due_dates = []
         if due_dates:
             kwargs.update(schedule="explicit", due_dates=tuple(due_dates),
                           payment_dates=tuple(payments) if payments and payments[0] is not None else (),
@@ -1553,6 +1564,9 @@ def corporate_from_terms(row, *, schedule: pd.DataFrame | None = None, options: 
 def _check_typed_amounts(bond: CorporateBond, typed: list[tuple[date, str, float]]) -> None:
     periods = {p.due: p for p in bond.periods()}
     for d, kind, amount in typed:
+        if d not in periods:
+            raise ValueError(f"the schedule's {kind} row due {d} is not a due date of the bond (due dates "
+                             f"{bond.due_schedule[0]} to {bond.maturity})")
         p = periods[d]
         computed = p.amount if kind == "coupon" else p.principal
         if abs(computed - amount) > AMOUNT_TOLERANCE:
@@ -1561,35 +1575,68 @@ def _check_typed_amounts(bond: CorporateBond, typed: list[tuple[date, str, float
                              "postponed_coupon and redemption_interest")
 
 
+PRICE_BASES = ("original", "outstanding")
+
+
+def price_factor(bond: CorporateBond, settlement, price_basis: str) -> float:
+    """What a price on ``price_basis`` is multiplied by to be per 100 original face: 1 for ``original``, the
+    outstanding face over 100 for ``outstanding`` (a partly redeemed bond quoted per 100 of the face it still has,
+    as exchanges trade it after a part redemption: UNVERIFIED for the prints and marks of this package)."""
+    if price_basis not in PRICE_BASES:
+        raise ValueError(f"price_basis must be one of {PRICE_BASES}, not {price_basis!r}")
+    return 1.0 if price_basis == "original" else bond.outstanding_face(as_date(settlement)) / 100
+
+
 def price_corporates(frame: pd.DataFrame, terms: pd.DataFrame, *, schedule: pd.DataFrame | None = None,
                      options: pd.DataFrame | None = None, amortisation: pd.DataFrame | None = None,
                      given: str = "clean_price", column: str | None = None, valuation: str = "ytm",
-                     calendar="default", rates: dict | None = None) -> pd.DataFrame:
+                     calendar="default", rates: dict | None = None, as_of=None,
+                     price_basis: str = "original") -> pd.DataFrame:
     """Analytics for every row of ``frame`` (``isin``, ``settlement_date`` and the ``given`` quantity).
 
+    ``given``: ``clean_price``, ``yield_pct`` or ``auto`` (each row from its clean price, else from its yield).
     ``valuation``: ``ytm`` (to maturity), ``worst`` (from a clean price the yield to worst over maturity and
     calls; from a yield the price to worst) or ``sebi`` (from a yield, SEBI's trigger rule). ``rates``: rate
-    steps by ISIN for ``frb_corp`` rows (``floating.corporate_frb_rates``). A row that cannot be priced gets
-    NaN and the reason in ``error``; results replace columns of the same name.
+    steps by ISIN for ``frb_corp`` rows (``floating.corporate_frb_rates``). The terms are taken as known at
+    ``as_of`` (``CorporateBond.as_known``: an exercise public by then redeems the bond at the option, kind
+    ``exercised_call`` or ``exercised_put``; a decision not to exercise public by then drops the option): one time
+    for every row, else the row's ``as_of`` cell, else 00:00 on its trade date (``default_as_of``: its
+    ``trade_date``, else the settlement less the settlement lag); never everything known. ``price_basis``: the
+    basis of given and returned prices, accrued interest and DV01, ``original`` (per 100 original face, the
+    pricer's own) or ``outstanding`` (per 100 of the face outstanding at settlement). A row that cannot be priced
+    keeps its input values, NaN in the other outputs and the reason in ``error``; for the rows priced, results
+    replace columns of the same name. ``calendar_projected``: a payment or record date ahead falls in a year the
+    payment calendar's holiday list does not cover (rolled on weekends only).
     """
-    if given not in ("clean_price", "yield_pct"):
-        raise ValueError("given must be 'clean_price' or 'yield_pct'")
+    if given not in ("clean_price", "yield_pct", "auto"):
+        raise ValueError("given must be 'clean_price', 'yield_pct' or 'auto'")
     if valuation not in ("ytm", "worst", "sebi"):
         raise ValueError(f"valuation must be ytm, worst or sebi, not {valuation!r}")
-    column = given if column is None else column
-    missing = [c for c in ("isin", "settlement_date", column) if c not in frame]
+    if price_basis not in PRICE_BASES:
+        raise ValueError(f"price_basis must be one of {PRICE_BASES}, not {price_basis!r}")
+    if given == "auto":
+        column = None
+        if not ({"clean_price", "yield_pct"} & set(frame.columns)):
+            raise ValueError("missing columns: ['clean_price or yield_pct']")
+        missing = [c for c in ("isin", "settlement_date") if c not in frame]
+    else:
+        column = given if column is None else column
+        missing = [c for c in ("isin", "settlement_date", column) if c not in frame]
     if missing:
         raise ValueError(f"missing columns: {missing}")
+    when_all = None if as_of is None else public_time(as_of, "as_of")
     terms = read_corporate_terms(terms)
     schedule = None if schedule is None else read_corporate_schedule(schedule)
     options = None if options is None else read_corporate_options(options)
     amortisation = None if amortisation is None else read_amortisation(amortisation)
     by_isin = {r["isin"]: r for r in terms.to_dict("records")}
+    rates = None if rates is None else {normalise_isin(k): v for k, v in rates.items()}
     bonds: dict[str, CorporateBond | Exception] = {}
-    outputs = [c for c in PRICED_COLUMNS if c != given]
-    rows = []
+    known: dict[tuple[str, datetime], CorporateBond] = {}
+    outputs = list(PRICED_COLUMNS) if given == "auto" else [c for c in PRICED_COLUMNS if c != given]
+    rows, refused = [], []
     for rec in frame.to_dict("records"):
-        isin = str(rec["isin"]).strip()
+        isin = normalise_isin(rec["isin"])
         try:
             if isin not in bonds:
                 try:
@@ -1605,20 +1652,39 @@ def price_corporates(frame: pd.DataFrame, terms: pd.DataFrame, *, schedule: pd.D
                     bonds[isin] = bond
                 except (ValueError, TypeError, NotImplementedError) as exc:
                     bonds[isin] = exc
-            bond = bonds[isin]
-            if isinstance(bond, Exception):
-                raise bond
-            value = rec[column]
-            if value is None or (isinstance(value, float) and math.isnan(value)) or str(value).strip() == "":
-                raise ValueError(f"{column} is missing")
-            rows.append(_price_row(bond, as_date(rec["settlement_date"]), given, float(value), valuation, outputs))
+            base = bonds[isin]
+            if isinstance(base, Exception):
+                raise base
+            s = as_date(rec["settlement_date"])
+            when = _as_of_for(base, rec, s, when_all)
+            if (isin, when) not in known:
+                known[(isin, when)] = base.as_known(when)
+            row_given = given
+            if given == "auto":
+                row_given = "clean_price" if _present(rec.get("clean_price")) else "yield_pct"
+            value = rec.get(row_given if given == "auto" else column)
+            if not _present(value):
+                raise ValueError(f"{row_given if given == 'auto' else column} is missing" if given != "auto"
+                                 else "clean_price and yield_pct are both missing")
+            out = _price_row(known[(isin, when)], base, s, row_given, float(value), valuation, price_basis)
+            rows.append({c: (when if c == "known_as_of" else out[c]) for c in outputs})
+            refused.append(False)
         except (ValueError, TypeError, NotImplementedError) as exc:
             rows.append(dict.fromkeys(outputs, math.nan) | {"error": str(exc)})
+            refused.append(True)
     out = frame.copy()
     computed = pd.DataFrame(rows, columns=outputs, index=frame.index)
     for col in computed:
-        out[col] = computed[col]
+        if col in frame.columns and col != "error":  # a refused row keeps what it was given
+            out[col] = computed[col].where(~pd.Series(refused, index=frame.index), frame[col])
+        else:
+            out[col] = computed[col]
     return out
+
+
+def _present(value) -> bool:
+    return not (value is None or value is pd.NaT or (isinstance(value, float) and math.isnan(value))
+                or str(value).strip() == "")
 
 
 def _workout_price(bond: CorporateBond, s: date, kind: str, when: date) -> float:
@@ -1630,22 +1696,36 @@ def _workout_price(bond: CorporateBond, s: date, kind: str, when: date) -> float
     return prices[(kind, when)]
 
 
-def _price_row(bond: CorporateBond, s: date, given: str, value: float, valuation: str, outputs) -> dict:
-    extra = {"workout_date": bond.maturity, "workout_kind": "maturity", "call_trigger": None, "put_trigger": None}
+def _price_row(bond: CorporateBond, base: CorporateBond, s: date, given: str, value: float, valuation: str,
+               price_basis: str) -> dict:
+    """One row of ``price_corporates``: ``bond`` as known (``base.as_known``), from ``value`` of ``given``."""
+    exercised = bond.maturity != base.maturity
+    kind0 = "maturity"
+    if exercised:
+        done = [o for o in base.options if o.date == bond.maturity and o.exercised]
+        kind0 = f"exercised_{done[0].kind}" if done else "exercised"
+    extra = {"workout_date": bond.maturity, "workout_kind": kind0, "call_trigger": None, "put_trigger": None}
+    f = price_factor(bond, s, price_basis)
+    if given == "clean_price":
+        value *= f
     target = bond
     if valuation == "worst":
         if given == "clean_price":
             w = bond.yield_to_worst(s, value)
-            target = bond.to_workout(w.date, w.price)
+            target, kind = bond.to_workout(w.date, w.price), w.kind
         else:
             _, when, kind = bond.price_to_worst(s, value)
             target = bond.to_workout(when, _workout_price(bond, s, kind, when))
-        extra.update(workout_date=target.maturity, workout_kind=w.kind if given == "clean_price" else kind)
+        extra.update(workout_date=target.maturity, workout_kind=kind0 if kind == "maturity" else kind)
     elif valuation == "sebi":
         if given != "yield_pct":
             raise ValueError("the SEBI valuation works from a yield: pass given='yield_pct'")
         v = bond.sebi_valuation(s, value)
         target = bond.to_workout(v.date, _workout_price(bond, s, v.kind, v.date))
-        extra.update(workout_date=v.date, workout_kind=v.kind, call_trigger=v.call_trigger, put_trigger=v.put_trigger)
+        extra.update(workout_date=v.date, workout_kind=kind0 if v.kind == "maturity" else v.kind,
+                     call_trigger=v.call_trigger, put_trigger=v.put_trigger)
     a = target.analytics(s, **{given: value})
-    return {c: getattr(a, c) for c in ANALYTICS_COLUMNS if c in outputs} | extra | {"error": ""}
+    values = {c: getattr(a, c) for c in ANALYTICS_COLUMNS}
+    for c in ("clean_price", "accrued_interest", "dirty_price", "dv01"):
+        values[c] /= f
+    return values | extra | {"calendar_projected": bond.calendar_projected(s), "error": ""}

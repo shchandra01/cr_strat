@@ -151,9 +151,18 @@ def test_year_fraction_rules_and_refusals():
     assert year_fraction_sebi(a, b, rule="calendar") == pytest.approx(18 / 365 + 165 / 366)
     assert year_fraction_sebi(a, b, rule="fixed365") == pytest.approx(183 / 365)
     assert year_fraction_sebi(a, a, anchor=anchor) == 0.0
-    # A 29 Feb anchor falls on 28 Feb in other years: the year from 28 Feb 2027 to 29 Feb 2028 has 366 days.
-    assert year_fraction_sebi(D(2027, 2, 28), D(2028, 2, 29), anchor=D(2024, 2, 29)) == pytest.approx(1.0)
-    assert year_fraction_sebi(D(2024, 2, 29), D(2025, 2, 28), anchor=D(2024, 2, 29)) == pytest.approx(1.0)
+    # A 29 Feb anchor falls on 28 Feb in common years. SEBI 2016 para 3(b) counts 366 days for the year holding 29
+    # Feb: 29 Feb 2024 - 28 Feb 2025 (365 days) holds one, 28 Feb 2027 - 29 Feb 2028 (366 days) holds none.
+    # (UNVERIFIED reading; the build counted each year's own length, 1.0 for both.)
+    assert year_fraction_sebi(D(2027, 2, 28), D(2028, 2, 29), anchor=D(2024, 2, 29)) == pytest.approx(366 / 365)
+    assert year_fraction_sebi(D(2024, 2, 29), D(2025, 2, 28), anchor=D(2024, 2, 29)) == pytest.approx(365 / 366)
+    # the half-years of a semi-annual bond allotted on 29 Feb 2024 (the math review's case)
+    leap = CorporateBond(10.0, D(2029, 2, 28), D(2024, 2, 29), frequency=2)
+    amounts = {p.due: round(p.amount, 6) for p in leap.periods()}
+    assert amounts[D(2024, 8, 29)] == 4.972678  # 182 / 366
+    assert amounts[D(2027, 8, 29)] == 4.986301  # 182 / 365
+    for anchor_ in (D(2023, 3, 1), D(2023, 2, 28), D(2024, 1, 15)):  # other anchors: unchanged, a year's length
+        assert year_fraction_sebi(anchor_, anchor_.replace(year=anchor_.year + 1), anchor=anchor_) == 1.0
     # Additive over a split point, every rule.
     for rule in ("anniversary", "calendar", "fixed365"):
         whole = year_fraction_sebi(D(2023, 3, 5), D(2026, 9, 9), rule=rule, anchor=anchor)
@@ -507,7 +516,10 @@ def test_workouts_drop_options_past_their_record_date():
     assert [w[1] for w in bond.workouts(D(2028, 1, 1))][0] == D(2029, 1, 15)  # the put's record date has passed
     declined = _callable(options=(CallPut("call", D(2029, 1, 15), exercised=False,
                                           exercised_public_from="2028-12-01"),))
-    assert [w[0] for w in declined.workouts(D(2027, 1, 15))] == ["maturity"]
+    # a decision not to call is used only from when it was public (the build dropped the call at any date)
+    assert [w[0] for w in declined.workouts(D(2027, 1, 15))] == ["call", "maturity"]  # no as_of: no decision used
+    assert [w[0] for w in declined.workouts(D(2027, 1, 15), as_of="2027-01-14T00:00")] == ["call", "maturity"]
+    assert [w[0] for w in declined.workouts(D(2028, 12, 5), as_of="2028-12-02T00:00")] == ["maturity"]
 
 
 def test_sebi_valuation_rule():
@@ -763,9 +775,12 @@ def test_price_corporates_batch_and_determinism():
     again = price_corporates(prices, shuffled, options=OPTIONS.iloc[::-1], amortisation=AMORT, given="yield_pct",
                              valuation="sebi")
     assert again.to_csv(index=False) == sebi.to_csv(index=False)
+    from cr_strat.corporates import _price_row
     with pytest.raises(ValueError, match="SEBI valuation works from a yield"):
-        from cr_strat.corporates import _price_row
-        _price_row(_callable(), D(2027, 1, 15), "clean_price", 100.0, "sebi", PRICED_COLUMNS)
+        _price_row(_callable(), _callable(), D(2027, 1, 15), "clean_price", 100.0, "sebi", "original")
+    from_price = price_corporates(pd.DataFrame([{"isin": "INE000X01011", "settlement_date": "2027-01-15",
+                                                 "clean_price": 100.0}]), TERMS, options=OPTIONS, valuation="sebi")
+    assert "SEBI valuation works from a yield" in from_price["error"].iloc[0]
 
 
 def test_same_inputs_same_bytes():

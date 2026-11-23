@@ -43,11 +43,14 @@ def test_spec_vector_t19_readings(isin):
     out = tr.check_trade_yields(frame, terms(t17))
     assert list(out.columns) == [*frame.columns, *tr.CHECK_COLUMNS]
     pd.testing.assert_frame_equal(out[list(frame.columns)], frame)  # the trades' own columns are untouched
-    assert out["recomputed_yield_pct"].tolist() == pytest.approx([8.2612262724] * 4, abs=1e-9)
-    assert out["standard_diff_bp"].tolist() == pytest.approx([0.0, 0.503979, 256.9724, -16.3916], abs=1e-4)
+    # the third print's yield matches only with its price read as dirty: its recomputed yield reads it so (the build
+    # kept the clean reading, 8.2612262724, and called the print ok)
+    assert out["recomputed_yield_pct"].tolist() == pytest.approx([8.2612262724] * 2 + [10.8309501599]
+                                                                 + [8.2612262724], abs=1e-9)
+    assert out["standard_diff_bp"].tolist() == pytest.approx([0.0, 0.503979, 0.0, -16.3916], abs=1e-4)
     assert out["nearest_reading"].tolist()[:3] == ["clean/due dates/maturity", "clean/payment dates/maturity",
                                                    "dirty/due dates/maturity"]
-    assert out["yield_check"].tolist() == ["ok", "ok", "ok", "mismatch"]  # a semi-annual yield is no reading
+    assert out["yield_check"].tolist() == ["ok", "ok", "dirty_price", "mismatch"]  # a semi-annual yield is no reading
     assert out["yield_diff_bp"].iloc[3] == pytest.approx(-16.3916, abs=1e-4)
     loose = tr.check_trade_yields(frame, terms(t17), tolerance_bp=20.0)
     assert loose["yield_check"].iloc[3] == "ok"
