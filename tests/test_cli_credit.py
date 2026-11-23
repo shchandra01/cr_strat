@@ -261,6 +261,12 @@ def test_corp_price_prices_mixed_rows_and_fails_when_nothing_is_priced(tmp_path,
     assert out["error"].fillna("").tolist() == ["", ""]
     assert out["clean_price"].tolist() == pytest.approx([T17_CLEAN] * 2, abs=1e-8)
     assert "2 of 2 rows priced" in capsys.readouterr().out
+    written = pd.read_csv(tmp_path / "o.csv", dtype=str, keep_default_na=False)
+    assert (written["clean_price"].iloc[0], written["yield_pct"].iloc[1]) == (str(T17_CLEAN), "8.2612262724")
+    exact = _csv(tmp_path / "e.csv", [{"isin": t17, "settlement_date": "2026-11-16", "clean_price": 102.25}])
+    assert main(["corp-price", "--terms", terms, "--prices", exact, "--out", str(tmp_path / "e_out.csv")]) == 0
+    written = pd.read_csv(tmp_path / "e_out.csv", dtype=str, keep_default_na=False)
+    assert written["clean_price"].tolist() == ["102.25"]  # as given, not 102.24999999999994 from the solved yield
     refused = _csv(tmp_path / "r.csv", [{"isin": isin("INE000NOT01"), "settlement_date": "2026-11-16",
                                          "clean_price": 100}])
     assert main(["corp-price", "--terms", terms, "--prices", refused, "--out", str(tmp_path / "x.csv")]) == 1
@@ -290,3 +296,21 @@ def test_frb_coupons_command(tmp_path, capsys):
     capsys.readouterr()
     forward = pd.read_csv(out_path).set_index("period_start")
     assert forward.loc["2027-06-07", "public_from_source"] == "forward"
+
+
+def test_frb_coupons_forward_every_frb(tmp_path, capsys):
+    # --projection forward over every shipped FRB: the T-bill FRBs forward, FRB 2035 (five-year G-sec index) flat on
+    # its announced coupon, as in a flat run, and the run says so (it was refused for FRB 2035)
+    nss = _csv(tmp_path / "nss.csv", [rt.nss_params_row(CURVE, date(2026, 11, 13))])
+    both = ["frb-coupons", "--as-of", "2026-11-19T20:00"]
+    assert main([*both, "--projection", "forward", "--nss-params", nss, "--out", str(tmp_path / "f.csv")]) == 0
+    assert "IN0020042050 projected flat, not forward" in capsys.readouterr().out
+    assert main([*both, "--out", str(tmp_path / "flat.csv")]) == 0
+    forward, flat = pd.read_csv(tmp_path / "f.csv"), pd.read_csv(tmp_path / "flat.csv")
+    assert set(forward["isin"]) == set(flat["isin"]) and len(forward) == len(flat) == 156
+    f35 = forward[forward["isin"] == "IN0020042050"].reset_index(drop=True)
+    pd.testing.assert_frame_equal(f35, flat[flat["isin"] == "IN0020042050"].reset_index(drop=True))
+    assert f35.loc[f35["period_start"] == "2030-01-25", ["rate_pct", "public_from_source"]].values.tolist() == [
+        [6.66, "announced_base"]]
+    sources = forward[forward["isin"] != "IN0020042050"].groupby("isin")["public_from_source"].apply(set)
+    assert all("forward" in s for s in sources)

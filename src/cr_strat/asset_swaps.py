@@ -516,8 +516,9 @@ def asset_swap_table(frame: pd.DataFrame, curve, settlement=None, *, terms=None,
                     raise ValueError(f"maturity_date {rec['maturity_date']} differs from the terms' {base.maturity}")
                 if not _blank(rec.get("coupon_pct")) and abs(float(rec["coupon_pct"]) - base.coupon_pct) > 1e-9:
                     raise ValueError(f"coupon_pct {rec['coupon_pct']} differs from the terms' {base.coupon_pct:g}")
-                if not _blank(rec.get("kind")) and str(rec["kind"]).strip().lower() != "corporate":
-                    raise ValueError(f"kind {rec['kind']!r} differs from the terms: {isin} is a corporate bond there")
+                if not _blank(rec.get("kind")) and str(rec["kind"]).strip().lower() not in ("corporate", row["kind"]):
+                    raise ValueError(f"kind {rec['kind']!r} differs from the terms: {isin} is of kind {row['kind']!r} "
+                                     "there (give 'corporate', the terms' kind or a blank)")
                 out["maturity_date"] = base.maturity
             elif "maturity_date" not in rec:
                 raise ValueError("maturity_date is missing (and the ISIN is not in the corporate terms)")

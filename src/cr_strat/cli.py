@@ -1253,10 +1253,17 @@ def _frb_coupons(args: argparse.Namespace) -> int:
         tbills = _tbill_results(args, store=args.store)
         announced = None if args.no_frb_coupons else (args.frb_coupons or FRB_COUPONS_CSV)
         curve = _projection_curve(args)
-        tables = [goi_frb_rates(row, tbills, announced, as_of=as_of, allow_fewer=args.frb_allow_fewer,
-                                allow_stale=args.frb_allow_stale, projection=args.projection,
-                                curve=curve if row["index"] != "gsec5y_reset5y" else None)
-                  for row in terms.to_dict("records")]
+        tables, flat_only = [], []
+        for row in terms.to_dict("records"):
+            # a forward projection is a T-bill forward rate: an FRB on another index (FRB 2035's five-year G-sec
+            # yield) keeps the flat projection on its announced coupon, and the run says so
+            tbill = row["index"] != "gsec5y_reset5y"
+            if args.projection == "forward" and not tbill:
+                flat_only.append(row["isin"])
+            tables.append(goi_frb_rates(row, tbills, announced, as_of=as_of, allow_fewer=args.frb_allow_fewer,
+                                        allow_stale=args.frb_allow_stale,
+                                        projection=args.projection if tbill else "flat",
+                                        curve=curve if tbill else None))
         rates = pd.concat(tables, ignore_index=True) if tables else pd.DataFrame(columns=list(FRB_RATE_COLUMNS))
     except (ValueError, TypeError, NotImplementedError, FileNotFoundError) as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -1266,6 +1273,8 @@ def _frb_coupons(args: argparse.Namespace) -> int:
     print(f"{len(terms)} GoI FRBs, {len(rates)} coupon periods as known at {as_of_text}: "
           + ", ".join(f"{k} {int(counts.get(k, 0))}" for k in ("announced", "computed", "projected", "unfixed",
                                                                "unknown")))
+    if flat_only:
+        print(f"note: {', '.join(flat_only)} projected flat, not forward (its index is not a 182-day T-bill yield)")
     return 0
 
 
@@ -1896,7 +1905,8 @@ def _known_args(p: argparse.ArgumentParser, *, basis: str = "original") -> None:
 def _projection_args(p: argparse.ArgumentParser) -> None:
     """``--projection`` of FRB coupons and the curve of a forward projection."""
     p.add_argument("--projection", choices=PROJECTIONS, default="flat",
-                   help="coupons still to be fixed: flat at the latest base (default) or forward from a curve")
+                   help="coupons still to be fixed: flat at the latest base (default) or forward from a curve (T-bill "
+                        "FRBs; frb-coupons projects FRB 2035 flat, frb-price refuses it)")
     p.add_argument("--nss-params", help="with --projection forward: NSS curves CSV (curve-fit --nss-params)")
     p.add_argument("--curve", default="gsec", help="the curve's name in --nss-params (default gsec)")
     p.add_argument("--curve-date", help="the curve's mark date (needed when --nss-params holds several)")

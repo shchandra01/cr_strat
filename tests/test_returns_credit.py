@@ -386,7 +386,73 @@ def test_an_frb_coupon_projected_to_its_end_is_paid():
         _frb2031_run(load_frb_coupons())
     stale = _frb2031_run(load_frb_coupons(), st=settings(costs=NOCOST, frb_allow_stale=True))
     assert_identity(stale)
-    assert stale.positions.set_index("date")["notes"].loc[date(2026, 12, 8)] == "coupon 6.5200% projected"
+    assert stale.positions.set_index("date")["notes"].loc[date(2026, 12, 8)] == (
+        "coupon 6.5200% projected from the coupon announced for 2025-12-07, more than a period old (frb_allow_stale)")
+
+
+def test_an_frb_book_that_would_stop_at_its_reset_is_refused_before_the_run(monkeypatch):
+    """The verifier's book: FRB 2031 on the shipped coupons and no T-bill results ran from 20 Nov and stopped on
+    7 Dec at 20:00 (its new coupon's only base, the Dec 2025 coupon, too old), returning nothing. It is refused before
+    any day is valued, naming the periods, the day and the remedy; a book that sells before the reset still runs."""
+    from cr_strat.floating import load_frb_coupons
+
+    valued = []
+    day = rt._Engine._day
+    monkeypatch.setattr(rt._Engine, "_day", lambda self, d, p: (valued.append(d), day(self, d, p))[1])
+    with pytest.raises(ValueError) as refused:
+        _frb2031_run(load_frb_coupons())
+    text = str(refused.value)
+    assert valued == []
+    assert text.startswith(f"{FRB_ISIN}: the coupon of the period from 2026-12-07 is not known at 2026-12-07 20:00")
+    stop = "refused before the run, which would stop on 2026-12-07 (the trades hold or trade IN0020180041"
+    for part in ("too old to project from", "nor those of the 9 period(s) after it (to 2031-12-07)",
+                 "MarketData.frb_coupons", "frb_allow_stale=True", f"{stop} from 2026-11-20 to 2026-12-11)"):
+        assert part in text
+    days = CAL.business_days(date(2026, 11, 20), date(2026, 12, 11))
+    marks = pd.DataFrame([{"date": d, "isin": FRB_ISIN, "clean_price": 100.0} for d in days])
+    sold = run([trade("F1", "frb", "buy", "2026-11-20", isin=FRB_ISIN, kind="frb"),
+                trade("F2", "frb", "sell", "2026-12-01", isin=FRB_ISIN, kind="frb")], ("frb",), marks=marks, terms=(),
+               frb_coupons=load_frb_coupons(), end=days[-1])
+    assert_identity(sold)
+    assert sold.nav["date"].max() == date(2026, 12, 11) and sold.positions["date"].max() == date(2026, 12, 1)
+
+
+def test_a_stale_frb_projection_is_flagged_in_the_engine():
+    """With frb_allow_stale FRB 2028's coupon in Jan 2026 stands on the coupon announced for Oct 2021 (4.04%): the
+    positions and the run said only 'projected', the stale base stayed inside floating.goi_frb_rates."""
+    isin = "IN0020210160"
+    days = CAL.business_days(date(2026, 1, 5), date(2026, 1, 30))
+    marks = pd.DataFrame([{"date": d, "isin": isin, "clean_price": 100.0} for d in days])
+    res = rt.run_book([trade("F1", "frb", "buy", "2026-01-05", isin=isin, kind="frb")],
+                      flows=capital(("frb",), day="2026-01-05"), market=rt.MarketData(marks=marks),
+                      settings=settings(costs=NOCOST, frb_allow_stale=True), end=days[-1])
+    assert_identity(res)
+    notes = res.positions.set_index("date")["notes"]
+    assert notes.loc[date(2026, 1, 6)] == ("coupon 4.0400% projected from the coupon announced for 2021-10-04, more "
+                                           "than a period old (frb_allow_stale)")
+    assert sum("from 2026-01-06 its current coupon stood on the coupon announced for 2021-10-04, more than a period "
+               "old" in n for n in res.notes) == 1
+    assert res.lines("frb")["accrual"].sum() == pytest.approx(269333.33, abs=0.01)  # the values are unchanged
+    fresh = frb_run(frb_tbills())  # a fresh projection keeps its note
+    assert not any("stood on" in n for n in fresh.notes)
+
+
+def test_frb_2035s_rate_risk_sits_at_its_next_reset():
+    """FRB 2035 resets every five years (next on 25 Jan 2030): the engine put its rate DV01 in the bucket of its next
+    coupon date (25 Jan 2027, 0-1y) instead of its next reset (3-5y). FRB 2031's next reset is its next coupon."""
+    isin = "IN0020042050"
+    days = CAL.business_days(date(2026, 11, 19), date(2026, 11, 27))
+    marks = pd.DataFrame([{"date": d, "isin": isin, "clean_price": 100.0} for d in days])
+    res = run([trade("T1", "b", "buy", "2026-11-19", isin=isin, kind="frb", price=100.0)], ("b",), marks=marks,
+              terms=(), end=days[-1])
+    assert_identity(res)
+    pos = res.positions.set_index("date").loc[date(2026, 11, 25)]
+    assert rt.tenor_bucket(date(2030, 1, 25), date(2026, 11, 25)) == "3-5y"
+    assert (pos["bucket"], round(float(pos["dv01"]), 1)) == ("3-5y", 28133.0)
+    nav = res.nav.set_index("date").loc[date(2026, 11, 25)]
+    assert nav["dv01_3-5y"] == pytest.approx(pos["dv01"]) and nav["dv01_0-1y"] == 0.0
+    frb31 = frb_run(frb_tbills()).positions.set_index("date").loc[date(2026, 11, 26)]
+    assert frb31["bucket"] == "0-1y"  # 7 Dec 2026
 
 
 def _called(notice: str, record_date: str = ""):

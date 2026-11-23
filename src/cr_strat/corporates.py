@@ -1629,8 +1629,9 @@ def price_corporates(frame: pd.DataFrame, terms: pd.DataFrame, *, schedule: pd.D
     basis of given and returned prices, accrued interest and DV01, ``original`` (per 100 original face, the
     pricer's own) or ``outstanding`` (per 100 of the face outstanding at settlement). A row that cannot be priced
     keeps its input values, NaN in the other outputs and the reason in ``error``; for the rows priced, results
-    replace columns of the same name. ``calendar_projected``: a payment or record date ahead falls in a year the
-    payment calendar's holiday list does not cover (rolled on weekends only).
+    replace columns of the same name, except the quantity each row was priced from (with ``auto`` too: its clean
+    price, or its yield), which stays as given. ``calendar_projected``: a payment or record date ahead falls in a
+    year the payment calendar's holiday list does not cover (rolled on weekends only).
     """
     if given not in ("clean_price", "yield_pct", "auto"):
         raise ValueError("given must be 'clean_price', 'yield_pct' or 'auto'")
@@ -1658,7 +1659,7 @@ def price_corporates(frame: pd.DataFrame, terms: pd.DataFrame, *, schedule: pd.D
     bonds: dict[str, CorporateBond | Exception] = {}
     known: dict[tuple[str, datetime], CorporateBond] = {}
     outputs = list(PRICED_COLUMNS) if given == "auto" else [c for c in PRICED_COLUMNS if c != given]
-    rows, refused = [], []
+    rows, refused, givens = [], [], []  # givens: the column each row was priced from (kept as given)
     for rec in frame.to_dict("records"):
         isin = normalise_isin(rec["isin"])
         try:
@@ -1693,14 +1694,20 @@ def price_corporates(frame: pd.DataFrame, terms: pd.DataFrame, *, schedule: pd.D
             out = _price_row(known[(isin, when)], base, s, row_given, float(value), valuation, price_basis)
             rows.append({c: (when if c == "known_as_of" else out[c]) for c in outputs})
             refused.append(False)
+            givens.append(row_given)
         except (ValueError, TypeError, NotImplementedError) as exc:
             rows.append(dict.fromkeys(outputs, math.nan) | {"error": str(exc)})
             refused.append(True)
+            givens.append(None)
     out = frame.copy()
     computed = pd.DataFrame(rows, columns=outputs, index=frame.index)
+    given_by_row = pd.Series(givens, index=frame.index, dtype=object)
     for col in computed:
-        if col in frame.columns and col != "error":  # a refused row keeps what it was given
-            out[col] = computed[col].where(~pd.Series(refused, index=frame.index), frame[col])
+        if col in frame.columns and col != "error":
+            # a refused row keeps what it was given, a priced one the quantity it was priced from (``auto``: its
+            # own clean price or yield, not the round trip through the solved yield)
+            keep = pd.Series(refused, index=frame.index) | (given_by_row == col)
+            out[col] = computed[col].where(~keep, frame[col])
         else:
             out[col] = computed[col]
     return out

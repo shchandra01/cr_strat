@@ -50,9 +50,13 @@ refused before the run, naming the remedy: the option's ``record_date``); an FRB
 knows it (announced, computed from the three latest 182-day T-bill results public by then and dated before its fixing
 day, or projected flat and noted; a period that ends with its coupon still projected keeps that rate, so its coupon is
 paid at what was accrued, flagged ``unfixed``; a period it cannot project, from fewer than three results or from a base
-more than a period old, is refused, naming why, unless ``frb_allow_fewer`` or ``frb_allow_stale``). When the bond as
-known changes, the previous close's mark is restated on it (its yield from the same clean price) and the interest
-accrued to that close is restated at the new coupon in the ``coupon_reset`` line, ``F/100 (AI_new(prev) -
+more than a period old, is refused, naming why, unless ``frb_allow_fewer`` or ``frb_allow_stale``, whose stale base or
+proxy ``positions.notes`` and the run's notes name). For ``run_book`` that refusal comes before the run: each FRB of
+the trades is taken as known at every valuation time it is held or pending (``_check_frb_coupons``), as the run will
+take it, so a book that would stop at a reset is refused up front with the periods, the day and the remedy (a
+back-test's own FRB orders are checked as the run reaches them). When the bond as known changes, the previous close's
+mark is restated on it (its yield from the same clean price) and the interest accrued to that close is restated at the
+new coupon in the ``coupon_reset`` line, ``F/100 (AI_new(prev) -
 AI_old(prev))``, nonzero only when a coupon becomes known after its period began (a fixing or rating action published
 late). A corporate coupon goes to the holder at the close of its record date (``CorporateBond.record_date``: 15 days
 before the due date under the SEBI conventions of ``corporates``, a holiday moved to the preceding day; at the latest
@@ -77,9 +81,10 @@ in the user's haircut table a corporate bond is lent against in corporate bond r
 repo on 13 and 16 Nov 2026; UNVERIFIED that a fund pays the segment's average), an FRB in market repo
 (``excess_segment``), without one not at all (equity-funded). Risk: an FRB's ``dv01`` in positions, the tenor buckets
 (at its next reset) and the hedge check is its rate DV01 (``floating.index_dv01``, the margin held), not its yield DV01,
-which is its spread DV01 and some hundred times larger. Attribution: a corporate bond's yield moves against the G-sec
-curve (``rich_cheap`` is its spread's change); an FRB has no default reference curve, so its price move is
-``price_unattributed``.
+which is its spread DV01 and some hundred times larger; its bucket is that of ``floating.next_reset``, the first
+period whose coupon is still projected (FRB 2035's next five-yearly reset, not its next coupon date). Attribution: a
+corporate bond's yield moves against the G-sec curve (``rich_cheap`` is its spread's change); an FRB has no default
+reference curve, so its price move is ``price_unattributed``.
 
 **Attribution** (A2). For each position and day, market lines on the start-of-day book from close to close: ``accrual``
 (accrued interest gained plus coupons entitled), ``pull_to_par`` (``F/100 (clean(y0, s_d) - clean(y0, s_prev))``), and
@@ -222,6 +227,7 @@ from cr_strat.floating import (
     index_dv01,
     load_frb_coupons,
     load_frb_terms,
+    next_reset,
     rate_steps,
     read_fixings,
     read_floating_terms,
@@ -612,7 +618,8 @@ class EngineSettings:
     ``frb_allow_fewer``: project a GoI FRB's coupons from fewer than three public T-bill results (flagged), as
     ``floating.goi_frb_rates`` allows; otherwise such a projection is refused and the coupon stays unknown.
     ``frb_allow_stale``: project from a base more than one period old (a coupon announced long before, T-bill
-    results after a passed fixing day: flagged); otherwise refused, with the missing coupons named.
+    results after a passed fixing day: flagged in ``positions.notes`` and the run's notes, which name the base);
+    otherwise refused, with the missing coupons named, before the run for the trades of ``run_book``.
     """
 
     access: AccessPolicy
@@ -2059,6 +2066,9 @@ class _Engine:
         self._period_cache: dict[tuple[str, int], tuple] = {}
         self._base_maturity: dict[str, date] = {}
         self.frb_projected: dict[str, date] = {}  # FRBs held while their current coupon was projected: first day
+        self.frb_stale: dict[str, tuple[date, str]] = {}  # FRBs whose current coupon stood on a stale base or proxy
+        self._known_memo: dict[tuple[str, datetime], Any] = {}  # each FRB as known at a time: checked, then reused
+        self._known_last: dict[str, Any] = {}  # the latest FRB as known, by ISIN (equal ones share one object)
         self.instruments: dict[str, Instrument] = {}
         self.books: dict[str, _Book] = {}
         self.trades = self._prepare_trades(read_trades(trades) if trades is not None else None)
@@ -2204,11 +2214,13 @@ class _Engine:
             gaps = rates[rates["rate_pct"].isna() & (rates["period_end"] >= t.date())]
             if not gaps.empty:
                 first = gaps.iloc[0]
+                more = (f", nor those of the {len(gaps) - 1} period(s) after it (to {gaps['period_end'].iloc[-1]})"
+                        if len(gaps) > 1 else "")
                 raise ValueError(f"{isin}: the coupon of the period from {first['period_start']} is not known at "
-                                 f"{t:%Y-%m-%d %H:%M} and cannot be projected ({first['notes']}): give the announced "
-                                 "coupons (MarketData.frb_coupons) or the 182-day T-bill results (MarketData.tbills), "
-                                 "or EngineSettings(frb_allow_fewer=True) for fewer results, frb_allow_stale=True for "
-                                 "an old base")
+                                 f"{t:%Y-%m-%d %H:%M} and cannot be projected ({first['notes']}){more}: give the "
+                                 "announced coupons (MarketData.frb_coupons) or the 182-day T-bill results "
+                                 "(MarketData.tbills), or EngineSettings(frb_allow_fewer=True) for fewer results, "
+                                 "frb_allow_stale=True for an old base")
             return goi_frb_bond(row, rates)
 
         try:
@@ -2219,11 +2231,72 @@ class _Engine:
                           issue_date=unit.issue_date, conventions=unit.conventions, known=known)
 
     def _bond_known(self, inst: Instrument, t: datetime) -> Any:
+        """The bond as known at ``t``. A GoI FRB's is kept (``_check_frb_coupons`` asks for every day of the run
+        before it starts, the run asks again): equal bonds as known share one object, so the memo stays small."""
+        key = (inst.isin, t)
+        if inst.kind == "frb" and key in self._known_memo:
+            return self._known_memo[key]
         try:
-            return inst.known(t)
+            bond = inst.known(t)
         except (ValueError, NotImplementedError) as exc:
             text = str(exc)
             raise ValueError(text if text.startswith(inst.isin) else f"{inst.isin}: {text}") from None
+        if inst.kind == "frb":
+            last = self._known_last.get(inst.isin)
+            if last is not None and bond == last and bond.bases == last.bases:
+                bond = last
+            self._known_last[inst.isin] = bond
+            self._known_memo[key] = bond
+        return bond
+
+    def _frb_windows(self, days: list[date]) -> dict[str, list[date]]:
+        """The days of ``days`` on which the run asks for each GoI FRB of the trades as known: while a trade in it is
+        pending (its trade date to its settlement) or a book holds it (from a settlement to the settlement that
+        closes it, or to its maturity), as ``_refresh_known`` asks."""
+        rows: dict[str, list[dict]] = {}
+        for day_rows in self.trades.values():
+            for trade in day_rows:
+                inst = self.instruments.get(trade["isin"])
+                if inst is not None and inst.kind == "frb":
+                    rows.setdefault(trade["isin"], []).append(trade)
+        out: dict[str, list[date]] = {}
+        for isin, trades in sorted(rows.items()):
+            maturity = self.instruments[isin].maturity
+            settles = sorted(trades, key=lambda r: (r["settlement"], r["trade_id"]))
+            spans = [(r["trade_date"], r["settlement"]) for r in trades]
+            held: dict[str, float] = {}
+            k, wanted = 0, []
+            for d in days:
+                if d > maturity:
+                    break
+                while k < len(settles) and settles[k]["settlement"] < d:
+                    r = settles[k]
+                    held[r["book"]] = held.get(r["book"], 0.0) + r["side"] * r["face"]
+                    k += 1
+                if any(abs(v) >= 1e-6 for v in held.values()) or any(a <= d <= b for a, b in spans):
+                    wanted.append(d)
+            if wanted:
+                out[isin] = wanted
+        return out
+
+    def _check_frb_coupons(self, days: list[date]) -> None:
+        """Refuse before the run a GoI FRB whose coupons the run will need but cannot know: each FRB of the trades is
+        taken as known at the valuation time of every day it is held or pending (``_frb_windows``), as the run will
+        take it, and the first time a coupon it needs is unknown is named, with the periods and the remedy (the run
+        stopped there, at its next reset say, and returned nothing). A back-test's own FRB orders are checked as the
+        run reaches them."""
+        problems = []
+        for isin, window in self._frb_windows(days).items():
+            inst = self.instruments[isin]
+            for d in window:
+                try:
+                    self._bond_known(inst, _at(d, self.settings.valuation_time))
+                except ValueError as exc:
+                    problems.append(f"{exc}; refused before the run, which would stop on {d} (the trades hold or "
+                                    f"trade {isin} from {window[0]} to {window[-1]})")
+                    break
+        if problems:
+            raise ValueError(" | ".join(problems))
 
     def _refresh_known(self, t: datetime) -> None:
         """Rebuild each corporate bond and FRB the books hold, wait for or trade today as known at ``t``; a bond whose
@@ -2238,6 +2311,9 @@ class _Engine:
                 continue
             bond = self._bond_known(inst, t)
             if bond == inst.bond:
+                if isinstance(bond, GoiFloatingRateBond) and bond.bases != inst.bond.bases:
+                    # the same rates on another footing (a base gone stale, say): the notes follow, the values not
+                    self.instruments[isin] = replace(inst, bond=bond, paying=replace(bond, calendar=self.calendar))
                 continue
             paying = replace(bond, calendar=self.calendar) if isinstance(bond, GoiFloatingRateBond) else bond
             new = replace(inst, bond=bond, paying=paying, maturity=bond.maturity, version=inst.version + 1)
@@ -2745,6 +2821,7 @@ class _Engine:
         days = self.calendar.business_days(s, e)
         if not days:
             raise ValueError(f"no Mumbai business day from {s} to {e}")
+        self._check_frb_coupons(days)
         prev = None
         for d in days:
             self._day(d, prev)
@@ -2781,6 +2858,10 @@ class _Engine:
         for isin, first in sorted(self.frb_projected.items()):
             self.notes.append(f"FRB {isin}: its current coupon was projected, not announced or computed, from {first} "
                               "(UNVERIFIED flat projection: floating.goi_frb_rates; positions.notes per day)")
+        for isin, (first, base) in sorted(self.frb_stale.items()):
+            self.notes.append(f"FRB {isin}: from {first} its current coupon stood on {base}, a proxy that "
+                              "EngineSettings(frb_allow_stale=True) allows: its accrual and price rest on it "
+                              "(positions.notes per day)")
         if self.static_buckets:
             self.notes.append(f"costs: {', '.join(sorted(self.static_buckets))} took the terms' static rating_bucket "
                               "for their half spread (no rating action public before the trade in MarketData.ratings): "
@@ -4013,12 +4094,14 @@ class _Engine:
     def _rate_risk(self, inst: Instrument, y: float, s: date, units: float, d: date) -> tuple[float, str]:
         """(rupee DV01, tenor bucket) of ``units`` x 100 face: the bond's yield DV01 in its maturity's bucket; for a
         GoI FRB its rate (index) DV01, ``floating.index_dv01`` with the margin held (the projected coupons move with
-        the index, the current one does not), in the bucket of its next reset, where that risk sits. The FRB's yield
+        the index, the current one does not), in the bucket of its next reset, where that risk sits
+        (``floating.next_reset``: the first period whose coupon is still projected; FRB 2035's next five-yearly
+        reset, not its next coupon date). The FRB's yield
         DV01 is its spread DV01 (``floating.spread_dv01``), some hundred times larger, and hedges nothing an OIS
         does: it stays out of ``dv01``, the buckets and the hedge check."""
         if isinstance(inst.bond, GoiFloatingRateBond):
             dv01 = units * index_dv01(inst.bond, s, 0.0, index_pct=y)
-            return dv01, tenor_bucket(inst.bond.next_coupon_date(s), d)
+            return dv01, tenor_bucket(next_reset(inst.bond, s), d)
         return units * inst.bond.dv01(y, s), tenor_bucket(inst.maturity, d)
 
     def _terms_note(self, inst: Instrument, mark: MarkState) -> str:
@@ -4028,9 +4111,13 @@ class _Engine:
         bond, s, notes = inst.bond, mark.settlement, []
         if isinstance(bond, GoiFloatingRateBond):  # the coupon accruing on the position's date
             status = bond.rate_status(mark.date)
-            notes.append(f"coupon {bond.coupon_rate(mark.date):.4f}% {status}")
+            stale = bond.rate_basis(mark.date)[1]
+            notes.append(f"coupon {bond.coupon_rate(mark.date):.4f}% {status}"
+                         + (f" from {stale} (frb_allow_stale)" if stale else ""))
             if status == "projected":
                 self.frb_projected.setdefault(inst.isin, mark.date)
+            if stale:
+                self.frb_stale.setdefault(inst.isin, (mark.date, stale))
             return "; ".join(notes)
         if bond.is_ex_interest(s):
             notes.append(f"the mark's settlement {s} is ex-interest")

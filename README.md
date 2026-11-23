@@ -243,7 +243,8 @@ the pressure variable and the price response for each event.
   refused unless allowed. The shipped coupon table is thin: of the half-years begun by 19 Nov 2026 it holds
   FRB 2028's coupons for 2 of 11, FRB 2031's for 3 of 18, FRB 2033's for 3 of 14 and FRB 2034's for 7 of 12,
   and the saved T-bill data hold one 182-day result, so most past periods are `unknown` (or, with
-  `--frb-allow-stale`, projected from an old base and flagged) and the current coupons are projected: a
+  `--frb-allow-stale`, projected from an old base and flagged: `stale_base` in `frb-coupons`, the positions'
+  and the run's notes in `returns`) and the current coupons are projected: a
   back-test needs RBI's coupon history typed in, or the 182-day results the RBI store collects from its first
   poll (RBI grants no reuse licence: ask, `docs/data_enquiries.md` letter 3). Not built: FRB DV01 in the
   event ledger, a parser for RBI's FRB coupon releases, AT1 coupon discretion, partial exercises, irregular
@@ -258,7 +259,9 @@ the pressure variable and the price response for each event.
   taken as ineligible for TREPS (corporate bonds are not on CCIL's list), so with a haircut row of yours a
   corporate bond is funded in corporate bond repo (the RBI store's segment, 15 bp over G-sec market repo on 13
   and 16 Nov 2026) and an FRB in market repo, else not at all; an FRB's engine DV01 is its rate DV01 (the
-  spread DV01 is not reported there); no default reference curve for an FRB (its price move stays
+  spread DV01 is not reported there), bucketed at its next reset (FRB 2035's five-yearly one); a `run_book`
+  whose FRB coupons cannot all be known while it holds them is refused before the run (a back-test's own FRB
+  orders are checked as it reaches them); no default reference curve for an FRB (its price move stays
   unattributed). Not modelled: a corporate bond's default or missed payment, a partial call or put, a
   `frb_corp` bond with rating steps as well. Not built: S8's new-issue half (no loader for the electronic
   bidding platform's results, no new-issue concession measure). Before real use they need licensed data:

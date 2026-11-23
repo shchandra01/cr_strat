@@ -772,8 +772,10 @@ during the trade day counts from the next day (UNVERIFIED, conservative: a trade
 `--price-basis` reads a partly redeemed bond's prices per 100 of its original face (the default of `corp-price`,
 `credit-spreads` and `asset-swaps`, and of the engine's marks) or of the face still outstanding (the default of
 `trade-check` and `price-panel`, whose prints come from exchanges: UNVERIFIED). A payment or record date beyond the
-holiday list, rolled on weekends only, is flagged (`calendar_projected`) and warned of. Each command exits 1 when no row
-could be measured (`corp-price --prices` too), 2 on bad input or a missing file; the same inputs give the same bytes.
+holiday list, rolled on weekends only, is flagged (`calendar_projected`) and warned of. `corp-price --prices` prices
+each row from its clean price, else its yield, and keeps that input as given (after the first review it wrote back the
+clean price through the solved yield: 100 as 99.99999999999999). Each command exits 1 when no row could be measured
+(`corp-price --prices` too), 2 on bad input or a missing file; the same inputs give the same bytes.
 
 **Asset swaps of corporate bonds.** The measures are the G-sec ones (yield-yield, par-par, proceeds and z-spread,
 [Method](#method-1)), on the flows a buyer settling that day receives: a settlement after a record date leaves the
@@ -801,10 +803,12 @@ dated before the fixing day, once the last of them is within a week of that day 
 of thumb from the weekly auction calendar, UNVERIFIED: an auction cancelled in the fixing week no longer leaves the
 coupon projected for good); else projected (flat at the latest computable base, or at the base the latest announced
 coupon implies; `projection="forward"` from a curve), a fixing day already passed only from the results before it or
-the coupon announced for the period before; a base more than one period old is refused unless `allow_stale` (flagged
-`proxy`), and a period that ended still projected keeps its projection, flagged `unfixed`, so its coupon can be paid.
-`public_from_source` names each projection's base. `cr-strat frb-coupons` writes every FRB's periods as known at a time
-(`--as-of`, required; `--projection forward` with `--nss-params`).
+the coupon announced for the period before; a base more than one period old is refused unless `allow_stale` (then
+`stale_base` names the base, and a passed fixing's source is `proxy`), and a period that ended still projected keeps
+its projection, flagged `unfixed`, so its coupon can be paid. `public_from_source` names each projection's base.
+`cr-strat frb-coupons` writes every FRB's periods as known at a time (`--as-of`, required; `--projection forward` with
+`--nss-params` projects the T-bill FRBs forward and keeps FRB 2035, on a five-year G-sec yield, flat on its announced
+coupon, saying so; before the second review it refused the whole run unless `--isin` left FRB 2035 out).
 
 **Spreads to a fitted G-sec curve** (`credit_spreads`). The curve is any `curvefit` curve, here one row of the NSS table
 `curve-fit --nss-params` writes. The G-spread is the bond's yield less the curve's par yield at the workout date, the
@@ -893,16 +897,23 @@ dates are semi-annual under `frequency=1` is refused (it moved the yield-yield s
 (108.976115 dirty at 8%). An options row keyed `ine000cl001` now reaches its bond (yield to worst 6.445028% to the 2029
 call, not 7.431602% to maturity). A misspelt `price_pre100` or `redemption_pct` is refused, naming `price_per100` or
 `redemption_per100`. In `asset_swap_table` a row whose `coupon_pct` (6.0 against the terms' 7.4) or `kind` contradicts
-the terms is refused. A bond allotted on 29 Feb 2024 pays 4.972678 for its first half-year (182/366) and 4.986301 for 28
-Feb to 29 Aug 2027 (182/365). FRB 2034 for a settlement of 2 Jun 2025 from `frb-price` without `--as-of`: 6.988717% and
-97.8717 bp over the index (as known at 00:00 on 30 May 2025), not 6.479798% and 100.9798 bp from RBI's announcement of
-Apr 2026; `asset-swaps` gives that FRB's current and next coupon as 6.99%. FRB 2031 with the 2 Dec 2026 auction not
-held: 7.40% `computed` from 17 Dec (a week after the fixing day), never re-projected from the auctions after 7 Dec. A
-corporate FRB reset on 2 Dec 2026 whose fixing is public on 3 Dec at 11:00 is `projected` at 7.70% at 09:00 and `fixed`
-at 7.90% at 12:00. A T-bill result public before its auction, a fixing public before its date and a coupon announced
-more than 14 days before its fixing day are refused. One FRB over 35 business days with 574 weekly results takes 0.8 s
-in the engine under a profiler (5.6 s before), four FRBs over 239 days 5.4 to 6.4 s in two runs (the review measured
-49.7 s).
+the terms is refused (a kind of `corporate`, the terms' own, such as `perpetual`, or a blank agrees; the first review's
+fix refused a perpetual's `perpetual`). A bond allotted on 29 Feb 2024 pays 4.972678 for its first half-year (182/366)
+and 4.986301 for 28 Feb to 29 Aug 2027 (182/365). FRB 2034 for a settlement of 2 Jun 2025 from `frb-price` without
+`--as-of`: 6.988717% and 97.8717 bp over the index (as known at 00:00 on 30 May 2025), not 6.479798% and 100.9798 bp
+from RBI's announcement of Apr 2026; `asset-swaps` gives that FRB's current and next coupon as 6.99%. FRB 2031 with the
+2 Dec 2026 auction not held: 7.40% `computed` from 00:00 on 14 Dec (a week after the 7 Dec fixing day; `projected` at
+23:59 on 13 Dec), never re-projected from the auctions after 7 Dec. A corporate FRB reset on 2 Dec 2026 whose fixing is
+public on 3 Dec at 11:00 is `projected` at 7.70% at 09:00 and `fixed` at 7.90% at 12:00, whether the 2 Dec row is in the
+table and not yet public or not in it at all: for a periodic benchmark such as a weekly T-bill yield the reset waits for
+the fixing due on its schedule on or before the fixing date (every usual interval of the table, its median gap, from the
+latest fixing public: the fixing date's own when it falls on the schedule, UNVERIFIED rule of thumb, a holiday shifting
+a result shifts the schedule); after the first review a weekly table without the 2 Dec row gave `fixed` at 7.70% on the
+25 Nov value, any fixing up to one and a half weeks old passing (a gap that long is still noted). A reset on Friday 4
+Dec takes Wednesday's result once public. A T-bill result public before its auction, a fixing public before its date and
+a coupon announced more than 14 days before its fixing day are refused. One FRB over 35 business days with 574 weekly
+results takes 0.8 s in the engine under a profiler (5.6 s before), four FRBs over 239 days 5.4 to 6.4 s in two runs (the
+review measured 49.7 s).
 
 ## The return engine and costs
 
@@ -1155,9 +1166,17 @@ differences.
   engine stopped on the coupon date before the review (the next period then needs its announced coupon, or
   `frb_allow_stale` to project it from the coupon of Dec 2025, two periods old). A period whose coupon cannot be
   projected (fewer than three results, or a base more than one period old) is refused, naming why, unless
-  `frb_allow_fewer` (`--frb-allow-fewer`) or `frb_allow_stale` (`--frb-allow-stale`, flagged). When the bond as known
-  changes, the previous close's mark is restated on it (its yield from the same clean price), so the day's moves compare
-  like with like.
+  `frb_allow_fewer` (`--frb-allow-fewer`) or `frb_allow_stale` (`--frb-allow-stale`). The refusal comes before the
+  run: each FRB of `run_book`'s trades is taken as known at the valuation time of every day it is held or a trade in it
+  is pending, as the run will take it, so Rs 10 crore of FRB 2031 bought on 20 Nov 2026 on the shipped coupons and no
+  T-bill results, run to 11 Dec, is refused before any day is valued, naming the period from 7 Dec 2026 and the nine
+  after it, the day the run would stop (7 Dec) and the remedies; after the first review it stopped on 7 Dec at 20:00 and
+  returned nothing. A book that sells before the reset runs. A back-test's own FRB orders are checked as the run
+  reaches them, so a back-test can still stop at a reset, naming it. With `frb_allow_stale` a coupon on a stale base or
+  a proxy is flagged in `positions.notes` (FRB 2028 in Jan 2026: `coupon 4.0400% projected from the coupon announced
+  for 2021-10-04, more than a period old (frb_allow_stale)`) and in the run's notes, from the first day; before the
+  second review both said only `projected`. When the bond as known changes, the previous close's mark is restated on it
+  (its yield from the same clean price), so the day's moves compare like with like.
 - **The `coupon_reset` line.** When a coupon becomes known after its period began (a fixing or rating action published
   late), the interest accrued to the previous close is restated at the new rate:
   `coupon_reset = F/100 (AI_new(prev) - AI_old(prev))`. It is part of the NAV change and of the identity, and zero
@@ -1201,9 +1220,13 @@ differences.
   pays the segment's average, `--funding-spread-bp` applies to it too), its interest in the `funding_excess` line; an
   FRB in market repo (`excess_segment`). Before the review both took the G-sec market repo rate. Without a haircut row
   a bond is not lent against at all (equity-funded), and a shortfall says which bonds lend nothing and why.
-- **Risk.** An FRB's `dv01` in positions, in the tenor buckets (at its next reset) and in the hedge check is its rate
-  DV01, `floating.index_dv01` with the margin held: Rs 344 per bp for Rs 10 crore of FRB 2031 bought at 100.25 on 20
-  Nov 2026, in the `0-1y` bucket. Its yield DV01, which equals its spread DV01 (Rs 41,746 there, some hundred times
+- **Risk.** An FRB's `dv01` in positions, in the tenor buckets and in the hedge check is its rate DV01,
+  `floating.index_dv01` with the margin held: Rs 344 per bp for Rs 10 crore of FRB 2031 bought at 100.25 on 20 Nov
+  2026, in the `0-1y` bucket. Its bucket is that of its next reset, `floating.next_reset`: the start of the first
+  period whose coupon is still projected (for a T-bill FRB its next coupon date while that coupon is to be fixed; the
+  maturity once every coupon is known). FRB 2035 resets every five years: Rs 10 crore bought at 100 on 19 Nov 2026
+  carries Rs 28,133 per bp in `3-5y`, at its reset of 25 Jan 2030 (its next coupon date, 25 Jan 2027, put it in `0-1y`
+  before the second review). Its yield DV01, which equals its spread DV01 (Rs 41,746 for FRB 2031, some hundred times
   larger), was used before the review, so a pay-fixed OIS of up to 105% of it passed the `hedge_only` test.
   `traded_dv01` uses the same rate DV01. The spread DV01 is not reported by the engine (`frb-price` and
   `frb_asset_swap_table` give it).

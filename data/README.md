@@ -159,7 +159,7 @@ table may also carry `rating_bucket`, which the return engine's costs read. The 
 | `corporate_amortisation.csv` | isin, date | **isin**, **date** (a due date), **principal_per100**, basis (`face`, `quantity`), source |
 | `corporate_steps.csv` | isin | **isin**, **threshold** (a grade such as `AA`), **step_bp_per_notch**, max_step_bp, agencies (`;` list), combine (`worst`, `best`, `second_best`), effective (`next_period`, `from_event`), step_down, source |
 | `corporate_floating.csv` | isin | **isin**, **benchmark**, **spread_pct**, **reset_months**, fixing_lag_days, lookback, floor_pct, cap_pct, decimals, source |
-| `fixings.csv` | benchmark, date | **benchmark**, **date**, **value_pct**, **public_from** (a bare date counts from 23:59:59), source |
+| `fixings.csv` | benchmark, date | **benchmark**, **date**, **value_pct**, **public_from** (a bare date counts from 23:59:59), source. Keep each benchmark's every published fixing: a reset is fixed only on the fixing due on or before its fixing date (a daily benchmark's that day; a weekly one's on its schedule, every usual interval of the table from the latest fixing), so a missing row leaves it projected |
 | T-bill results for `frb-price --tbills` | auction date | **auction_date**, **tenor_days**, way (or wap), cutoff_yield or cutoff_price, public_from (or the RBI store's published and release_date; else `--tbill-time` as a rule) |
 | `src/cr_strat/data/goi_frb_terms.csv` (shipped) | isin | **isin**, **name**, **issue_date**, **maturity_date**, first_coupon_date, **index** (`tbill182_way_avg3`, `tbill182_cutoff_avg3`, `gsec5y_reset5y`), spread_pct, decimals, reset_months, source, status, notes |
 | `src/cr_strat/data/goi_frb_coupons.csv` (shipped) | isin, period_start | **isin**, **period_start**, period_end (exclusive), **rate_pct**, announced (RBI's release time or date; blank: estimated as 00:00 on the fixing day), source, status |
@@ -172,10 +172,13 @@ coupons cover 14 of its 44), none of the coupons set from June to October 2026
 for the first four among them, and the RBI store holds the 182-day results
 needed to compute coupons only from its first poll. A period with neither is
 `unknown`, and a back-test across it is refused unless allowed to project from
-an older base (`--frb-allow-stale`, flagged). An announced time more than 14
-days before the fixing day, and a T-bill result public before its auction, are
-refused as typos. `cr-strat frb-coupons --as-of T` writes every FRB's coupon
-for each period as known at `T`.
+an older base (`--frb-allow-stale`, flagged; a `returns` run whose trades hold
+an FRB across such a period is refused before it starts). An announced time
+more than 14 days before the fixing day, and a T-bill result public before its
+auction, are refused as typos. `cr-strat frb-coupons --as-of T` writes every
+FRB's coupon for each period as known at `T` (`floating.FRB_RATE_COLUMNS`; its
+`stale_base` names the old base or proxy a rate stands on, blank when fresh;
+`--projection forward` projects the T-bill FRBs forward and FRB 2035 flat).
 
 The same tables feed `asset-swaps --terms` (corporate bonds) and `--frb-out`
 (GoI FRBs), `credit-spreads --terms`, `trade-check --terms`, `price-panel

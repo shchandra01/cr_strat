@@ -1037,6 +1037,25 @@ def test_price_corporates_prices_each_row_from_what_it_has_and_keeps_refused_inp
     assert fixed["error"].iloc[1] == "clean_price is missing" and fixed["yield_pct"].iloc[1] == 8.0
 
 
+def test_auto_keeps_the_quantity_each_row_was_priced_from():
+    """``given='auto'`` wrote each row's clean price back through its solved yield (100 came out as
+    99.99999999999999, 102.25 as 102.24999999999994); a row priced from its yield keeps that yield."""
+    terms = pd.DataFrame([{"isin": "INE000T1701", "kind": "corporate", "coupon_pct": "8.95", "frequency": "1",
+                           "issue_date": "2023-12-14", "maturity_date": "2030-12-14"}])
+    frame = pd.DataFrame([
+        {"isin": "INE000T1701", "settlement_date": "2030-11-29", "clean_price": 100.0, "yield_pct": None},
+        {"isin": "INE000T1701", "settlement_date": "2026-11-16", "clean_price": 102.25, "yield_pct": None},
+        {"isin": "INE000T1701", "settlement_date": "2026-11-16", "clean_price": None, "yield_pct": 8.1234567}])
+    auto = price_corporates(frame, terms, given="auto")
+    assert auto["error"].tolist() == ["", "", ""]
+    assert auto["clean_price"].tolist()[:2] == [100.0, 102.25] and auto["yield_pct"].iloc[2] == 8.1234567
+    by_price = price_corporates(frame.iloc[:2], terms)  # given="clean_price": the same yields, prices as given
+    assert auto["yield_pct"].tolist()[:2] == by_price["yield_pct"].tolist()
+    assert by_price["clean_price"].tolist() == [100.0, 102.25]
+    by_yield = price_corporates(frame.iloc[[2]], terms, given="yield_pct")
+    assert auto["clean_price"].iloc[2] == by_yield["clean_price"].iloc[0]
+
+
 def test_prices_per_100_of_the_outstanding_face():
     """Spec T14 after 30 of its 100 are redeemed: 99.903062 per 100 of the 70 outstanding is 69.932143 per 100
     original face, a 9% yield."""

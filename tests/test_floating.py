@@ -471,6 +471,8 @@ def test_a_skipped_auction_still_fixes_the_coupon():
     assert (pending["status"], pending["rate_pct"], pending["public_from_source"]) == ("projected", 7.40,
                                                                                        "before_fixing")
     assert pending["auctions"] == "2026-11-11;2026-11-18;2026-11-25" and "12 days before it" in pending["notes"]
+    edge = period("2026-12-13T23:59")  # computed from 00:00 on 14 Dec, a week after the fixing day (analytics.md)
+    assert (edge["status"], edge["rate_pct"], edge["public_from_source"]) == ("projected", 7.40, "before_fixing")
     for as_of in ("2026-12-14T00:00", "2026-12-17T20:00", "2027-01-14T20:00"):
         row = period(as_of)
         assert (row["status"], row["rate_pct"], row["auctions"]) == ("computed", 7.40,
@@ -511,6 +513,41 @@ def test_a_stale_announced_coupon_is_not_projected():
     assert (stale_row["rate_pct"], stale_row["public_from_source"]) == (4.04, "proxy")
     later = goi_frb_rates(frb2028, None, as_of="2026-04-10T18:00").set_index("period_start")
     assert (later.loc[D(2026, 4, 4), "status"], later.loc[D(2026, 10, 4), "status"]) == ("announced", "projected")
+
+
+def test_next_reset_and_the_stale_base_of_each_rate():
+    """FRB 2035's rate risk sits at its next five-yearly reset (25 Jan 2030), not its next coupon (25 Jan 2027); a
+    T-bill FRB's at its next coupon while that coupon is to be fixed. A rate on a stale base or a proxy (allow_stale)
+    names that base in ``stale_base`` and in the bond's ``rate_basis``; a fresh one leaves it blank."""
+    from cr_strat.floating import next_reset
+
+    terms = load_frb_terms().set_index("isin")
+    frb2035 = terms.loc["IN0020042050"].to_dict() | {"isin": "IN0020042050"}
+    b35 = goi_frb_bond(frb2035, goi_frb_rates(frb2035, None, as_of="2026-11-19T20:00"))
+    s = D(2026, 11, 20)
+    assert (b35.next_coupon_date(s), next_reset(b35, s)) == (D(2027, 1, 25), D(2030, 1, 25))
+    fresh = goi_frb_rates(FRB2031, None, as_of="2026-11-19T20:00")
+    b31 = goi_frb_bond(FRB2031, fresh)
+    assert next_reset(b31, s) == D(2026, 12, 7) and (fresh["stale_base"] == "").all()
+    assert b31.rate_basis(s) == ("previous_coupon", "")
+    known = b31.with_rates([(st, 7.0, "announced") for st, *_ in b31.rates])  # every coupon known: to maturity
+    assert next_reset(known, s) == b31.maturity and known.rate_basis(s) == ("", "")
+    frb2028 = terms.loc["IN0020210160"].to_dict() | {"isin": "IN0020210160"}
+    stale = goi_frb_rates(frb2028, None, as_of="2026-01-05T20:00", allow_stale=True)
+    old = "the coupon announced for 2021-10-04, more than a period old"
+    rows = stale.set_index("period_start")
+    assert (rows.loc[D(2025, 10, 4), "stale_base"], rows.loc[D(2026, 4, 4), "stale_base"]) == (old, old)
+    assert rows.loc[D(2021, 10, 4), "stale_base"] == "" and rows.loc[D(2022, 4, 4), "stale_base"] == ""
+    assert goi_frb_bond(frb2028, stale).rate_basis(D(2026, 1, 6)) == ("proxy", old)
+    tb = tbills([(D(2026, 1, 7) + timedelta(days=7 * k), 6.40, f"{D(2026, 1, 7) + timedelta(days=7 * k)}T18:30")
+                 for k in range(22)])  # weekly to 3 Jun 2026, then nothing
+    flat = goi_frb_rates(FRB2031, tb, None, as_of="2026-12-04T20:00", allow_stale=True).set_index("period_start")
+    assert (flat.loc[D(2026, 12, 7), "public_from_source"], flat.loc[D(2026, 12, 7), "stale_base"]) == (
+        "flat", "the auctions to 2026-06-03, more than a period old")
+    proxy = goi_frb_rates(FRB2033, weekly(D(2026, 10, 28), [6.40, 6.45, 6.50]), None, as_of="2026-11-20T20:00",
+                          allow_stale=True).set_index("period_start").loc[D(2026, 9, 22)]
+    assert (proxy["public_from_source"], proxy["stale_base"]) == (
+        "proxy", "the auctions to 2026-11-11, after its fixing day 2026-09-22 (a proxy)")
 
 
 def test_times_before_their_own_date_are_refused():
@@ -584,6 +621,48 @@ def test_a_corporate_reset_is_fixed_only_on_its_own_published_fixing():
     future = corporate_frb_rates(quarterly, FloatingTerms("mibor", 1.0, 3, fixing_lag_days=1), daily,
                                  as_of="2026-10-01T20:00").set_index("period_start").loc[D(2026, 10, 15)]
     assert future["status"] == "projected" and "not in the table" not in future["notes"]  # still to come: no gap
+
+
+def _wednesdays(last: date, skip=()) -> pd.DataFrame:
+    """A weekly benchmark: 5.40 every Wednesday from 2 Sep 2026 to ``last``, each public at 17:00 on its date."""
+    rows, d = [], D(2026, 9, 2)
+    while d <= last:
+        if d not in skip:
+            rows.append({"benchmark": "tbill91_cutoff", "date": d.isoformat(), "value_pct": "5.40",
+                         "public_from": f"{d}T17:00"})
+        d += timedelta(days=7)
+    return pd.DataFrame(rows)
+
+
+def test_a_weekly_reset_waits_for_the_fixing_due_on_its_schedule():
+    """The verifier's case: a weekly benchmark's reset on Wednesday 2 Dec 2026, its result (5.60) public on 3 Dec at
+    11:00 and not yet in the table at 09:00, was called fixed on the 25 Nov value (any fixing up to one and a half
+    weeks old passed); a daily benchmark in the same case was projected."""
+    terms = FloatingTerms("tbill91_cutoff", 2.30, 3)
+    before = _wednesdays(D(2026, 11, 25))
+    after = pd.concat([before, pd.DataFrame([{"benchmark": "tbill91_cutoff", "date": "2026-12-02", "value_pct": "5.60",
+                                              "public_from": "2026-12-03T11:00"}])], ignore_index=True)
+
+    def reset(bond, table, as_of, start):
+        return corporate_frb_rates(bond, terms, table, as_of=as_of).set_index("period_start").loc[start]
+
+    wed = CorporateBond(8.0, D(2028, 12, 2), D(2025, 12, 2), frequency=4)
+    early = reset(wed, before, "2026-12-03T09:00", D(2026, 12, 2))
+    assert (early["status"], early["rate_pct"], early["fixings_used"]) == ("projected", 7.7, "2026-11-25")
+    assert "the fixing of 2026-12-02 (the benchmark's dates run 7 days apart in the table) is not in the table" in \
+        early["notes"] and "gap" not in early["notes"]
+    late = reset(wed, after, "2026-12-03T12:00", D(2026, 12, 2))
+    assert (late["status"], late["rate_pct"], late["fixings_used"], late["notes"]) == ("fixed", 7.9, "2026-12-02", "")
+    fri = CorporateBond(8.0, D(2028, 12, 4), D(2025, 12, 4), frequency=4)  # resets on Fridays 4 Dec, 4 Mar, ...
+    assert reset(fri, after, "2026-12-05T09:00", D(2026, 12, 4))[["status", "rate_pct"]].tolist() == ["fixed", 7.9]
+    waiting = reset(fri, before, "2026-12-05T09:00", D(2026, 12, 4))  # Wednesday's result due, not in the table
+    assert (waiting["status"], waiting["rate_pct"]) == ("projected", 7.7)
+    assert "the fixing of 2026-12-02" in waiting["notes"] and "9 days before the fixing date" in waiting["notes"]
+    gap = reset(wed, _wednesdays(D(2026, 12, 2), skip=(D(2026, 11, 18), D(2026, 11, 25), D(2026, 12, 2))),
+                "2026-12-03T12:00", D(2026, 12, 2))
+    assert gap["status"] == "projected" and "21 days is more than one and a half" in gap["notes"]
+    sep = reset(wed, before, "2026-12-03T09:00", D(2026, 9, 2))  # 2 Sep's own result, public that day: fixed
+    assert (sep["status"], sep["rate_pct"], sep["fixings_used"]) == ("fixed", 7.7, "2026-09-02")
 
 
 def test_coupons_as_known_are_quick_on_a_long_table():

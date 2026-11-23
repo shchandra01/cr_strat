@@ -416,6 +416,26 @@ def test_a_corporate_row_that_contradicts_its_terms_is_refused(curve):
     assert aw.asset_swap_table(empty, curve).empty
 
 
+def test_a_perpetual_row_may_give_its_terms_kind():
+    """A bonds row of kind 'perpetual', as its terms say, was refused as differing from the terms (a corporate)."""
+    terms = pd.DataFrame([{"isin": "INE000PP0001", "kind": "perpetual", "coupon_pct": "8.5", "frequency": "1",
+                           "issue_date": "2024-06-15", "tier": "at1"}])
+    long = flat_curve(0.08)
+    long.t_max = 200.0  # past the perpetual's deemed 100-year maturity
+
+    def measured(kind: str) -> pd.Series:
+        frame = pd.DataFrame([{"isin": "INE000PP0001", "kind": kind, "clean_price": 100.0}])
+        return aw.asset_swap_table(frame, long, S, terms=terms).iloc[0]
+
+    rows = {kind: measured(kind) for kind in ("perpetual", "PERPETUAL", "corporate", "")}
+    assert [r["error"] for r in rows.values()] == [""] * 4
+    assert rows["perpetual"]["maturity_date"] == date(2124, 6, 15)
+    assert len({r["par_par_bp"] for r in rows.values()}) == 1 and math.isfinite(rows["perpetual"]["par_par_bp"])
+    assert ("kind 'gsec' differs from the terms: INE000PP0001 is of kind 'perpetual' there"
+            in measured("gsec")["error"])
+    assert "is of kind 'perpetual' there" in measured("frb_corp")["error"]
+
+
 def test_the_asset_swap_of_a_called_bond_runs_to_its_call(curve):
     options = pd.DataFrame([{"isin": "INE000A07011", "kind": "call", "date": "2027-06-15", "exercised": "yes",
                              "exercised_public_from": "2026-11-02T17:00"}])
