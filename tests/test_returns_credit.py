@@ -11,9 +11,10 @@ from datetime import date, datetime, time, timedelta
 
 import pandas as pd
 import pytest
-from test_returns import CAL, LEN, NOCOST, assert_identity, funding, settings
+from test_returns import CAL, LEN, NOCOST, assert_identity, funding, mmd, settings
 
 from cr_strat import costs as co
+from cr_strat import funding as fu
 from cr_strat import returns as rt
 from cr_strat.corporates import CorporateBond
 
@@ -256,16 +257,35 @@ def test_a_corporate_frb_uses_each_fixing_from_its_public_time():
     assert accrual.loc[date(2026, 12, 17)] == pytest.approx(1e8 * 0.078 / 365, rel=1e-12)
 
 
+def corporate_funding() -> dict:
+    """``funding()`` with a corporate bond repo segment 15 bp over market repo (5.72%: the store's 13 Nov spread)."""
+    frame = mmd(date(2026, 9, 1), date(2026, 12, 31))
+    frame["corp_bond_repo_rate_pct"] = frame["market_repo_rate_pct"].map(lambda r: None if r is None else r + 0.15)
+    frame["corp_bond_repo_volume_cr"] = frame["market_repo_volume_cr"] / 50
+    return funding() | {"corp_bond_repo": fu.funding_rates(frame, "corp_bond_repo")}
+
+
 def test_corporate_bonds_are_not_treps_collateral():
     books = ("b",)
     with pytest.raises(ValueError, match="not TREPS collateral here"):
         run([trade("T1", "b", "buy", "2026-11-20")], books, amount=2e7, funding=funding())
     cuts = pd.DataFrame([{"effective_date": "2015-01-01", "kind": "corporate", "haircut_pct": 10.0,
                           "source": "synthetic"}])
-    res = run([trade("T1", "b", "buy", "2026-11-20")], books, amount=2e7, funding=funding(), haircuts=cuts)
+    # lent against in corporate bond repo, at its rate (the build funded it at market repo, the G-sec segment's)
+    with pytest.raises(ValueError, match="no corp_bond_repo funding rates"):
+        run([trade("T1", "b", "buy", "2026-11-20")], books, amount=2e7, funding=funding(), haircuts=cuts)
+    res = run([trade("T1", "b", "buy", "2026-11-20")], books, amount=2e7, funding=corporate_funding(), haircuts=cuts)
     assert_identity(res)
-    assert set(res.funding["segment"]) == {"market_repo"}  # TREPS lends nothing against it: the excess segment
+    assert set(res.funding["segment"]) == {"corp_bond_repo"}  # TREPS lends nothing against it
+    assert res.funding["rate_pct"].round(10).eq(5.72).all()
     assert res.positions["haircut_pct"].dropna().eq(10.0).all()
+    night = res.funding.iloc[0]
+    nights = (night["repay_date"] - night["date"]).days
+    assert res.lines("b").loc[night["repay_date"], "funding_excess"] == pytest.approx(
+        -night["borrowed"] * 5.72 * nights / 36500, rel=1e-12)
+    as_gsec = run([trade("T1", "b", "buy", "2026-11-20")], books, amount=2e7, funding=funding(), haircuts=cuts,
+                  st=settings(costs=NOCOST, funding=rt.FundingPolicy(corporate_segment="market_repo")))
+    assert set(as_gsec.funding["segment"]) == {"market_repo"}  # the G-sec segment's rate, if the user says so
 
 
 def test_corporate_trade_costs_and_t0_settlement():
@@ -314,3 +334,102 @@ def test_a_gsec_book_is_unchanged_by_the_corporate_and_frb_inputs():
         assert a.to_csv(index=False) == b.to_csv(index=False), name
     assert plain.notes == full.notes
     assert replace(st).attribution.reference_map["corporate"] == "gsec"
+
+
+# ---------------------------------------------------------------- fixes of the review
+
+
+def test_an_frbs_engine_dv01_is_its_rate_risk():
+    """The engine put FRB 2031's yield DV01 (its spread DV01, Rs 41,746 a bp on Rs 10 crore) into positions.dv01, the
+    5-10y bucket and the hedge check; its rate risk is the index DV01, near Rs 350, at its next reset."""
+    from cr_strat.floating import goi_frb_bond, goi_frb_rates, index_dv01, load_frb_terms
+
+    res = frb_run(frb_tbills())
+    assert_identity(res)
+    pos = res.positions.set_index("date").loc[date(2026, 11, 26)]
+    terms = load_frb_terms().set_index("isin").loc[FRB_ISIN].to_dict() | {"isin": FRB_ISIN}
+    bond = goi_frb_bond(terms, goi_frb_rates(terms, frb_tbills(), as_of="2026-11-26T20:00"))
+    s = pos["settlement_date"]
+    y = bond.yield_from_price(100.25, s)
+    assert pos["dv01"] == pytest.approx(1e6 * index_dv01(bond, s, 0.0, index_pct=y), rel=1e-9)
+    assert 100 < pos["dv01"] < 0.02 * 1e6 * bond.dv01(y, s)  # the yield DV01 is 100 times larger
+    assert pos["bucket"] == "0-1y"  # the next reset, 7 Dec 2026
+    nav = res.nav.set_index("date").loc[date(2026, 11, 26)]
+    assert nav["dv01"] == pytest.approx(pos["dv01"]) and nav["dv01_0-1y"] == pytest.approx(pos["dv01"])
+
+
+def _frb2031_run(coupons, end=date(2026, 12, 11), st=None):
+    days = CAL.business_days(date(2026, 11, 20), end)
+    marks = pd.DataFrame([{"date": d, "isin": FRB_ISIN, "clean_price": 100.0} for d in days])
+    return run([trade("F1", "frb", "buy", "2026-11-20", isin=FRB_ISIN, kind="frb")], ("frb",), marks=marks,
+               terms=(), frb_coupons=coupons, end=end, st=st)
+
+
+def test_an_frb_coupon_projected_to_its_end_is_paid():
+    """The shipped coupons lack FRB 2031's coupon from 7 Jun 2026: it is projected flat at 6.52% (the Dec 2025
+    coupon) and, when its period ends on 7 Dec, paid at that rate (the build raised 'no rate for the coupon period
+    from 2026-06-07'). The next coupon, typed in as announced on 4 Dec, takes over."""
+    from cr_strat.floating import load_frb_coupons
+
+    typed = pd.concat([load_frb_coupons(), pd.DataFrame([{
+        "isin": FRB_ISIN, "period_start": "2026-12-07", "period_end": "2027-06-07", "rate_pct": "6.80",
+        "announced": "2026-12-04T17:00", "source": "synthetic", "status": "P"}])], ignore_index=True)
+    res = _frb2031_run(typed)
+    assert_identity(res)
+    cash = res.nav.set_index("date")["cash"]
+    assert cash.loc[date(2026, 12, 7)] - cash.loc[date(2026, 12, 4)] == pytest.approx(1e6 * 6.52 / 2, rel=1e-12)
+    notes = res.positions.set_index("date")["notes"]
+    assert notes.loc[date(2026, 12, 4)] == "coupon 6.5200% projected"
+    assert notes.loc[date(2026, 12, 8)] == "coupon 6.8000% announced"
+    # without the typed coupon the new period's only base is a year old: refused, naming why
+    with pytest.raises(ValueError, match="period from 2026-12-07 is not known at 2026-12-07 20:00.*too old"):
+        _frb2031_run(load_frb_coupons())
+    stale = _frb2031_run(load_frb_coupons(), st=settings(costs=NOCOST, frb_allow_stale=True))
+    assert_identity(stale)
+    assert stale.positions.set_index("date")["notes"].loc[date(2026, 12, 8)] == "coupon 6.5200% projected"
+
+
+def _called(notice: str, record_date: str = ""):
+    isin = "INECCC000001"
+    terms = {"isin": isin, "kind": "corporate", "coupon_pct": "8.0", "frequency": "1", "issue_date": "2024-06-15",
+             "maturity_date": "2031-06-15"}
+    options = pd.DataFrame([{"isin": isin, "kind": "call", "date": "2026-12-10", "price_per100": "101",
+                             "exercised": "yes", "exercised_public_from": notice, "record_date": record_date}])
+    bond = CorporateBond(8.0, date(2031, 6, 15), date(2024, 6, 15))
+    days = CAL.business_days(date(2026, 11, 20), date(2026, 12, 14))
+    marks = pd.DataFrame([{"date": d, "isin": isin, "clean_price": bond.clean_price(8.2, CAL.settlement_date(d, 1))}
+                          for d in days if d <= date(2026, 11, 24)])
+    return run([trade("C1", "b", "buy", "2026-11-20", isin=isin)], ("b",), marks=marks, terms=(terms,),
+               end=days[-1], corporate_options=options)
+
+
+def test_an_exercise_notice_after_its_record_date_is_refused_up_front():
+    """The 15-day rule puts the 10 Dec 2026 call's record date on 25 Nov: a notice public on 30 Nov stopped the
+    engine on that day with a message about the previous close's mark. It is refused before the run, naming the
+    remedy; with the record date the notice gives, the redemption is entitled at that date's close."""
+    with pytest.raises(ValueError, match="after the redemption's record date 2026-11-25 .*record_date in "
+                                         "corporate_options"):
+        _called("2026-11-30T17:00")
+    res = _called("2026-11-30T17:00", record_date="2026-12-01")
+    assert_identity(res)
+    nav = res.nav.set_index("date")
+    coupon = 8.0 * 178 / 365  # 15 Jun to 10 Dec 2026: interest to the call date
+    assert nav.loc[date(2026, 12, 2), "receivables"] == pytest.approx(1e6 * (101.0 + coupon), rel=1e-9)
+    assert nav.loc[date(2026, 12, 10), "receivables"] == 0.0
+    assert res.positions["date"].max() == date(2026, 12, 1)
+
+
+def test_the_half_spread_follows_the_rating_public_before_the_trade():
+    """The cost bucket came from the terms' static rating_bucket, so a downgrade typed in later priced earlier
+    trades: now the rating actions public before the trade day decide it."""
+    st = settings(costs=co.read_cost_table())
+    ratings = pd.DataFrame([
+        {"isin": NCD_ISIN, "agency": "CRISIL", "rating": "CRISIL AAA/Stable", "public_from": "2025-01-10"},
+        {"isin": NCD_ISIN, "agency": "CRISIL", "rating": "CRISIL A/Negative", "public_from": "2026-11-25T18:00"}])
+    trades = [trade("B1", "b", "buy", "2026-11-20"), trade("S1", "b", "sell", "2026-11-26", face=5e7)]
+    res = run(trades, ("b",), st=st, terms=(NCD_TERMS | {"rating_bucket": "A"},), ratings=ratings)
+    rules = res.fills.set_index("trade_id")["rules"].map(lambda r: r.split(";")[0])
+    assert rules.to_dict() == {"B1": "HS20:U", "S1": "HS23:U"}  # AAA before the downgrade, A after it
+    static = run(trades, ("b",), st=st, terms=(NCD_TERMS | {"rating_bucket": "A"},))
+    assert static.fills.set_index("trade_id")["rules"].map(lambda r: r.split(";")[0]).tolist() == ["HS23:U"] * 2
+    assert any("static rating_bucket" in n for n in static.notes)

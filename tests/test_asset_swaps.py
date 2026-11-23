@@ -399,3 +399,29 @@ def test_frb_asset_swap_table_uses_only_coupons_known_at_as_of(curve):
     later = aw.frb_asset_swap_table(frame.iloc[[0]], curve, S, tbills=weekly_tbills(public_shift_days=2),
                                     as_of=as_of)
     assert later["index_pct"].iloc[0] == pytest.approx(5.74)  # public on 20 Nov: 28 Oct, 4 and 11 Nov only
+
+
+def test_a_corporate_row_that_contradicts_its_terms_is_refused(curve):
+    """A row whose coupon and kind contradict the terms was measured as the terms' bond, without a word."""
+    frame = pd.DataFrame([{"isin": "INE000A07011", "kind": "gsec", "coupon_pct": 6.0, "clean_price": 99.0}])
+    assert "coupon_pct 6.0 differs from the terms' 7.4" in aw.asset_swap_table(frame, curve,
+                                                                               terms=corp_terms())["error"].iloc[0]
+    wrong_kind = frame.assign(coupon_pct=7.4)
+    assert "kind 'gsec' differs from the terms" in aw.asset_swap_table(wrong_kind, curve,
+                                                                       terms=corp_terms())["error"].iloc[0]
+    ok = aw.asset_swap_table(frame.assign(coupon_pct=7.4, kind="corporate", isin="ine000a07011"), curve,
+                             terms=corp_terms())
+    assert ok["error"].iloc[0] == "" and ok["kind"].iloc[0] == "corporate"
+    empty = pd.DataFrame(columns=["isin", "clean_price"])  # an FRB-only bonds file, its FRBs measured apart
+    assert aw.asset_swap_table(empty, curve).empty
+
+
+def test_the_asset_swap_of_a_called_bond_runs_to_its_call(curve):
+    options = pd.DataFrame([{"isin": "INE000A07011", "kind": "call", "date": "2027-06-15", "exercised": "yes",
+                             "exercised_public_from": "2026-11-02T17:00"}])
+    frame = pd.DataFrame([{"isin": "INE000A07011", "clean_price": 100.0}])
+    called = aw.asset_swap_table(frame, curve, terms=corp_terms(), options=options).iloc[0]
+    assert called["maturity_date"] == date(2027, 6, 15) and called["error"] == ""
+    before = aw.asset_swap_table(frame, curve, terms=corp_terms(), options=options, as_of="2026-11-01T00:00").iloc[0]
+    assert before["maturity_date"] == date(2029, 6, 15)
+    assert called["years_to_maturity"] < 1 < before["years_to_maturity"]

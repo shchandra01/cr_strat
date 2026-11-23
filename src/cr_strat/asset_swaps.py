@@ -1,4 +1,5 @@
-"""Asset-swap measures of G-secs, SDLs and bills against an OIS curve (strategy S1), or against any discount curve.
+"""Asset-swap measures of G-secs, SDLs, bills, CP, CD and corporate bonds against an OIS curve (strategies S1 and S2),
+or against any discount curve; discount margins of GoI FRBs.
 
 The S1 trade buys a G-sec (or SDL) and pays fixed in MIBOR-OIS: the spread it earns can be measured four ways,
 and they differ by up to 2 bp on one bond (the 6.36% GS 2031 of the tests: 33.9 to 35.9 bp), so a strategy must
@@ -41,9 +42,26 @@ or ``curvefit``'s fitted G-sec curve, against which the same z-spread is a bond'
 bond maturing past an OIS curve's last node (5 years for FBIL's) is refused unless the curve allows extrapolation,
 and then ``extrapolated`` says so; a fitted curve extrapolates on its own and is flagged the same way.
 
+**Corporate bonds** (``corporates.CorporateBond``): the same four measures on the bond's own flows, on the dates it
+is priced on (due dates for settlements from 18 Aug 2025, payment dates before), a coupon past its record date left
+out. Two choices no source settles (UNVERIFIED): the matched OIS rate is restated to the bond's annual basis before
+the yield-yield spread (``k_match_basis="bond"``, the default for corporate bonds: an annual NCD yield against a
+semi-annual or simple rate carries a basis: 9.13 bp on a bond of ``docs/analytics.md``; ``"schedule"`` keeps the par rate on the floating
+schedule, as for G-secs), and an amortising bond's swap notional amortises with its face (``_period_faces``: the par
+rate of an OIS on that notional). ``asset_swap_table`` builds them from the corporate terms tables, as known at
+``as_of`` (an exercise public by then redeems the bond at the option; default 00:00 on the trade date), and refuses a
+row whose coupon, kind or maturity contradicts the terms.
+
+**GoI FRBs** have no fixed-coupon asset swap: ``frb_measures`` gives the discount margin over the curve (the
+z-spread of the flows with the coupons not yet fixed at their projected rates; against OIS, the FRB's spread over
+OIS), its semi-annual variant, the index-form margin over the base the flat projection stands on, the spread DV01
+and the index (rate) DV01, on the coupons ``floating.goi_frb_rates`` knows at ``as_of`` (``frb_asset_swap_table``;
+``None`` uses everything in the inputs, a look-ahead for a past date). The projection is UNVERIFIED (flat by
+default).
+
 **Limits.** Tested on synthetic curves and closed forms only: no OIS quote, bond price or published asset-swap
 example with full inputs was used (FBIL's OIS rates need a licence; the FINCAD example the spec looked for was not
-read). Bonds without a pricer in ``bonds`` (floating-rate, inflation-indexed) and STRIPS are refused; no
+read). Bonds without a pricer (inflation-indexed) and STRIPS are refused, FRBs pointed to ``frb_measures``; no
 convexity or funding adjustment is made, and the bond's settlement is taken to be the swap's effective date. A
 settlement that is not a business day of the curve's calendar (Mumbai's when the curve has none; weekdays past the
 calendar's last listed year are accepted) is refused, as is an ISIN listed twice in ``asset_swap_table``.
@@ -259,7 +277,8 @@ def z_spread(dates: Sequence[date], amounts, settlement, dirty_price: float, cur
 
 def _period_faces(bond, s: date, dates: Sequence[date]) -> np.ndarray:
     """Face outstanding (per 100 original) in each floating period ending on ``dates``: 100 for every bond but an
-    amortising corporate bond, whose asset swap's notional amortises with it."""
+    amortising corporate bond, whose asset swap's notional amortises with it (UNVERIFIED: the swap's notional is the
+    bond's face outstanding, period by period; no Indian convention found)."""
     if not isinstance(bond, CorporateBond) or not bond.amortisation:
         return np.full(len(dates), 100.0)
     due = bond.uses_due_dates(s)
@@ -284,6 +303,7 @@ def asset_swap(bond, settlement, clean_price: float, curve, *, float_schedule: s
     _check_bond(bond)
     if float_schedule not in FLOAT_SCHEDULES:
         raise ValueError(f"float_schedule must be one of {FLOAT_SCHEDULES}, not {float_schedule!r}")
+    # UNVERIFIED default: a corporate bond's matched rate restated to its own (annual) yield basis; no source settles it
     basis = k_match_basis if k_match_basis is not None else ("bond" if isinstance(bond, CorporateBond) else
                                                              "schedule")
     if basis not in K_MATCH_BASES:
@@ -608,7 +628,7 @@ def frb_measures(bond: GoiFloatingRateBond, settlement, clean_price: float, curv
 
 
 def frb_asset_swap_table(frame: pd.DataFrame, curve, settlement=None, *, terms=None, announced=FRB_COUPONS_CSV,
-                         tbills=None, as_of=None, allow_fewer: bool = False) -> pd.DataFrame:
+                         tbills=None, as_of=None, allow_fewer: bool = False, allow_stale: bool = False) -> pd.DataFrame:
     """``frb_measures`` for every GoI FRB row of ``frame`` (``FRB_ASW_COLUMNS``), sorted by maturity and ISIN.
 
     ``frame``: ``isin``, ``clean_price`` (or ``yield_pct``), optional ``settlement_date`` (default ``settlement``,
@@ -643,7 +663,7 @@ def frb_asset_swap_table(frame: pd.DataFrame, curve, settlement=None, *, terms=N
                                  "date")
             s = as_date(default if _blank(given) else given)
             out["settlement_date"] = s
-            rates = goi_frb_rates(row, bills, announced, as_of=as_of, allow_fewer=allow_fewer)
+            rates = goi_frb_rates(row, bills, announced, as_of=as_of, allow_fewer=allow_fewer, allow_stale=allow_stale)
             bond = goi_frb_bond(row, rates)
             out["maturity_date"] = bond.maturity
             clean = rec.get("clean_price")

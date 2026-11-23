@@ -563,3 +563,43 @@ def test_cli_repo_carry_as_of_fixings_calendar_and_caps(tmp_path, capsys):
                  "--end", "2026-11-30", "--out", str(tmp_path / "s.csv")]) == 0
     assert "partly funded at market_repo rates" in capsys.readouterr().out
     assert pd.read_csv(tmp_path / "s.csv")["funding_share"].iloc[0] == 0
+
+
+# ---------------------------------------------------------------- corporate bonds and FRBs (the review's fixes)
+
+
+def test_corporate_bonds_fund_at_the_corporate_bond_repo_rate():
+    """The RBI store holds repo in corporate bonds (5.70% on 13 Nov 2026 against 5.55% for market repo); the build
+    offered only the G-sec segments, and repo-carry refused corporate bonds."""
+    frame = mmd(date(2026, 11, 13), date(2026, 12, 31))
+    frame["corp_bond_repo_rate_pct"] = frame["market_repo_rate_pct"].map(lambda r: None if r is None else r + 0.15)
+    frame["corp_bond_repo_volume_cr"] = frame["market_repo_volume_cr"] / 50
+    corp = fu.funding_rates(frame, "corp_bond_repo")
+    assert corp["rate_pct"].dropna().round(10).eq(5.72).all() and set(corp["source"]) == {"corp_bond_repo"}
+    from cr_strat.corporates import CorporateBond
+
+    ncd = CorporateBond(9.0, date(2030, 12, 15), date(2023, 12, 15))  # record date of the 15 Dec coupon: 30 Nov
+    s, e = date(2026, 11, 20), date(2026, 12, 10)
+    c = fu.carry(ncd, 1e8, 101.0, s, e, funding=corp, haircut_pct=10.0)
+    # the coupon goes to the holder at the close of 30 Nov, though paid on 15 Dec: 20 days of accrual in all
+    assert c.income == pytest.approx(1e8 * 0.09 * 20 / 365, rel=1e-12)
+    dirty = 101.0 + ncd.accrued_interest(s)
+    assert c.repo == pytest.approx(0.9 * dirty * 1e6 * sum(r["rate_pct"] for r in c.daily.to_dict("records"))
+                                   / 36500, rel=1e-12)
+    with pytest.raises(ValueError, match="redemption record date"):
+        fu.carry(ncd, 1e8, 101.0, date(2030, 11, 20), date(2030, 12, 2), funding=corp, haircut_pct=10.0,
+                 calendar=CAL.lenient())
+
+
+def test_an_frb_carries_on_its_coupons_as_known():
+    from cr_strat.floating import GoiFloatingRateBond, frb_periods
+
+    terms = {"isin": "IN0020200120", "issue_date": "2020-06-22", "maturity_date": "2033-09-22",
+             "first_coupon_date": "2020-09-22"}
+    starts = [st for st, _ in frb_periods(terms) if st >= date(2026, 9, 22)]
+    bond = GoiFloatingRateBond(date(2033, 9, 22), date(2020, 6, 22), 1.22,
+                               tuple((st, 6.75, "projected") for st in starts), first_coupon_date=date(2020, 9, 22))
+    funding = fu.funding_rates(mmd(date(2026, 11, 13), date(2026, 12, 31)), "market_repo")
+    c = fu.carry(bond, 1e8, 100.0, date(2026, 11, 20), date(2026, 12, 21), funding=funding, haircut_pct=5.0,
+                 pull_to_par=False)
+    assert c.income == pytest.approx(1e8 / 100 * 6.75 * 31 / 360, rel=1e-12)  # 30E/360 from 20 Nov to 21 Dec

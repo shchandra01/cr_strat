@@ -209,3 +209,79 @@ def test_returns_command_with_a_corporate_bond_and_an_frb(tmp_path, capsys):
     assert "not both" in capsys.readouterr().err
     assert main([*args, "--corporate-options", str(tmp_path / "missing.csv"), "--out-dir", str(tmp_path / "y")]) == 2
     assert "--corporate-options" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------- fixes of the review
+
+
+def _lines(text: str) -> dict:
+    return {line[:19].strip(): line[19:].strip() for line in text.splitlines() if line[:19].strip()}
+
+
+def test_frb_commands_default_to_the_trade_days_start(tmp_path, capsys):
+    """Without --as-of the FRB commands used every coupon in the inputs, RBI's announcement of 29 Apr 2026 included,
+    for a settlement of 2 Jun 2025 (a 49.5 bp look-ahead in asset-swaps' curve margin)."""
+    args = ["frb-price", "--isin", "IN0020210137", "--settlement", "2025-06-02", "--price", "100"]
+    assert main(args) == 0
+    lines = _lines(capsys.readouterr().out)
+    assert lines["as of"].startswith("2025-05-30 00:00") and lines["yield (%)"].startswith("6.988717")
+    assert lines["discount margin"].startswith("97.8717 bp")
+    assert main([*args, "--as-of", "all"]) == 0  # everything known only when asked, and said so
+    out = capsys.readouterr().out
+    assert "--as-of all: a look-ahead" in out and _lines(out)["discount margin"].startswith("104.6462 bp")
+    assert main(["frb-price", "--isin", "IN0020210160", "--settlement", "2026-01-15", "--price", "100"]) == 2
+    assert "too old to project from" in capsys.readouterr().err  # FRB 2028's only base then is from 2021
+    assert main(["frb-price", "--isin", "IN0020210160", "--settlement", "2026-01-15", "--price", "100",
+                 "--allow-stale"]) == 0
+    assert "a stale base" in capsys.readouterr().out
+
+
+def test_asset_swaps_frbs_only_and_their_default_as_of(tmp_path, capsys):
+    quotes = _csv(tmp_path / "q.csv", [{"tenor": k, "rate_pct": v} for k, v in QUOTES.items()])
+    bonds = _csv(tmp_path / "bonds.csv", [{"isin": "IN0020210137", "clean_price": "100"}])  # no maturity_date
+    args = ["asset-swaps", "--quotes", quotes, "--trade-date", "2025-05-30", "--overnight", "5.80",
+            "--max-extrapolation-years", "10", "--project-calendar", "--bonds", bonds, "--out",
+            str(tmp_path / "a.csv"), "--frb-out", str(tmp_path / "f.csv")]
+    assert main(args) == 0
+    out = capsys.readouterr().out
+    assert "1 of 1 GoI FRBs measured, their coupons as known at 2025-05-30 00:00 (00:00 on the trade date" in out
+    frb = pd.read_csv(tmp_path / "f.csv").iloc[0]
+    assert (frb["coupon_pct"], frb["next_coupon_pct"]) == (6.99, 6.99)  # not the coupon announced in Apr 2026
+
+
+def test_corp_price_prices_mixed_rows_and_fails_when_nothing_is_priced(tmp_path, capsys, isin):
+    t17 = isin("INE000T1701")
+    terms = _csv(tmp_path / "terms.csv", [{**T17_TERMS, "isin": t17}])
+    prices = _csv(tmp_path / "p.csv", [{"isin": t17, "settlement_date": "2026-11-16", "clean_price": T17_CLEAN,
+                                        "yield_pct": ""},
+                                       {"isin": t17, "settlement_date": "2026-11-16", "clean_price": "",
+                                        "yield_pct": "8.2612262724"}])
+    assert main(["corp-price", "--terms", terms, "--prices", prices, "--out", str(tmp_path / "o.csv")]) == 0
+    out = pd.read_csv(tmp_path / "o.csv")
+    assert out["error"].fillna("").tolist() == ["", ""]
+    assert out["clean_price"].tolist() == pytest.approx([T17_CLEAN] * 2, abs=1e-8)
+    assert "2 of 2 rows priced" in capsys.readouterr().out
+    refused = _csv(tmp_path / "r.csv", [{"isin": isin("INE000NOT01"), "settlement_date": "2026-11-16",
+                                         "clean_price": 100}])
+    assert main(["corp-price", "--terms", terms, "--prices", refused, "--out", str(tmp_path / "x.csv")]) == 1
+    assert "refused" in capsys.readouterr().out
+
+
+def test_frb_coupons_command(tmp_path, capsys):
+    out_path = tmp_path / "coupons.csv"
+    assert main(["frb-coupons", "--as-of", "2026-11-19T20:00", "--isin", "IN0020180041", "--out",
+                 str(out_path)]) == 0
+    assert "1 GoI FRBs" in capsys.readouterr().out
+    rates = pd.read_csv(out_path)
+    assert set(rates["isin"]) == {"IN0020180041"} and rates.columns.tolist()[:4] == ["isin", "period_start",
+                                                                                        "period_end", "fixing_day"]
+    row = rates.set_index("period_start").loc["2026-06-07"]
+    assert (row["status"], row["rate_pct"]) == ("projected", 6.52)
+    assert main(["frb-coupons", "--out", str(out_path)]) == 2  # a time is required
+    assert "--as-of is required" in capsys.readouterr().err
+    nss = _csv(tmp_path / "nss.csv", [rt.nss_params_row(CURVE, date(2026, 11, 13))])
+    assert main(["frb-coupons", "--as-of", "2026-11-19T20:00", "--isin", "IN0020180041", "--projection", "forward",
+                 "--nss-params", nss, "--out", str(out_path)]) == 0
+    capsys.readouterr()
+    forward = pd.read_csv(out_path).set_index("period_start")
+    assert forward.loc["2027-06-07", "public_from_source"] == "forward"

@@ -13,17 +13,27 @@ the rounding mode for later bonds is UNVERIFIED), an auction held on the fixing 
 (``index="gsec5y_reset5y"``): only announced coupons are used for it.
 
 **As known at a time.** Every T-bill result carries ``public_from`` (``tbill_way_table``: the RBI store's feed
-time, else the end of the release date; a stated rule otherwise, or refused). ``goi_frb_rates`` gives each coupon
-period's rate as known at ``as_of``: ``announced`` (RBI's coupon release, from ``goi_frb_coupons.csv`` or a table
-of the same columns, public from its release time; a release date alone counts from 23:59:59; an unknown time is
-estimated as 00:00 on the fixing day and flagged, UNVERIFIED), else ``computed`` (the three results public by
-``as_of``, complete once no weekly auction can still fall before the fixing day: the last used auction is within
-seven days of it, UNVERIFIED rule of thumb from the weekly auction calendar; public from the latest of the three
-results), else ``projected``, else ``unknown`` for a past period nothing fixes. Projection (UNVERIFIED choice):
-``flat`` (default) holds every later coupon at the latest computable base (rounded as the coupon rule rounds) plus
-the spread, or at the base implied by the latest announced coupon when the T-bill results are too few; ``forward``
-uses a discount curve's 182-day forward rate from each fixing day, as a T-bill yield (simple, actual/365),
-unrounded. Fewer than three results are refused unless ``allow_fewer`` (flagged).
+time, else the end of the release date; a stated rule otherwise, or refused; a time before 00:00 on the auction day
+is refused as a typo). ``goi_frb_rates`` gives each coupon period's rate as known at ``as_of``: ``announced``
+(RBI's coupon release, from ``goi_frb_coupons.csv`` or a table of the same columns, public from its release time; a
+release date alone counts from 23:59:59; an unknown time is estimated as 00:00 on the fixing day and flagged,
+UNVERIFIED; one announced more than ``ANNOUNCE_LEAD_DAYS``, 14, before its fixing day is refused), else ``computed``
+(the three results public by ``as_of`` and dated before the fixing day, complete once no weekly auction can still
+fall before the fixing day: the last used auction is within seven days of it, or a week has passed since the fixing
+day, by when every auction held before it is taken to be published, an auction not held noted; UNVERIFIED rules of
+thumb from the weekly auction calendar; public from the latest of the three results), else ``projected``, else
+``unfixed`` (a period that has ended with neither: its projection kept, flagged, so that its coupon can be paid),
+else ``unknown`` (nothing to project from: NaN, with the reason in ``notes``). A period whose fixing day has passed
+is projected only from the results dated before that day (``before_fixing``: the right auctions, awaiting
+completeness) or from the coupon announced for the period before it (``previous_coupon``), never from later
+auctions. One still to be fixed (UNVERIFIED choice): ``flat`` (default) at the latest computable base (rounded as the
+coupon rule rounds) plus the spread, or at the base implied by the latest announced coupon when the T-bill results
+are too few; ``forward`` at a discount curve's 182-day forward rate from each fixing day, as a T-bill yield (simple,
+actual/365), unrounded. ``public_from_source`` names a projection's base (``flat``, ``announced_base``, ``forward``,
+``before_fixing``, ``previous_coupon``, ``proxy``). A base more than one period older than the period in force at
+the fixing day (at ``as_of`` for one still ahead) is stale and refused (unknown, the missing coupons named) unless
+``allow_stale`` (``proxy``, flagged), as is a passed fixing with no result before it. Fewer than three results are
+refused unless ``allow_fewer`` (flagged). Without ``as_of`` everything in the inputs is used and every row says so.
 
 **The bond.** ``GoiFloatingRateBond`` composes an unchanged ``bonds.FixedRateBond`` with a 1% coupon on the G-sec
 conventions (``GOI_FRB``: 30E/360 periods, semi-annual, the last period simple): its schedule, flow times and unit
@@ -35,21 +45,28 @@ the G-sec half-year times and ``I`` the index the projection used, i.e. the FRB'
 with a flat projection a price of 100 gives ``dm`` equal to the spread. Curve form: ``P_dirty = sum CF_j DF(d_j)
 exp(-dm tau_j)``, ``tau`` actual days / 365 from settlement, ``DF`` relative to settlement. ``price_from_dm`` is the
 reverse; ``spread_dv01`` the fall in price for a one basis point rise in ``dm``; ``index_dv01`` the change for a
-one basis point rise in the projected index with ``dm`` held (the projected coupons move, the known ones do not);
-``spread_duration`` the spread DV01 per unit of dirty price. Reset dates are not deemed maturities (SEBI MF master
+one basis point rise in the projected index with ``dm`` held (the projected coupons of periods still to start move,
+the known ones and the coupon in force do not: it was fixed when its period began, even if the data lack it), the
+FRB's rate risk, which sits at its next reset; ``spread_duration`` the spread DV01 per unit of dirty price. Reset dates are not deemed maturities (SEBI MF master
 circular 6.18.18).
 
 **Corporate FRBs** are ``corporates.CorporateBond`` objects whose ``rate_steps`` hold the fixings:
 ``corporate_frb_rates`` reads a ``FloatingTerms`` (benchmark, spread, reset interval, fixing lag, look-back average,
 floor, cap, rounding: the fields SEBI's NCS master circular asks the database to hold) and a fixings table (each
-value with its ``public_from``) and returns one rate per reset, ``fixed`` once its fixing date is over and the
-fixing public, else ``projected`` (flat at the latest public fixing, or forward). MIBOR is FBIL's and licensed: none
-is shipped. Day count as for NCDs (SEBI actual/actual).
+value with its ``public_from``, refused when public before its own date) and returns one rate per reset, ``fixed``
+once its fixing date is over and the fixing public and current (no fixing dated on or before the fixing date still
+to be published; for a daily benchmark the fixing date's own value, or the last business day's before it when it is
+a holiday; for a periodic one, such as a weekly T-bill yield, one no more than one and a half of its usual intervals
+older), else ``projected`` (flat at the latest public fixings on or before a passed fixing date, the gap or the wait
+noted, or forward), ``unfixed`` once its period has ended so, ``unknown`` with no fixing at all. MIBOR is FBIL's and
+licensed: none is shipped. Day count as for NCDs (SEBI actual/actual).
 
 Shipped facts: ``data/goi_frb_terms.csv`` (the five outstanding GoI FRBs) and ``data/goi_frb_coupons.csv`` (coupons
-typed in from RBI releases read through copies and search summaries, each row with its status). Not built: RBI's
-FRB coupon releases are not parsed (no saved sample), the meaning of RBI's printed FRB auction yield is not known,
-FRB DV01 in the event ledger and FRBs in the return engine come next.
+typed in from RBI releases read through copies and search summaries, each row with its status). The coupons cover few
+past periods: of the half-years begun by 19 Nov 2026, FRB 2028 2 of 11, FRB 2031 3 of 18, FRB 2033 3 of 14, FRB 2034
+7 of 12 (FRB 2035's two five-yearly coupons 14 of 44): a back-test needs RBI's coupon history typed in, or the 182-day
+results. Not built: RBI's FRB coupon releases are not parsed (no saved sample), the meaning of RBI's printed FRB
+auction yield is not known, FRB DV01 in the event ledger. The return engine values FRBs (``returns``).
 """
 
 from __future__ import annotations
@@ -531,8 +548,8 @@ def _announced_base(announced: list[dict], cutoff: datetime | None, start: date,
     if b["start"] < fresh_from:
         if not allow_stale:
             return None, (f"the newest coupon announced by then is for the period from {b['start']}, more than one "
-                          f"period before the one in force on {ref} ({starts[j]}): too old to project from (add "
-                          "RBI's coupons or the T-bill results, or allow_stale=True projects from it, flagged)")
+                          f"period before the period from {starts[j]} (in force on {ref}): too old to project from "
+                          "(add RBI's coupons or the T-bill results; allow_stale=True projects from it, flagged)")
         stale = f"; a stale base, announced for {b['start']} (allow_stale)"
     else:
         stale = ""
@@ -858,14 +875,17 @@ def index_dv01(bond: GoiFloatingRateBond, settlement, dm_bp: float, *, index_pct
                form: str = "index") -> float:
     """Fall in price for a one basis point rise in the projected index with the discount margin held.
 
-    Projected coupons (status ``projected``) move by the bump; announced and computed ones do not. In index
-    form the discount rate ``I + dm`` moves too. A central difference of half a basis point each way.
+    Projected coupons (status ``projected``) of periods starting after settlement move by the bump; announced and
+    computed ones do not, nor does the coupon of the period in force at settlement, projected or not (it was fixed
+    when the period began, even when the data do not hold it). In index form the discount rate ``I + dm`` moves
+    too. A central difference of half a basis point each way.
     """
     s = as_date(settlement)
     base = _index(bond, index_pct) if form == "index" else 0.0
 
     def priced(h: float) -> float:
-        rates = [(st, r + h if status == "projected" else r, status, when) for st, r, status, when in bond.rates]
+        rates = [(st, r + h if status == "projected" and st > s else r, status, when)
+                 for st, r, status, when in bond.rates]
         bumped = bond.with_rates(rates, bond.index_pct)
         if form == "index":
             return price_from_dm(bumped, s, dm_bp, index_pct=base + h)[1]
@@ -951,22 +971,38 @@ def read_fixings(source) -> pd.DataFrame:
     rows = []
     for i, rec in enumerate(frame.to_dict("records")):
         where = f"fixings row {i + 2} ({rec['benchmark']} {rec['date']})"
-        rows.append({"benchmark": rec["benchmark"], "date": as_date(rec["date"]),
-                     "value_pct": _num(rec["value_pct"], f"{where} value_pct"),
-                     "public_from": public_time(rec["public_from"], f"{where} public_from"),
+        day, when = as_date(rec["date"]), public_time(rec["public_from"], f"{where} public_from")
+        if when < datetime.combine(day, time(0, 0)):
+            raise ValueError(f"{where}: public from {when:%Y-%m-%d %H:%M}, before the fixing's own date: check the "
+                             "time")
+        rows.append({"benchmark": rec["benchmark"], "date": day,
+                     "value_pct": _num(rec["value_pct"], f"{where} value_pct"), "public_from": when,
                      "source": rec.get("source", "")})
     return pd.DataFrame(rows, columns=list(FIXING_COLUMNS))
 
 
+def _expected_fixing(day: date, spacing: float, calendar: BusinessCalendar) -> date:
+    """The date the fixing used for ``day`` should carry: ``day`` itself for a daily benchmark, or the last business
+    day before it when it is not one; a periodic benchmark's (``spacing`` days apart) is any of its last period."""
+    return day if calendar.is_business_day(day) else calendar.adjust(day, "preceding")
+
+
 def corporate_frb_rates(bond: CorporateBond, terms: FloatingTerms, fixings: pd.DataFrame, *, as_of=None,
-                        projection: str = "flat", curve=None, tenor_days: int | None = None) -> pd.DataFrame:
+                        projection: str = "flat", curve=None, tenor_days: int | None = None,
+                        calendar: BusinessCalendar | None = None) -> pd.DataFrame:
     """One rate per reset of a corporate FRB as known at ``as_of`` (``CORPORATE_RATE_COLUMNS``).
 
     Resets fall on every ``reset_months // coupon months``-th period start from issue. The fixing date is the
     reset less ``fixing_lag_days``; its value the mean of the ``lookback`` latest fixings dated on or before it
-    and public by ``as_of``. A reset is ``fixed`` once its fixing date is over (before ``as_of``'s date) and
-    its fixings public; else ``projected``: ``flat`` at the latest public fixings, or ``forward`` from
-    ``curve`` over ``tenor_days`` (simple, 365 days). ``rate_steps`` turns the rows into the bond's steps.
+    and public by ``as_of``. A reset is ``fixed`` once its fixing date is over (before ``as_of``'s date), its
+    fixings public and current: no fixing dated on or before the fixing date is still to be published, and the
+    latest one used is the fixing date's own (the last business day before it on ``calendar``, default the bond's,
+    when the fixing date is a holiday) for a daily benchmark, or no more than one and a half of the benchmark's
+    usual intervals (the median gap between its dates in the table) older for a periodic one such as a weekly
+    T-bill yield. Otherwise it is ``projected``, flat at the latest public fixings on or before the fixing date (a
+    fixing still to be published, or a gap in the table, noted), or ``forward`` from ``curve`` over ``tenor_days``
+    (simple, 365 days); a period that has ended so is ``unfixed`` (its rate kept, noted); one with no fixing at all
+    is ``unknown``. ``rate_steps`` turns the rows into the bond's steps.
     """
     if not isinstance(bond, CorporateBond):
         raise TypeError("bond must be a corporates.CorporateBond")
@@ -983,39 +1019,63 @@ def corporate_frb_rates(bond: CorporateBond, terms: FloatingTerms, fixings: pd.D
     step = terms.reset_months // months
     starts = [bond.issue_date, *bond.due_schedule[:-1]][::step]
     cutoff = None if as_of is None else public_time(as_of, "as_of")
+    cal = calendar if calendar is not None else (bond.calendar.lenient() if bond.calendar is not None
+                                                  else BusinessCalendar("weekdays", strict=False))
     table = read_fixings(fixings)
-    mine = table.loc[table["benchmark"] == terms.benchmark].sort_values("date")
-    public = [r for r in mine.to_dict("records") if cutoff is None or r["public_from"] <= cutoff]
+    mine = table.loc[table["benchmark"] == terms.benchmark].sort_values("date").to_dict("records")
+    public = [r for r in mine if cutoff is None or r["public_from"] <= cutoff]
+    gaps = sorted((b["date"] - a["date"]).days for a, b in pairwise(mine))
+    spacing = gaps[len(gaps) // 2] if gaps else 1  # the benchmark's usual interval, as the table shows it
     ends = [*starts[1:], bond.maturity]
     out = []
     for start, end in zip(starts, ends):
         fixing_date = start - timedelta(days=terms.fixing_lag_days)
         used = [r for r in public if r["date"] <= fixing_date][-terms.lookback:]
         over = cutoff is None or cutoff.date() > fixing_date
+        ended = cutoff is not None and end <= cutoff.date()
         rec = {"period_start": start, "fixing_date": fixing_date, "fixings_used": "", "fixing_pct": math.nan,
                "rate_pct": math.nan, "status": "unknown", "public_from": None, "notes": ""}
-        if over and len(used) == terms.lookback:
+        notes = []
+        if used:
+            last = used[-1]["date"]
+            waiting = [r["date"] for r in mine if last < r["date"] <= fixing_date
+                       and not (cutoff is None or r["public_from"] <= cutoff)]
+            if waiting:
+                notes.append(f"the fixing of {waiting[-1]} is not public yet")
+            elif spacing <= 1:
+                expected = _expected_fixing(fixing_date, spacing, cal)
+                if last < expected:
+                    notes.append(f"the fixing of {expected} is not in the table: the latest, of {last}, is "
+                                 f"{len(cal.business_days(last, expected)) - 1} business days older")
+            elif (fixing_date - last).days > 1.5 * spacing:
+                notes.append(f"the fixing used, of {last}, is {(fixing_date - last).days} days before the fixing "
+                             f"date: more than the benchmark's usual {spacing} days (a gap in the table?)")
+        if over and len(used) == terms.lookback and not notes:
             value = sum(r["value_pct"] for r in used) / len(used)
             rec.update(fixings_used=";".join(str(r["date"]) for r in used), fixing_pct=value,
                        rate_pct=terms.coupon(value), status="fixed",
                        public_from=_as_datetime(max(r["public_from"] for r in used)))
-        elif cutoff is not None and end <= cutoff.date():
-            rec["notes"] = "the period has ended and its fixing is not in the table"
-        elif projection == "forward":
+        elif projection == "forward" and not ended and not (over and used):
             if curve is None or tenor_days is None:
                 raise ValueError("a forward projection needs curve= and tenor_days=")
             if fixing_date >= curve.valuation_date:
                 value = forward_tbill_yield(curve, fixing_date, tenor_days)
                 rec.update(fixing_pct=value, rate_pct=terms.coupon(value), status="projected",
                            notes="forward projection")
-        elif public:
-            latest = public[-terms.lookback:]
+        elif public and (len(used) == terms.lookback or not over):  # a passed fixing only from those before it
+            latest = used if over else public[-terms.lookback:]
             value = sum(r["value_pct"] for r in latest) / len(latest)
             note = f"flat at the fixings public by {cutoff:%Y-%m-%d %H:%M}" if cutoff else "flat"
-            if over:
-                note += f"; the fixing of {fixing_date} is not in the table"
+            if ended:
+                note += "; the period has ended without its fixing in the table: the projection is kept"
             rec.update(fixings_used=";".join(str(r["date"]) for r in latest), fixing_pct=value,
-                       rate_pct=terms.coupon(value), status="projected", notes=note)
+                       rate_pct=terms.coupon(value), status="unfixed" if ended else "projected",
+                       notes="; ".join([*notes, note]))
+        elif ended:
+            rec["notes"] = "the period has ended and its fixing is not in the table"
+        elif over:
+            rec["notes"] = (f"{len(used)} of the {terms.lookback} fixings on or before {fixing_date} are public: the "
+                            "coupon is not known")
         out.append(rec)
     return pd.DataFrame(out, columns=list(CORPORATE_RATE_COLUMNS))
 

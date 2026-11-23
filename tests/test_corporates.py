@@ -848,3 +848,214 @@ def test_corp_price_command(capsys, tmp_path):
     assert main(["corp-price", "--terms", str(terms), "--isin", "INE404X0000", "--settlement", "2027-01-15",
                  "--price", "100"]) == 2
     assert "not in" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------- fixes of the review (as known, tables, schedules)
+
+
+def test_a_decision_not_to_call_counts_only_from_its_notice():
+    """The math review's case: a call known not to be exercised from 1 Dec 2027 17:00 is still a workout on 20 Nov
+    2026 (the build dropped it at any date, a look-ahead of 215 bp in the yield to worst)."""
+    s = D(2026, 11, 20)
+    declined = CallPut("call", D(2028, 1, 15), 100.0, exercised=False, exercised_public_from="2027-12-01T17:00")
+    bond = CorporateBond(9.5, D(2033, 1, 15), D(2023, 1, 15), options=(declined,))
+    for as_of in (None, "2026-11-19T00:00", "2027-12-01T16:59"):
+        w, v = bond.yield_to_worst(s, 103.0, as_of=as_of), bond.sebi_valuation(s, 8.0, as_of=as_of)
+        assert (round(w.yield_pct, 6), w.kind, round(v.clean_price, 6), v.date) == (6.6745, "call", 101.544778,
+                                                                                    D(2028, 1, 15))
+    w, v = bond.yield_to_worst(s, 103.0, as_of="2027-12-01T17:00"), bond.sebi_valuation(s, 8.0, as_of="2027-12-02")
+    assert (round(w.yield_pct, 6), w.kind, round(v.clean_price, 6)) == (8.827958, "maturity", 106.990293)
+    assert bond.price_to_worst(s, 8.0)[2] == "call" and bond.price_to_worst(s, 8.0, as_of="2027-12-02")[2] == \
+        "maturity"
+    assert [o.kind for o in bond.as_known("2027-12-02").options] == [] and bond.as_known("2026-11-19").options
+    terms = pd.DataFrame([{"isin": "INE000UX0001", "kind": "corporate", "coupon_pct": "9.5", "frequency": "1",
+                           "issue_date": "2023-01-15", "maturity_date": "2033-01-15"}])
+    options = pd.DataFrame([{"isin": "INE000UX0001", "kind": "call", "date": "2028-01-15", "exercised": "no",
+                             "exercised_public_from": "2027-12-01T17:00"}])
+    frame = pd.DataFrame([{"isin": "INE000UX0001", "settlement_date": "2026-11-20", "clean_price": 103.0}])
+    out = price_corporates(frame, terms, options=options, valuation="worst")  # as known at 00:00 on 19 Nov (T-1)
+    assert (round(out["yield_pct"].iloc[0], 6), out["workout_kind"].iloc[0]) == (6.6745, "call")
+    assert out["known_as_of"].iloc[0] == pd.Timestamp("2026-11-19 00:00")
+    later = price_corporates(frame, terms, options=options, valuation="worst", as_of="2027-12-02T00:00")
+    assert (round(later["yield_pct"].iloc[0], 6), later["workout_kind"].iloc[0]) == (8.827958, "maturity")
+    row = price_corporates(frame.assign(as_of="2027-12-02T00:00"), terms, options=options, valuation="worst")
+    assert row["workout_kind"].iloc[0] == "maturity"  # a row's own as_of cell
+
+
+def test_batch_pricing_applies_an_exercise_once_public():
+    """A call exercised by a notice public on 2 Nov 2026 redeems the bond on 15 Jan 2027 for a settlement on 16 Nov
+    (the build valued it to 2034 outside the return engine)."""
+    terms = pd.DataFrame([{"isin": "INE000CL001", "kind": "corporate", "coupon_pct": "8", "frequency": "1",
+                           "issue_date": "2024-01-15", "maturity_date": "2034-01-15"}])
+    options = pd.DataFrame([{"isin": "INE000CL001", "kind": "call", "date": "2027-01-15", "exercised": "yes",
+                             "exercised_public_from": "2026-11-02T17:00"}])
+    called = CorporateBond(8.0, D(2034, 1, 15), D(2024, 1, 15)).to_workout(D(2027, 1, 15))
+    clean = called.clean_price(7.0, D(2026, 11, 16))
+    assert round(clean, 6) == 100.086466
+    frame = pd.DataFrame([{"isin": "INE000CL001", "settlement_date": "2026-11-16", "clean_price": clean}])
+    out = price_corporates(frame, terms, options=options).iloc[0]
+    assert out["yield_pct"] == pytest.approx(7.0, abs=1e-9) and round(out["modified_duration"], 4) == 0.1625
+    assert (out["workout_date"], out["workout_kind"]) == (D(2027, 1, 15), "exercised_call")
+    assert out["known_as_of"] == pd.Timestamp("2026-11-13 00:00")  # Monday's settlement: Friday's trade
+    before = price_corporates(frame, terms, options=options, as_of="2026-11-01T00:00").iloc[0]
+    assert (round(before["yield_pct"], 6), before["workout_date"]) == (7.969392, D(2034, 1, 15))
+
+
+def test_an_exercise_public_after_its_record_date_is_refused():
+    """The 15-day rule puts a 10 Dec 2026 call's record date on 25 Nov: a notice public on 30 Nov cannot be valued
+    through (the engine stopped on it with a message about the previous close's mark)."""
+    late = CallPut("call", D(2026, 12, 10), 101.0, exercised=True, exercised_public_from="2026-11-30T17:00")
+    bond = CorporateBond(8.0, D(2031, 6, 15), D(2024, 6, 15), options=(late,))
+    assert bond.option_record_date(late) == D(2026, 11, 25)
+    with pytest.raises(ValueError, match="after the redemption's record date 2026-11-25 .*record_date in "
+                                         "corporate_options"):
+        bond.effective_bond("2026-12-01")
+    assert bond.effective_bond("2026-11-29") is bond  # not public yet: nothing to refuse
+    given = dataclasses.replace(late, record_date=D(2026, 12, 1))
+    called = CorporateBond(8.0, D(2031, 6, 15), D(2024, 6, 15), options=(given,)).effective_bond("2026-12-01")
+    assert (called.maturity, called.redemption, called.last_cum_settlement()) == (D(2026, 12, 10), 101.0,
+                                                                                  D(2026, 12, 1))
+    after = CallPut("call", D(2026, 12, 10), exercised=True, exercised_public_from="2026-12-10T09:00",
+                    record_date=D(2026, 12, 1))
+    with pytest.raises(ValueError, match="not before the exercise date"):
+        CorporateBond(8.0, D(2031, 6, 15), D(2024, 6, 15), options=(after,)).check_exercises()
+    with pytest.raises(ValueError, match="record date 2026-12-10 must be before it"):
+        CallPut("call", D(2026, 12, 10), record_date=D(2026, 12, 10))
+    table = pd.DataFrame([{"isin": "INE1", "kind": "call", "date": "2026-12-10", "exercised": "yes",
+                           "exercised_public_from": "2026-11-30T17:00", "record_date": "2026-12-01"}])
+    row = {"isin": "INE1", "kind": "corporate", "coupon_pct": "8", "frequency": "1", "issue_date": "2024-06-15",
+           "maturity_date": "2031-06-15"}
+    assert corporate_from_terms(row, options=read_corporate_options(table)).options[0].record_date == D(2026, 12, 1)
+
+
+def test_term_tables_refuse_unknown_columns():
+    """A misspelt optional column fell back to its default silently: a cumulative bond's 194.17 typed as
+    redemption_pct priced to 100 (a 0% yield)."""
+    with pytest.raises(ValueError, match=r"unknown column 'redemption_pct' \(did you mean 'redemption_per100'\?\)"):
+        read_corporate_terms(TERMS.assign(redemption_pct="194.17"))
+    with pytest.raises(ValueError, match=r"'price_pre100' \(did you mean 'price_per100'\?\)"):
+        read_corporate_options(OPTIONS.rename(columns={"price_per100": "price_pre100"}))
+    with pytest.raises(ValueError, match="unknown column 'colour'"):
+        read_corporate_schedule(pd.DataFrame([{"isin": "A", "due_date": "2027-01-01", "colour": "red"}]))
+    # a blank column from a trailing comma, a header's case and spaces, and rating_bucket (the engine reads it) pass
+    blank = TERMS.assign(**{"Unnamed: 9": "", " Coupon_PCT ": TERMS["coupon_pct"]}).drop(columns="coupon_pct")
+    assert read_corporate_terms(blank.assign(rating_bucket="AA"))["coupon_pct"].tolist() == TERMS["coupon_pct"].tolist()
+    with pytest.raises(ValueError, match="price_pre100"):
+        price_corporates(pd.DataFrame([{"isin": "INE000X01011", "settlement_date": "2027-01-15", "clean_price": 101}]),
+                         TERMS, options=OPTIONS.rename(columns={"price_per100": "price_pre100"}), valuation="worst")
+
+
+def test_isins_match_in_any_case():
+    """An options row keyed in lower case was dropped silently (worst to maturity, 7.43%)."""
+    frame = pd.DataFrame([{"isin": "INE000X01011", "settlement_date": "2026-11-16", "clean_price": 103.0}])
+    lower = OPTIONS.assign(isin=OPTIONS["isin"].str.lower())
+    for opts, terms in ((OPTIONS, TERMS), (lower, TERMS), (OPTIONS, TERMS.assign(isin=TERMS["isin"].str.lower()))):
+        out = price_corporates(frame.assign(isin=" ine000x01011 "), terms, options=opts, valuation="worst")
+        assert (round(out["yield_pct"].iloc[0], 6), out["workout_kind"].iloc[0]) == (6.445028, "call")
+    assert read_corporate_terms(TERMS.iloc[:1].assign(isin=" ine000x01011"))["isin"].iloc[0] == "INE000X01011"
+
+
+def test_principal_only_schedule_rows_amortise_the_generated_schedule():
+    """Schedule rows that are only principal and redemption rows made an explicit schedule of their own dates: one
+    coupon of 27 for 2026-2029 (the code review's case; spec T14)."""
+    schedule = pd.DataFrame([
+        {"isin": "INE000AM0001", "due_date": "2029-04-01", "kind": "principal", "amount_per100": "30"},
+        {"isin": "INE000AM0001", "due_date": "2030-04-01", "kind": "principal", "amount_per100": "30"},
+        {"isin": "INE000AM0001", "due_date": "2031-04-01", "kind": "redemption", "amount_per100": "40"}])
+    row = {"isin": "INE000AM0001", "kind": "corporate", "coupon_pct": "9", "frequency": "1",
+           "issue_date": "2026-04-01", "maturity_date": "2031-04-01"}
+    bond = corporate_from_terms(row, schedule=schedule, calendar=None)
+    assert bond.schedule == "forward"
+    assert [(p.due.year, round(p.amount, 6), p.principal) for p in bond.periods()] == [
+        (2027, 9.0, 0.0), (2028, 9.0, 0.0), (2029, 9.0, 30.0), (2030, 6.3, 30.0), (2031, 3.6, 40.0)]
+    s = D(2026, 11, 20)
+    assert round(bond.dirty_price(9.0, s), 6) == 105.632453 and round(bond.yield_from_price(100.0, s), 6) == 8.960553
+    with pytest.raises(ValueError, match="list every due date"):
+        corporate_from_terms(row, schedule=schedule.assign(record_date="2029-03-17"), calendar=None)
+    with pytest.raises(ValueError, match="not a due date of the bond"):
+        corporate_from_terms(row, schedule=schedule.assign(due_date=["2029-04-01", "2030-04-01", "2031-05-01"]),
+                             calendar=None)
+
+
+def test_explicit_schedules_must_follow_their_frequency():
+    """Semi-annual due dates typed with frequency 1 (or annual ones with 2) were accepted, and the asset swap's
+    matched rate was restated on the wrong basis (+9.2 bp yield-yield)."""
+    semi = tuple(D(y, m, 15) for y in (2027, 2028, 2029) for m in (6, 12))
+    with pytest.raises(ValueError, match="not one period of frequency 1"):
+        CorporateBond(8.0, D(2029, 12, 15), D(2026, 6, 15), frequency=1, schedule="explicit", due_dates=semi)
+    annual = (D(2025, 1, 15), D(2026, 1, 15), D(2027, 1, 15))
+    with pytest.raises(ValueError, match="not one period of frequency 2"):
+        CorporateBond(8.0, D(2027, 1, 15), D(2024, 1, 15), frequency=2, schedule="explicit", due_dates=annual)
+    ok = CorporateBond(8.0, D(2029, 12, 15), D(2026, 6, 15), frequency=2, schedule="explicit", due_dates=semi)
+    assert len(ok.periods()) == 6
+    stubs = (D(2026, 9, 30), D(2027, 3, 31), D(2027, 9, 30), D(2028, 1, 15))  # month ends, a short last period
+    assert CorporateBond(8.0, D(2028, 1, 15), D(2026, 6, 15), frequency=2, schedule="explicit",
+                         due_dates=stubs).due_schedule == stubs
+    with pytest.raises(ValueError, match="record_dates must increase"):
+        CorporateBond(8.0, D(2026, 1, 15), D(2024, 1, 15), schedule="explicit",
+                      due_dates=(D(2025, 1, 15), D(2026, 1, 15)), record_dates=(D(2025, 1, 1), D(2024, 12, 1)))
+    monthly = (D(2025, 1, 15), D(2025, 2, 15), D(2025, 3, 15))
+    with pytest.raises(ValueError, match="payment_dates must increase"):
+        CorporateBond(8.0, D(2025, 3, 15), D(2024, 12, 15), frequency=12, schedule="explicit", due_dates=monthly,
+                      payment_dates=(D(2025, 1, 30), D(2025, 1, 25), D(2025, 3, 15)))
+    with pytest.raises(ValueError, match="not before its payment date"):
+        CorporateBond(8.0, D(2026, 1, 15), D(2024, 1, 15), schedule="explicit",
+                      due_dates=(D(2025, 1, 15), D(2026, 1, 15)), payment_dates=(D(2025, 1, 13), D(2026, 1, 15)),
+                      record_dates=(D(2025, 1, 14), D(2026, 1, 1)))
+
+
+def test_a_record_date_falls_before_an_early_payment(cal):
+    """With record_days=0 the redemption due Sunday 15 Dec 2024 is paid on Friday 13 Dec: its record date is the
+    day before, so the last settlement that receives it is 12 Dec (the build said 14 Dec and refused to price it)."""
+    bond = CorporateBond(9.0, D(2024, 12, 15), D(2019, 12, 15), record_days=0, calendar=cal, isin="INE000RD0001")
+    last = bond.periods()[-1]
+    assert (last.payment, last.record, bond.last_cum_settlement()) == (D(2024, 12, 13), D(2024, 12, 12),
+                                                                       D(2024, 12, 12))
+    assert round(bond.dirty_price(8.0, D(2024, 12, 12)), 6) == 108.976115
+    with pytest.raises(ValueError, match="after the redemption record date 2024-12-12"):
+        bond.dirty_price(8.0, D(2024, 12, 13))
+    coupon = bond.periods()[-2]  # due Fri 15 Dec 2023 and paid that day: on record at the close of 14 Dec
+    assert (coupon.payment, coupon.record, bond.record_date(coupon.due)) == (D(2023, 12, 15), D(2023, 12, 14),
+                                                                             D(2023, 12, 14))
+
+
+def test_price_corporates_prices_each_row_from_what_it_has_and_keeps_refused_inputs():
+    """A row with only a yield was refused ('clean_price is missing') and its yield blanked."""
+    frame = pd.DataFrame([{"isin": "INE000X01011", "settlement_date": "2027-01-15", "clean_price": 102.25,
+                           "yield_pct": None},
+                          {"isin": "INE000X01011", "settlement_date": "2027-01-15", "clean_price": None,
+                           "yield_pct": 8.0},
+                          {"isin": "INE999X99999", "settlement_date": "2027-01-15", "clean_price": 101.0,
+                           "yield_pct": 7.5}])
+    out = price_corporates(frame, TERMS, given="auto")
+    assert out["error"].tolist()[:2] == ["", ""] and out["error"].iloc[2] == "INE999X99999: no terms"
+    s = D(2027, 1, 15)
+    assert out["clean_price"].iloc[1] == pytest.approx(_callable(options=()).clean_price(8.0, s), abs=1e-12)
+    assert out["yield_pct"].iloc[1] == 8.0
+    assert (out["clean_price"].iloc[2], out["yield_pct"].iloc[2]) == (101.0, 7.5)  # the inputs, kept
+    fixed = price_corporates(frame, TERMS)  # given="clean_price": the yield row is refused, its yield kept
+    assert fixed["error"].iloc[1] == "clean_price is missing" and fixed["yield_pct"].iloc[1] == 8.0
+
+
+def test_prices_per_100_of_the_outstanding_face():
+    """Spec T14 after 30 of its 100 are redeemed: 99.903062 per 100 of the 70 outstanding is 69.932143 per 100
+    original face, a 9% yield."""
+    frame = pd.DataFrame([{"isin": "INE000X01029", "settlement_date": "2029-10-01", "clean_price": 99.903062}])
+    out = price_corporates(frame, TERMS, amortisation=AMORT, price_basis="outstanding").iloc[0]
+    assert out["yield_pct"] == pytest.approx(9.0, abs=1e-5) and out["clean_price"] == pytest.approx(99.903062)
+    assert price_corporates(frame, TERMS, amortisation=AMORT)["yield_pct"].iloc[0] < 0  # read per 100 original
+    with pytest.raises(ValueError, match="price_basis"):
+        price_corporates(frame, TERMS, price_basis="par")
+
+
+def test_rolls_on_a_projected_calendar_are_flagged():
+    """Dates past 2026 roll on weekends only (Republic Day 2027 is a payment date): flagged calendar_projected."""
+    terms = pd.DataFrame([{"isin": "INE000RD2701", "kind": "corporate", "coupon_pct": "9", "frequency": "1",
+                           "issue_date": "2025-01-26", "maturity_date": "2030-01-26"}])
+    frame = pd.DataFrame([{"isin": "INE000RD2701", "settlement_date": "2026-11-20", "yield_pct": 8.0}])
+    out = price_corporates(frame, terms, given="yield_pct")
+    assert bool(out["calendar_projected"].iloc[0]) is True
+    assert not price_corporates(frame, terms, given="yield_pct", calendar=None)["calendar_projected"].iloc[0]
+    short = terms.assign(maturity_date="2026-01-26", issue_date="2024-01-26", isin="INE000RD2601")
+    assert not price_corporates(frame.assign(isin="INE000RD2601", settlement_date="2025-11-20"), short,
+                                given="yield_pct")["calendar_projected"].iloc[0]

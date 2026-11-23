@@ -4,8 +4,9 @@
 them (``rbi_store.read_table(store, "money_market_daily")``): one row per as-on date, weekends and holidays
 included. ``source`` picks the overnight segment: ``triparty`` (TREPS, CCIL's tri-party repo, the default),
 ``market_repo`` (basket and special repo together), ``call`` (the weighted average call rate, WACR: the operating
-target and the free stand-in for overnight MIBOR, a whole-day average where FBIL's MIBOR averages a morning window)
-or ``overnight`` (all segments). A row is a dealing day when it carries a rate; weekend and holiday rows carry none
+target and the free stand-in for overnight MIBOR, a whole-day average where FBIL's MIBOR averages a morning window),
+``overnight`` (all segments) or ``corp_bond_repo`` (repo in corporate bonds: what a corporate bond or CP is lent
+against, dearer than G-sec repo: 5.70% against 5.55% on 13 Nov 2026 in the RBI store). A row is a dealing day when it carries a rate; weekend and holiday rows carry none
 and are never filled forward. A dealing day's rate runs to the next dealing day: a Friday's covers the weekend, and a
 Saturday row with a rate and a volume (money markets deal on some Saturdays) is a dealing day of its own. The SDF and
 MSF rates of each row bound the corridor (SDF = repo - 25 bp, MSF = repo + 25 bp, symmetric since the SDF replaced the
@@ -95,6 +96,8 @@ from cr_strat.asset_swaps import instrument_from_row
 from cr_strat.bonds import DiscountInstrument, FixedRateBond
 from cr_strat.calendars import BusinessCalendar, CalendarCoverageError, calendar_for
 from cr_strat.conventions import as_date, days_30e_360
+from cr_strat.corporates import CorporateBond
+from cr_strat.floating import GoiFloatingRateBond
 from cr_strat.ois import (
     OisSwap,
     as_time,
@@ -106,7 +109,7 @@ from cr_strat.ois import (
 )
 from cr_strat.policy_path import policy_rate_on, read_policy_table
 
-FUNDING_SOURCES = ("triparty", "market_repo", "call", "overnight")
+FUNDING_SOURCES = ("triparty", "market_repo", "call", "overnight", "corp_bond_repo")
 FUNDING_COLUMNS = ("date", "dealing_day", "rate_pct", "volume_cr", "low_pct", "high_pct", "sdf_pct", "msf_pct",
                    "repo_pct", "below_sdf", "above_msf", "business_day", "quarter_end_day", "fy_end_day",
                    "public_from", "revised", "source", "notes")
@@ -604,8 +607,9 @@ def carry(bond, face: float, clean_price: float, start, end, *, funding: pd.Data
     rate, which only the user can give): coupons and the pull to par are paid away, interest is earned on the cash
     lent and on the sale proceeds kept.
     """
-    if not isinstance(bond, (FixedRateBond, DiscountInstrument)):
-        raise TypeError("bond must be a bonds.FixedRateBond or DiscountInstrument")
+    if not isinstance(bond, (FixedRateBond, DiscountInstrument, CorporateBond, GoiFloatingRateBond)):
+        raise TypeError("bond must be a bonds.FixedRateBond or DiscountInstrument, a corporates.CorporateBond or a "
+                        "floating.GoiFloatingRateBond")
     if repo_compounding not in REPO_COMPOUNDING:
         raise ValueError(f"repo_compounding must be one of {REPO_COMPOUNDING}, not {repo_compounding!r}")
     if projection is not None and projection not in PROJECTIONS:
@@ -618,6 +622,9 @@ def carry(bond, face: float, clean_price: float, start, end, *, funding: pd.Data
     if e >= bond.maturity:
         raise ValueError(f"the horizon ends {e}, on or after the bond's maturity {bond.maturity}: carry to redemption "
                          "is not built")
+    if isinstance(bond, CorporateBond) and e > bond.last_cum_settlement():
+        raise ValueError(f"the horizon ends {e}, after the bond's redemption record date {bond.last_cum_settlement()}: "
+                         "trading is suspended then, and carry to redemption is not built")
     f = float(face)
     if not (math.isfinite(f) and f > 0):
         raise ValueError(f"face must be a positive number of rupees, not {face!r} (a short is side='short')")
@@ -647,6 +654,7 @@ def carry(bond, face: float, clean_price: float, start, end, *, funding: pd.Data
         if other_funding is not None:
             other_funding = _funding_at(other_funding, cutoff, "other funding")
     clean = float(clean_price)
+    principal = 0.0
     if isinstance(bond, DiscountInstrument):
         dirty, accrued0, accrued1, coupons = clean, 0.0, 0.0, 0.0
         y0 = bond.yield_from_price(clean, s)
@@ -655,11 +663,20 @@ def carry(bond, face: float, clean_price: float, start, end, *, funding: pd.Data
         a = bond.analytics(s, clean_price=clean)
         dirty, accrued0, y0 = a.dirty_price, a.accrued_interest, a.yield_pct
         accrued1 = bond.accrued_interest(e)
-        coupons = sum(fl.amount for fl in bond.cash_flows(s) if fl.kind == "coupon" and fl.date <= e)
+        if isinstance(bond, CorporateBond):
+            # a corporate bond's flows go to the holder at its record dates: the coupons and principal entitled in
+            # [start, end), whatever their payment date (accrued interest is negative in the ex-interest window)
+            coupons = principal = 0.0
+            for per in bond.periods():
+                if s <= min(per.record, per.due - timedelta(days=1)) < e:
+                    coupons += per.amount
+                    principal += per.principal
+        else:
+            coupons = sum(fl.amount for fl in bond.cash_flows(s) if fl.kind == "coupon" and fl.date <= e)
         clean_end = bond.clean_price(y0, e)
     sign = 1.0 if side == "long" else -1.0
     income = sign * f / 100 * (coupons + accrued1 - accrued0)
-    pull = sign * f / 100 * (clean_end - clean) if pull_to_par else 0.0
+    pull = sign * f / 100 * (clean_end - clean + principal) if pull_to_par else 0.0
     cash, equity = (1 - h / 100) * dirty * f / 100, h / 100 * dirty * f / 100
     daily, notes = _daily_rates(funding, s, e, projection, cal)
     days = (e - s).days

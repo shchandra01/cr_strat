@@ -45,9 +45,12 @@ Fills never use model or stale prices.
 (the shipped table by default). A corporate trade settles on the exchange, T+1 unless its ``settlement_date`` says
 otherwise (T+0 allowed, handbook 3.5.1); an FRB as a G-sec. Each day at the valuation time, and at each trade's
 settlement check, the bond is rebuilt as known then (``Instrument.known``): a ``frb_corp`` fixing, a rating action and
-a call's or put's exercise only from their ``public_from``; an FRB's coupon as ``floating.goi_frb_rates`` knows it
-(announced, computed from the three latest 182-day T-bill results public by then, or projected flat and noted; a period
-it cannot project is refused unless ``frb_allow_fewer``). When the bond as known changes, the previous close's mark is
+a call's or put's exercise only from their ``public_from`` (an exercise public after its redemption's record date is
+refused before the run, naming the remedy: the option's ``record_date``); an FRB's coupon as ``floating.goi_frb_rates``
+knows it (announced, computed from the three latest 182-day T-bill results public by then and dated before its fixing
+day, or projected flat and noted; a period that ends with its coupon still projected keeps that rate, so its coupon is
+paid at what was accrued, flagged ``unfixed``; a period it cannot project, from fewer than three results or from a base
+more than a period old, is refused, naming why, unless ``frb_allow_fewer`` or ``frb_allow_stale``). When the bond as known changes, the previous close's mark is
 restated on it (its yield from the same clean price) and the interest accrued to that close is restated at the new
 coupon in the ``coupon_reset`` line, ``F/100 (AI_new(prev) - AI_old(prev))``, nonzero only when a coupon becomes known
 after its period began (a fixing or rating action published late). A corporate coupon goes to the holder at the close
@@ -64,13 +67,18 @@ mark whose standard settlement falls after it is restated to settle on the day i
 redeems at its date and price once the exercise is public; an unexercised option changes no flow (the bond is valued
 to maturity and the mark carries the option). Costs (``costs``): the debenture stamp duty (0.0001% of the
 consideration, on the buyer), the exchange's fee (Rs 5 a crore of value, Rs 25 to Rs 500, GST extra), no CCIL charge,
-the half spread by the trade's ``rating_bucket`` (else the terms', else the widest, all UNVERIFIED); FRBs take the
-G-sec rows. Funding: neither is TREPS collateral here (corporate bonds are not on CCIL's list; FRBs are GoI dated
-securities but are taken as ineligible, UNVERIFIED and conservative); with a row for its kind in the user's haircut
-table a bond is lent against in market repo (``excess_segment``), without one not at all (equity-funded). Attribution:
-a corporate bond's yield moves against the G-sec curve (``rich_cheap`` is its spread's change); an FRB has no default
-reference curve, so its price move is ``price_unattributed`` (a fixed-rate DV01 on projected coupons would overstate
-its rate risk).
+the half spread by the trade's ``rating_bucket``, else the bucket of the worst of each agency's latest rating public
+before the trade day (``MarketData.ratings``, rows of the ISIN or its issuer), else the terms' static
+``rating_bucket`` (noted: a rating typed in later would price earlier trades), else the widest (all UNVERIFIED); FRBs
+take the G-sec rows. Funding: neither is TREPS collateral here (corporate bonds are not on CCIL's list; FRBs are GoI
+dated securities but are taken as ineligible, UNVERIFIED and conservative); with a row for its kind in the user's
+haircut table a corporate bond is lent against in corporate bond repo (``FundingPolicy.corporate_segment``,
+``corp_bond_repo``: the RBI store's repo in corporate bonds, 15 bp over market repo on 13 and 16 Nov 2026; UNVERIFIED
+that a fund pays the segment's average), an FRB in market repo (``excess_segment``), without one not at all
+(equity-funded). Risk: an FRB's ``dv01`` in positions, the tenor buckets (at its next reset) and the hedge check is
+its rate DV01 (``floating.index_dv01``, the margin held), not its yield DV01, which is its spread DV01 and some
+hundred times larger. Attribution: a corporate bond's yield moves against the G-sec curve (``rich_cheap`` is its
+spread's change); an FRB has no default reference curve, so its price move is ``price_unattributed``.
 
 **Attribution** (A2). For each position and day, market lines on the start-of-day book from close to close: ``accrual``
 (accrued interest gained plus coupons entitled), ``pull_to_par`` (``F/100 (clean(y0, s_d) - clean(y0, s_prev))``), and
@@ -160,10 +168,11 @@ used. Unverified: the valuation convention, the roll-down definition, the factor
 funding sizing and rate basis, the TREPS-first split, the margin's form, a hedge's DV01 allowed up to
 ``HEDGE_TOLERANCE`` (105%) of its bonds' under ``hedge_only``, the auction allotment share, the costs marked U in
 ``costs``, the decision and mark times; for corporate bonds and FRBs, the exchange's T+1, the record-date rules of
-``corporates``, FRBs as not TREPS collateral, the half spreads by rating, the flat projection of an unknown coupon.
-Not built: inflation-indexed bonds (no pricer: refused); a corporate bond's default or missed payment (every scheduled
-flow is paid), a partial exercise of a call or put, a ``frb_corp`` bond with rating steps as well, an FRB's split into
-index and spread risk (``asset_swaps.frb_measures`` gives the measures); CSA, clearing margin or charges on OIS;
+``corporates``, FRBs as not TREPS collateral, corporate bonds funded at the corporate bond repo rate, the half spreads
+by rating, the flat projection of an unknown coupon and the coupon of a period ended unfixed paid at it. Not built:
+inflation-indexed bonds (no pricer: refused); a corporate bond's default or missed payment (every scheduled flow is
+paid), a partial exercise of a call or put, a ``frb_corp`` bond with rating steps as well, an FRB's spread DV01 in
+the positions table (``asset_swaps.frb_measures`` gives it); CSA, clearing margin or charges on OIS;
 security-wise repo rates (a short's special rate is the user's, constant over the short); the key-rate DV01 table (DV01
 is by tenor bucket); the funding lines allocated to positions (they stay at book level; ``positions.funded`` gives each
 long's share for reporting); the tradable universe from the issuance ledger (a strategy's own job); an auction's own
@@ -193,6 +202,7 @@ from cr_strat.corporates import (
     CorporateBond,
     apply_rating_steps,
     corporate_from_terms,
+    public_time,
     read_amortisation,
     read_corporate_options,
     read_corporate_schedule,
@@ -208,6 +218,7 @@ from cr_strat.floating import (
     floating_terms_from_row,
     goi_frb_bond,
     goi_frb_rates,
+    index_dv01,
     load_frb_coupons,
     load_frb_terms,
     rate_steps,
@@ -217,6 +228,7 @@ from cr_strat.floating import (
 )
 from cr_strat.funding import FUNDING_SOURCES, haircut, read_haircuts, treps_class, treps_shares
 from cr_strat.issuance import TENOR_BUCKETS, tenor_bucket
+from cr_strat.rating_scale import parse_rating, rating_bucket
 from cr_strat.ois import (
     MIBOR_OIS,
     OisCurve,
@@ -399,7 +411,9 @@ class FundingPolicy:
     """How each book is funded overnight (A1.5).
 
     ``segment``: the ``funding.funding_rates`` source of the main borrowing (``triparty``: TREPS); ``excess_segment``
-    for what CCIL's TREPS caps leave (``market_repo``). ``spread_bp`` over every rate of the cash borrowed (UNVERIFIED
+    for what CCIL's TREPS caps leave (``market_repo``); ``corporate_segment`` for what corporate bonds are lent
+    against (``corp_bond_repo``, repo in corporate bonds, dearer than G-sec repo: UNVERIFIED that a fund gets the
+    segment's average rate; ``spread_bp`` applies to it too), its interest in the ``funding_excess`` line. ``spread_bp`` over every rate of the cash borrowed (UNVERIFIED
     default 0, as ``funding.carry``). ``sizing``: ``cash_need`` (borrow what the day's cash needs, rounded up to
     ``lot_rs``, Rs 5 lakh, TREPS's lot) or ``fixed`` (keep the amount borrowed at each purchase, ``(1 - h)`` of its
     consideration, as ``funding.carry``; cash may go negative at 0%). ``idle_cash_rate_pct`` on cash left over
@@ -416,6 +430,7 @@ class FundingPolicy:
 
     segment: str = "triparty"
     excess_segment: str = "market_repo"
+    corporate_segment: str = "corp_bond_repo"
     spread_bp: float = 0.0
     sizing: str = "cash_need"
     lot_rs: float = 500_000.0
@@ -430,6 +445,7 @@ class FundingPolicy:
     def __post_init__(self) -> None:
         _choice(self.segment, FUNDING_SOURCES, "segment")
         _choice(self.excess_segment, FUNDING_SOURCES, "excess_segment")
+        _choice(self.corporate_segment, FUNDING_SOURCES, "corporate_segment")
         _choice(self.sizing, SIZINGS, "sizing")
         _choice(self.rate_basis, RATE_BASES, "rate_basis")
         _choice(self.on_shortfall, SHORTFALL_RULES, "on_shortfall")
@@ -594,6 +610,8 @@ class EngineSettings:
     verified; an SDL's is 1% of the notified amount, verified; T-bill non-competitive bids are not modelled).
     ``frb_allow_fewer``: project a GoI FRB's coupons from fewer than three public T-bill results (flagged), as
     ``floating.goi_frb_rates`` allows; otherwise such a projection is refused and the coupon stays unknown.
+    ``frb_allow_stale``: project from a base more than one period old (a coupon announced long before, T-bill
+    results after a passed fixing day: flagged); otherwise refused, with the missing coupons named.
     """
 
     access: AccessPolicy
@@ -612,6 +630,7 @@ class EngineSettings:
     auction_max_share: float = 0.10
     auction_nc_limit_rs: float = 2e7
     frb_allow_fewer: bool = False
+    frb_allow_stale: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.access, AccessPolicy):
@@ -2034,6 +2053,8 @@ class _Engine:
         self.strategy = strategy
         self._terms_tables(market)
         self._changed: set[str] = set()  # instruments whose terms as known changed at today's valuation time
+        self._bucket_cache: dict[tuple[str, date], str | None] = {}
+        self.static_buckets: set[str] = set()  # corporate bonds whose costs took the terms' static rating bucket
         self._period_cache: dict[tuple[str, int], tuple] = {}
         self._base_maturity: dict[str, date] = {}
         self.frb_projected: dict[str, date] = {}  # FRBs held while their current coupon was projected: first day
@@ -2102,11 +2123,47 @@ class _Engine:
             return frame[frame["issuer_id"].map(_text) == issuer].reset_index(drop=True)
         return frame.iloc[0:0]
 
+    def _cost_bucket(self, inst: Instrument, d: date) -> str | None:
+        """The rating bucket a corporate trade on ``d`` pays the half spread of: the worst of each agency's latest
+        rating public before ``d`` began (``MarketData.ratings``, rows of the ISIN or its issuer), else the terms'
+        static ``rating_bucket`` (UNVERIFIED fallback: a rating typed in today would price earlier trades; noted)."""
+        key = (inst.isin, d)
+        if key in self._bucket_cache:
+            return self._bucket_cache[key]
+        bucket = inst.rating_bucket
+        rows = None
+        if self.ratings is not None and inst.kind == "corporate":
+            rows = self._ratings_of(inst.isin, self.corp_terms[inst.isin])
+        if rows is not None and not rows.empty:
+            cutoff, latest = _at(d, time(0, 0)), {}
+            for rec in rows.to_dict("records"):
+                when = public_time(rec.get("public_from"), "ratings public_from")
+                if when is None or when > cutoff:
+                    continue
+                parsed = parse_rating(rec.get("rating"))
+                if parsed.scale != "LT" or parsed.notch is None:
+                    continue
+                agency = _text(rec.get("agency")).upper()
+                if agency not in latest or when >= latest[agency][0]:
+                    latest[agency] = (when, parsed.notch)
+            bucket = rating_bucket(max(n for _, n in latest.values())) if latest else None
+            if bucket is None and inst.rating_bucket:
+                bucket = inst.rating_bucket
+                self.static_buckets.add(inst.isin)
+        elif inst.rating_bucket:
+            self.static_buckets.add(inst.isin)
+        self._bucket_cache[key] = bucket
+        return bucket
+
     def _corporate_instrument(self, isin: str, row: Mapping, where: str) -> Instrument:
         """A corporate bond from its terms row and tables; ``known(t)`` gives it as known at ``t``: fixings of a
         ``frb_corp`` bond public by then, rating steps public by then, exercises whose notice was public by then."""
         base = corporate_from_terms(row, schedule=self.corp_schedule, options=self.corp_options,
                                     amortisation=self.corp_amortisation, where=where)
+        try:  # an exercise made public after its redemption's record date cannot be valued through: refused now
+            base.check_exercises()
+        except ValueError as exc:
+            raise ValueError(f"{where}: {exc}") from None
         floating = self.corp_floating.get(isin)
         if row["kind"] == "frb_corp" and floating is None:
             raise ValueError(f"{where}: {isin} is a frb_corp bond without a corporate_floating row (its benchmark)")
@@ -2137,16 +2194,20 @@ class _Engine:
     def _frb_instrument(self, isin: str, row: Mapping, where: str) -> Instrument:
         """A GoI FRB from its terms row; ``known(t)`` its coupons as known at ``t`` (``floating.goi_frb_rates``:
         announced, computed from T-bill results public by then, or projected flat), every period from ``t`` on."""
-        coupons, tbills, allow = self._frb_coupons, self._tbills, self.settings.frb_allow_fewer
+        coupons, tbills = self._frb_coupons, self._tbills
+        allow, stale = self.settings.frb_allow_fewer, self.settings.frb_allow_stale
 
         def known(t: datetime) -> GoiFloatingRateBond:
-            rates = goi_frb_rates(row, tbills, coupons, as_of=t, allow_fewer=allow)
-            gaps = rates[rates["rate_pct"].isna() & (rates["period_end"] > t.date())]
+            rates = goi_frb_rates(row, tbills, coupons, as_of=t, allow_fewer=allow, allow_stale=stale)
+            # every period from the one ending today on (today's coupon is paid at today's rate as known)
+            gaps = rates[rates["rate_pct"].isna() & (rates["period_end"] >= t.date())]
             if not gaps.empty:
-                first = gaps["period_start"].iloc[0]
-                raise ValueError(f"{isin}: the coupon of the period from {first} is not known at {t:%Y-%m-%d %H:%M} "
-                                 "and cannot be projected: give the announced coupons (MarketData.frb_coupons) or the "
-                                 "182-day T-bill results (MarketData.tbills), or EngineSettings(frb_allow_fewer=True)")
+                first = gaps.iloc[0]
+                raise ValueError(f"{isin}: the coupon of the period from {first['period_start']} is not known at "
+                                 f"{t:%Y-%m-%d %H:%M} and cannot be projected ({first['notes']}): give the announced "
+                                 "coupons (MarketData.frb_coupons) or the 182-day T-bill results (MarketData.tbills), "
+                                 "or EngineSettings(frb_allow_fewer=True) for fewer results, frb_allow_stale=True for "
+                                 "an old base")
             return goi_frb_bond(row, rates)
 
         try:
@@ -2719,6 +2780,10 @@ class _Engine:
         for isin, first in sorted(self.frb_projected.items()):
             self.notes.append(f"FRB {isin}: its current coupon was projected, not announced or computed, from {first} "
                               "(UNVERIFIED flat projection: floating.goi_frb_rates; positions.notes per day)")
+        if self.static_buckets:
+            self.notes.append(f"costs: {', '.join(sorted(self.static_buckets))} took the terms' static rating_bucket "
+                              "for their half spread (no rating action public before the trade in MarketData.ratings): "
+                              "a rating typed in later prices earlier trades too (UNVERIFIED fallback)")
         corporates = sorted(i for i, inst in self.instruments.items() if inst.kind == "corporate")
         if corporates:
             self.notes.append(f"corporate bonds ({len(corporates)}): coupons and principal entitled at the close of "
@@ -2815,14 +2880,16 @@ class _Engine:
         main_sum, projected = self._rate_sum(pol.segment, deal.day, d) \
             if (deal.parts.get("main") or deal.haircut_equity or deal.margin) else (0.0, [])
         self.projected_nights.update(projected)
-        for part, line in (("main", "funding_repo"), ("excess", "funding_excess"), ("overdraft", "funding_overdraft")):
+        for part, line in (("main", "funding_repo"), ("excess", "funding_excess"), ("corporate", "funding_excess"),
+                           ("overdraft", "funding_overdraft")):
             amount = deal.parts.get(part, 0.0)
             if not amount:
                 continue
             if part == "main":
                 total = main_sum + pol.spread_bp / 100 * n
-            elif part == "excess":
-                r_sum, proj = self._rate_sum(pol.excess_segment, deal.day, d)
+            elif part in ("excess", "corporate"):
+                r_sum, proj = self._rate_sum(pol.excess_segment if part == "excess" else pol.corporate_segment,
+                                             deal.day, d)
                 self.projected_nights.update(proj)
                 total = r_sum + pol.spread_bp / 100 * n
             else:
@@ -3032,7 +3099,8 @@ class _Engine:
         breakdown = cost_rules.bond_trade_costs(
             self.costs, kind=inst.kind, side=side, face=face, mid=mid, dv01_per100=dv01, trade_date=d, venue=venue,
             liquidity=liq, years=cost_rules.years_between(d, inst.maturity), accrued=_accrued(inst.bond, settle),
-            broker=broker, isin=inst.isin, fill=fill, rating_bucket=rating_bucket or inst.rating_bucket)
+            broker=broker, isin=inst.isin, fill=fill,
+            rating_bucket=rating_bucket or (self._cost_bucket(inst, d) if inst.kind == "corporate" else None))
         self.unverified.update(breakdown.unverified)
         price = breakdown.fill
         book.cash -= breakdown.total
@@ -3051,7 +3119,10 @@ class _Engine:
             book.pending.append(_Pending(trade_id or order_id, inst.isin, side, face, price, settle, d, venue,
                                          notified_cr=notified, auction_day=auction_day))
         book.traded_face += face
-        book.traded_dv01 += face / 100 * dv01
+        # the rate DV01 traded (a GoI FRB's index DV01: as positions.dv01 counts it; the bid-offer above is on its
+        # yield DV01, the price change of a quote one basis point wider)
+        book.traded_dv01 += (self._rate_risk(inst, y_mid, settle, face / 100, d)[0]
+                             if isinstance(inst.bond, GoiFloatingRateBond) else face / 100 * dv01)
         notes = list(breakdown.notes)
         if not given_mid:
             notes.append("no mid given: the fill is its own mid (no spread cost measured)")
@@ -3511,21 +3582,24 @@ class _Engine:
                     for k, share in zip(eligible, got):
                         shares[k] = share
                     notes.extend(cap_notes)
+            corp = [inst.kind == "corporate" for inst, _, _ in longs]  # lent against in corporate bond repo
+            cap_corp = sum(c for c, k in zip(caps, corp) if k) if access.repo else 0.0
             if not access.repo:
                 cap_main = cap_excess = 0.0
                 notes.append(f"the access policy {access.name!r} allows no repo")
             elif on_treps:
                 cap_main = sum(s * c for s, c in zip(shares, caps))
-                cap_excess = sum((1 - s) * c for s, c in zip(shares, caps))
+                cap_excess = sum((1 - s) * c for s, c, k in zip(shares, caps, corp) if not k)
             else:
-                cap_main, cap_excess = 0.0, sum(caps)
+                cap_main, cap_excess = 0.0, sum(c for c, k in zip(caps, corp) if not k)
             main_rate = self._rate_table(pol.segment).rate_on(d, pol.projection)[0] if cap_main else 0.0
             growth = 1 + (main_rate + pol.spread_bp / 100) * nights / 36500
             m = self._margin_rate(d) / 100 if on_treps else 0.0
             for _ in range(3):
                 b_main = min(want, cap_main / (1 + m * growth)) if cap_main else 0.0
                 b_excess = min(want - b_main, cap_excess)
-                over = want - b_main - b_excess
+                b_corp = min(want - b_main - b_excess, cap_corp)
+                over = want - b_main - b_excess - b_corp
                 charges = 0.0
                 if b_main:
                     seg = "treps" if on_treps else "market_repo"
@@ -3534,18 +3608,24 @@ class _Engine:
                                                     repayment=b_main * growth, deal_date=d)
                     charges += cb.total
                     self.unverified.update(cb.unverified)
-                if b_excess:
-                    excess_rate = self._rate_table(pol.excess_segment).rate_on(d, pol.projection)[0]
-                    face_x = self._face_share(longs, shares, caps, b_excess, cap_excess, main=False)
+                for amount, capacity, segment, which in ((b_excess, cap_excess, pol.excess_segment, False),
+                                                         (b_corp, cap_corp, pol.corporate_segment, True)):
+                    if not amount:
+                        continue
+                    rate_x = self._rate_table(segment).rate_on(d, pol.projection)[0]
+                    face_x = self._face_share([x for x, k in zip(longs, corp) if k == which],
+                                              [v for v, k in zip(shares, corp) if k == which],
+                                              [c for c, k in zip(caps, corp) if k == which], amount, capacity,
+                                              main=False)
                     cb = cost_rules.repo_deal_costs(
-                        self.costs, segment="market_repo", face=face_x, cash=b_excess,
-                        repayment=b_excess * (1 + (excess_rate + pol.spread_bp / 100) * nights / 36500), deal_date=d)
+                        self.costs, segment="market_repo", face=face_x, cash=amount,
+                        repayment=amount * (1 + (rate_x + pol.spread_bp / 100) * nights / 36500), deal_date=d)
                     charges += cb.total
                     self.unverified.update(cb.unverified)
                 if pol.sizing == "fixed" or book.cash + want - lent_total - charges >= -1e-9 or not pol.lot_rs:
                     break
                 want += pol.lot_rs
-            limit = cap_main / (1 + m * growth) + cap_excess if cap_main else cap_excess
+            limit = (cap_main / (1 + m * growth) if cap_main else 0.0) + cap_excess + cap_corp
             if over > 1e-6:
                 if pol.on_shortfall == "raise":
                     why = (f"the access policy {access.name!r} allows no repo (RBI Repo Directions 2025 para 4(1)(b), "
@@ -3567,12 +3647,15 @@ class _Engine:
                 parts["main"] = b_main
             if b_excess:
                 parts["excess"] = b_excess
+            if b_corp:
+                parts["corporate"] = b_corp
             margin = m * b_main * growth
             weighted = sum(caps)
             if pol.sizing == "fixed":
                 equity = equity_fixed
             elif weighted:
-                equity = (b_main + b_excess) * sum(h / 100 * v for (_, _, v), h in zip(longs, cuts)) / weighted
+                equity = (b_main + b_excess + b_corp) * sum(h / 100 * v for (_, _, v), h in zip(longs, cuts)) \
+                    / weighted
             if charges:
                 book.cash -= charges
                 _add(lines, book.name, "", "repo_charges", -charges)
@@ -3582,7 +3665,8 @@ class _Engine:
         if borrowed or lent_total:
             first = min(parts) if parts else None  # the night's charges on one row only, whatever the parts
             for part, amount in sorted(parts.items()):
-                segment = {"main": pol.segment, "excess": pol.excess_segment, "overdraft": "overdraft"}[part]
+                segment = {"main": pol.segment, "excess": pol.excess_segment, "corporate": pol.corporate_segment,
+                           "overdraft": "overdraft"}[part]
                 rate = (float(pol.overdraft_rate_pct) if part == "overdraft" else
                         self._rate_table(segment).rate_on(d, pol.projection)[0] + pol.spread_bp / 100)
                 self.rows["funding"].append({
@@ -3846,7 +3930,7 @@ class _Engine:
             if face and today is not None:
                 ai = _accrued(inst.bond, d)
                 value = face / 100 * (today.clean + ai)
-                dv01 = face / 100 * inst.bond.dv01(today.yield_pct, today.settlement)
+                dv01, bucket = self._rate_risk(inst, today.yield_pct, today.settlement, face / 100, d)
                 book.clean_prev[isin] = today.clean
                 book.dirty_prev[isin] = today.clean + ai
                 book.ai_prev[isin] = ai
@@ -3854,7 +3938,6 @@ class _Engine:
                 gross_long += max(value, 0.0)
                 gross_short += max(-value, 0.0)
                 dv01_total += dv01
-                bucket = tenor_bucket(inst.maturity, d)
                 buckets[bucket] = buckets.get(bucket, 0.0) + dv01
                 positions.append(self._position_row(book, inst, d, "settled", face, today.settlement, today, ai,
                                                     value, dv01, bucket, self._terms_note(inst, today)))
@@ -3865,10 +3948,9 @@ class _Engine:
                 units = trade.side * trade.face / 100
                 value = units * (clean_s - trade.price)
                 trade.clean_prev = clean_s
-                dv01 = units * inst.bond.dv01(today.yield_pct, trade.settlement)
+                dv01, bucket = self._rate_risk(inst, today.yield_pct, trade.settlement, units, d)
                 forwards += value
                 dv01_total += dv01
-                bucket = tenor_bucket(inst.maturity, d)
                 buckets[bucket] = buckets.get(bucket, 0.0) + dv01
                 positions.append(self._position_row(book, inst, d, "pending", trade.side * trade.face,
                                                     trade.settlement, today, 0.0, value, dv01, bucket,
@@ -3926,6 +4008,17 @@ class _Engine:
             row["calendar_projected"] = projected
         self.rows["positions"].extend(positions)
         self._positions_today[(d, book.name)] = positions
+
+    def _rate_risk(self, inst: Instrument, y: float, s: date, units: float, d: date) -> tuple[float, str]:
+        """(rupee DV01, tenor bucket) of ``units`` x 100 face: the bond's yield DV01 in its maturity's bucket; for a
+        GoI FRB its rate (index) DV01, ``floating.index_dv01`` with the margin held (the projected coupons move with
+        the index, the current one does not), in the bucket of its next reset, where that risk sits. The FRB's yield
+        DV01 is its spread DV01 (``floating.spread_dv01``), some hundred times larger, and hedges nothing an OIS
+        does: it stays out of ``dv01``, the buckets and the hedge check."""
+        if isinstance(inst.bond, GoiFloatingRateBond):
+            dv01 = units * index_dv01(inst.bond, s, 0.0, index_pct=y)
+            return dv01, tenor_bucket(inst.bond.next_coupon_date(s), d)
+        return units * inst.bond.dv01(y, s), tenor_bucket(inst.maturity, d)
 
     def _terms_note(self, inst: Instrument, mark: MarkState) -> str:
         """What a corporate bond's or FRB's position row says of its terms as known (blank for other kinds)."""

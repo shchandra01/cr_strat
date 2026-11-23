@@ -340,7 +340,8 @@ Built in [`corporates.py`](../src/cr_strat/corporates.py) (listed non-convertibl
 on the conventions `NCD`, `NCD_2013`, `NCD_PRE2013` and `GOI_FRB` in `conventions.py`
 (`CORPORATE_CONVENTIONS`; `CONVENTIONS` still lists only what `bonds` prices). Both are `bonds.Bond`
 subclasses: every price, yield, duration, DV01 and convexity comes from one list of (time, amount) flows,
-and `bonds.py` is unchanged (a GoI FRB composes an unchanged `FixedRateBond` with a 1% coupon). No
+and the code of `bonds.py` is unchanged (its docstring now points to them; a GoI FRB composes an unchanged
+`FixedRateBond` with a 1% coupon). No
 licensed price was used: the tests are SEBI's and issuers' worked examples (numbers only) and synthetic
 bonds with answers computed independently.
 
@@ -374,7 +375,7 @@ standard or conservative reading, a named parameter.
 | | Listed NCD (`NCD`) | GoI FRB (`GOI_FRB`) |
 |---|---|---|
 | Day count | Actual/actual, a year of 365 or 366 days (`ACT/ACT SEBI`) | 30E/360, as G-secs |
-| Coupons | Annual, semi-annual, quarterly or monthly, counted forward from the deemed date of allotment; zero-coupon and cumulative bonds | Semi-annual on the maturity's day, the rate reset each half-year |
+| Coupons | Annual, semi-annual, quarterly or monthly, counted forward from the deemed date of allotment; zero-coupon and cumulative bonds | Semi-annual on the maturity's day, the rate reset each half-year (FRB 2035: every five years, at a five-year G-sec yield) |
 | Yield | Annual compounding on actual days / 365 (XIRR); simple under a year with one flow left | Semi-annual, as G-secs; discount margin over the index |
 | Holidays | Coupon paid the next working day, redemption the previous one | As G-secs |
 | Record date | 15 days before each due date; ex-interest after it | None |
@@ -382,15 +383,16 @@ standard or conservative reading, a named parameter.
 
 | Rule | Engine | Source | Status |
 |---|---|---|---|
-| Interest on listed debt is actual/actual | `ACT/ACT SEBI`, `corporates.year_fraction_sebi`; `year_fraction` and `coupon_period_days` refuse it | SEBI 2013 para I, SEBI 2016 para 1, NCS master circular Ch. III; handbook 7.3.8 | V |
+| Interest on listed debt is actual/actual | `ACT/ACT SEBI`, `corporates.year_fraction_sebi`; `year_fraction` and `coupon_period_days` refuse it | SEBI 2013 para I, SEBI 2016 para 3(b) (para 1 only recounts the earlier circulars), NCS master circular Ch. III; handbook 7.3.8 | V |
 | A year holding 29 February counts 366 days for every coupon in it, at any frequency (issues from 1 Jan 2017) | `leap_year_rule` | SEBI 2016 para 3(b), 4 | V |
 | Which one-year period: between anniversaries of the deemed allotment | `leap_year_rule="anniversary"` (default); `calendar`, `fixed365` | Reproduces the NCS master circular's illustration (89,500 a year); the calendar split gives 89,487.94 and 89,512.06 there. Kosamattam's monthly table follows calendar years (all 98 coupons) against its own text | U (decision) |
-| Issues before Dec 2013: each issue's terms | `NCD_PRE2013`: actual/365 fixed | earlier research notes only | U |
+| An allotment on 29 February: anniversaries on 28 February in common years, each year 366 days when it holds a 29 February, else 365 (29 Feb 2024 to 28 Feb 2025 pays 365/366 of the rate, 28 Feb 2027 to 29 Feb 2028 366/365) | `corporates._year_days` | SEBI 2016 para 3(b) read literally | U (decision) |
+| Issues before Dec 2013: each issue's terms | `NCD_PRE2013`: actual/365 fixed, and a postponed coupon or early redemption accruing to its payment date (`to_payment`, as `NCD_2013`; the corporates spec had `scheduled`: 9.073973 against 9.024658 for a 9% coupon due Sun 13 Nov 2016, paid Tue 15 Nov) | earlier research notes only | U (decision) |
 | Schedule counted forward from the deemed allotment, maturity last | `schedule="forward"`; `backward`, `month_start` (monthly on the 1st, `first_period="clubbed"`), `explicit` (from the term sheet or the database, with payment and record dates) | SEBI 2016 para 3(a) example; PFC, Capri, Kosamattam | V |
 | Each listed ISIN's schedule sits in SEBI's centralised database from 18 Aug 2025 | `schedule="explicit"`, `corporate_schedule.csv` (amounts typed there are checked against the rules) | SEBI 2025 paras 2-4 | V |
 | Coupon on a holiday paid the next working day; later dates unchanged | `coupon_roll="following"` | SEBI 2013, 2016 para 3(a); NCS master circular Ch. III | V |
 | Issues from 2017: a late coupon's interest only to the due date | `postponed_coupon="scheduled"` | SEBI 2016 para 3(a); the NCS illustration (Sat 14 Dec 2024 paid Mon 16 Dec at the full 89,500) | V |
-| Issues of Dec 2013 to Dec 2016: interest to the payment date, the next period from there; redemption with interest to its early payment | `NCD_2013` (`to_payment` both) | SEBI 2013 Annex A (copy): 367 and 364 days, 89,745.21 and 89,254.79 | V (copy) |
+| Issues of Dec 2013 to Dec 2016: interest to the payment date, the next period from there; redemption with interest to its early payment | `NCD_2013` (`to_payment` both) | SEBI 2013 Annex A (copy): 367 and 364 days, printed as Rs 89,745.00 and 89,255.00 (rounded to the rupee); the redemption's interest to the payment date reads the note that redemption and accrued interest are paid on the previous working day | V (copy) for the postponed coupon; P/U for the redemption's interest (an interpretation) |
 | Redemption on a holiday paid the previous working day | `redemption_roll="preceding"` | SEBI 2013; NCS master circular Ch. III | V |
 | Interest on an early redemption: the full scheduled coupon | `redemption_interest="scheduled"`; `"to_payment"` per issue (PFC, Capri: 89,009.59 in the illustration) | NCS illustration; term sheets | V per document; U as a market rule (decision) |
 | Payments on Mumbai money-market days; working Saturdays pay | `calendar` (payment dates roll on it; none roll without one) | SEBI 2016 para 3(c); PFC | V |
@@ -399,30 +401,38 @@ standard or conservative reading, a named parameter.
 | Record date on a holiday: the preceding day | `record_roll="preceding"` (Capri: `following`) | PFC | U (decision) |
 | Ex-interest: a settlement after the record date and before the due date leaves out that coupon, accrued interest `-F r yf(s, due)`; the record date itself is cum | `CorporateBond._flows` | no exchange or FIMMDA rule found | U (decision) |
 | A record date never falls before the allotment (a first period shorter than the offset: the allottee is on record) | `CorporateBond._record` | inference | U |
+| A record date always falls before its payment date: with `record_days=0` a redemption due Sun 15 Dec 2024 and paid Fri 13 Dec is on record at the close of 12 Dec | `CorporateBond._record` (within `RECORD_PAYMENT_DAYS` of the due date) | inference | U |
+| An explicit schedule's due dates are one period of the frequency apart (a first or last stub allowed, 3 days' slack for month ends); payment and record dates increase with them, each record date before its payment date | `CorporateBond._generate_dues`, `_check_aligned` (refused otherwise) | inference: the matched OIS rate and coupons follow the frequency | U |
 | Trading stops from the redemption's record date to the redemption | settlement there refused; `in_shut_period` | PFC, Capri; NCS master circular Ch. XVI 6.1 (no shut period for interest) | V (issues) |
 | A partial redemption's record date: ex-principal | `amortisation` | none | U |
 | Prices per 100, 4 decimals; yields 4 decimals | `price_decimals=4`, `price_tick=0.0001` (U) | handbook 6.9.1(b) | V |
 | Yields annual on actual/365 (XIRR) | `compounding="annual"`, `time_basis="act/365"`; `with_compounding` for any `COMPOUNDING` basis (quarterly and monthly added) | PFC's annual series within 0.6 bp, its cumulative amounts within Rs 0.02 per Rs 1,000, its zero-coupon yields round to the printed ones; Capri's annual and 18-month series within 0.5 bp | P |
 | Under a year with no interim interest: simple, actual/365 | `final_period="simple"`, `mm_final_days=365` | handbook 6.9.1(c) | V |
-| Due dates for yield-to-price from 18 Aug 2025; payment dates before | `flow_dates="by_date"`, `due_dates_from` | SEBI 2025 paras 1.2-1.3, 4; the working group's description of earlier practice | V; P before |
+| Due dates for yield-to-price from 18 Aug 2025; payment dates before | `flow_dates="by_date"`, `due_dates_from` | SEBI 2025 paras 1.2-1.3, 4 (para 1.2 sets it for securities traded on the RFQ platform); the working group's description of earlier practice | V for RFQ trades; U for OTC reports, valuation and the return engine, which use it too; P before |
 | Accrued interest `F r yf(last due, s)`; none on zero and cumulative bonds | `CorporateBond` | follows from the day count; handbook 7.3.8 | P; U for zeros |
 | Cash rounded per security, valuation unrounded | `cash_schedule(decimals=)`, `amount_decimals` | SEBI 2013 note (rupee); Kosamattam (paisa) | P |
 | Callable bonds valued at the lowest of the values to each call and maturity; puttable at the highest over puts and maturity; with both, the earlier trigger; a put and call on one date at one price is a deemed maturity | `price_to_worst`, `price_to_best_put`, `sebi_valuation` | MF master circular 10.3.1 | V |
 | A put favours the holder when the yield exceeds the coupon by 30 bp | `SebiValuation.put_favours_holder` (reported, not enforced) | MF master circular 10.3.2-10.3.4 | V |
 | AT1 bonds valued to call; perpetuals deemed to mature 100 years after issue | `tier="at1"` (first call ahead), `perpetual_bond` | MF master circular 10.3.1(a), 10.4.2 | V |
 | Yield to worst: lowest of the yields to maturity and to each call | `yield_to_worst` (puts with `include_puts`) | standard definition | U (choice) |
-| An exercise counts from its notice; a date alone from 23:59:59 | `CallPut.exercised_public_from`, `effective_bond` | term sheets list notice times | V; U for the time |
+| An exercise counts from its notice, a decision not to exercise likewise; a date alone from 23:59:59 | `CallPut.exercised_public_from`, `effective_bond`, `workouts(as_of=)`, `as_known` | term sheets list notice times; rule 10 (nothing before it is public) | V; U for the time |
+| A batch of prices, prints or valuations takes the terms as known at 00:00 on each row's trade date (its `trade_date`, else the settlement less T+1); `as_of` overrides | `corporates.default_as_of` | a trade's time is rarely known: a notice made public during the trade day counts from the next day | U (conservative) |
+| An exercise public after the record date of its redemption (15 days before the exercise date by the bond's rule) is refused; the notice's own record date can be given | `CorporateBond.check_exercises`, `CallPut.record_date` (`record_date` in `corporate_options.csv`) | inference: the holders to be redeemed are those on record | U |
+| Reported prices of a partly redeemed bond are per 100 of the face still outstanding | `price_basis="outstanding"` (trade check and recomputed panel; `original` elsewhere by default, and for engine marks) | exchange part-redemption notices: trading continues on the reduced face value (BSE notices through a search summary, not read) | P; U for this package's prints and marks (decision) |
+| Reported corporate bond prices are clean | the trade check's standard reading; a print matching only on its dirty reading is `dirty_price` and its yield read so | the corporates spec's decision 7; NSE's order-matching platform may print dirty prices (unverified) | U (decision) |
 | Exercise between coupon dates pays interest to it | `to_workout` | none | U |
 | Coupon steps on ratings, from the next period when the terms are silent | `StepRule`, `apply_rating_steps` (`effective="next_period"`; `from_event` the day after the action is public) | NCS master circular Annex XIV-A item 43 (disclosure) | V; U for the default |
 | Amortisation by face; coupons on the outstanding face; a partial redemption due on a holiday paid the previous working day, as a redemption | `amortisation` (on due dates; quantity redemptions valued pro rata) | Annex XIV-A items 51-52 | V; U (pro rata, the holiday roll) |
 | GoI FRB base: mean of the WAYs of the last three 182-day auctions before the fixing day, plus the spread | `floating.goi_frb_fixing` (`yield_kind="cutoff"` for FRB 2024's rule) | FRB 2034 release (copy); primer | V (copy) |
 | Base rounded half up to 2 decimals; each WAY taken to 4 decimals; an auction on the fixing day left out | `decimals=2`, `yield_decimals=4`, `include_fixing_day=False` | primer (FRB 2024's rounding) | P; U |
 | WAY = (100/WAP - 1) x 365/182 x 100 | `way_from_wap` | reproduces RBI's 6.5059 from WAP 96.8579 | V |
-| A coupon is public from RBI's release; else from the latest of its three results once no weekly auction can still fall before the fixing day; an unknown release time is 00:00 on the fixing day | `goi_frb_rates` (`announced`, `computed`, `projected`, `unknown`) | release dates (2022 copy; 2026 via search) | V/P; U for the rules |
-| Projection flat at the latest computable base (or the base the last announced coupon implies); forward from a curve as an option | `projection` | none | U (decision) |
+| A coupon is public from RBI's release; else from the latest of its three results dated before the fixing day, once no weekly auction can still fall before it or a week after it; an unknown release time is 00:00 on the fixing day; an announcement more than 14 days before the fixing day, or a result public before its auction, is refused | `goi_frb_rates` (`announced`, `computed`, `projected`, `unfixed`, `unknown`), `ANNOUNCE_LEAD_DAYS`, `AUCTION_WEEK_DAYS` | release dates (2022 copy; 2026 via search) | V/P; U for the rules |
+| A passed fixing is projected only from the results before it, or the previous period's announced coupon; a period ended unprojected keeps its projection (`unfixed`) | `goi_frb_rates` (`public_from_source`: `before_fixing`, `previous_coupon`) | the coupon rule fixes the coupon on its fixing day | V for the rule; U for the flags |
+| Projection flat at the latest computable base (or the base the last announced coupon implies); forward from a curve as an option; a base more than one period old is refused unless `allow_stale` | `projection`, `allow_stale` | none | U (decision) |
 | Discount margin over the projection's index, on the G-sec half-year times; curve form as an option | `discount_margin_bp`, `price_from_dm`, `spread_dv01`, `index_dv01`, `spread_duration` | standard definitions | U (choice) |
 | FRB spreads 0.64 / 1.00 / 1.22 / 0.98 and the coupons known | `data/goi_frb_terms.csv`, `data/goi_frb_coupons.csv`, each row with its source and status | RBI's GoI list (saved); RBI releases via search; FRB 2034's 0.98 and 7.69 from the 2022 copy | P; V for FRB 2034 |
 | Corporate FRB terms: benchmark, spread, floor, cap, reset process | `FloatingTerms`, `corporate_frb_rates` (fixings with `public_from`; fixing lag 0 and a one-fixing look-back when the terms are silent, U) | Annex XIV-A item 42 | V |
+| A corporate FRB reset is fixed only on its own published fixing: the fixing date's (the last business day's before a holiday) for a daily benchmark, one within one and a half usual intervals for a periodic one, none still to be published; else projected and noted | `corporate_frb_rates` | inference | U |
 
 Worked examples reproduced in [`tests/test_corporates.py`](../tests/test_corporates.py) and
 [`tests/test_floating.py`](../tests/test_floating.py):
@@ -430,8 +440,10 @@ Worked examples reproduced in [`tests/test_corporates.py`](../tests/test_corpora
 - **NCS master circular illustration** (8.95% on Rs 10 lakh, 14 Dec 2020 to 14 Dec 2025): five coupons of
   Rs 89,500.00, the Saturday coupon of 14 Dec 2024 paid on Monday 16 Dec, the Sunday maturity paid on
   Friday 12 Dec 2025 with the full coupon, Rs 14,47,500.00 in all.
-- **SEBI 2013 Annex A** (8.95%, 13 Nov 2013 to 13 Nov 2018): 367 days (Rs 89,745.21, rounded 89,745) and
-  364 days (89,254.79, rounded 89,255), rupee-rounded total Rs 14,47,500.
+- **SEBI 2013 Annex A** (8.95%, 13 Nov 2013 to 13 Nov 2018): 367 days and 364 days, which SEBI prints as
+  Rs 89,745.00 and 89,255.00 (rupee-rounded; total Rs 14,47,500). The unrounded Rs 89,745.21 and 89,254.79 are
+  the engine's reading of the years (anniversaries: 366/366 + 1/365); counting 367/366 gives 89,744.54, which
+  rounds the same, so the illustration does not confirm the split.
 - **SEBI 2016 examples**: 182/366 and 184/366 for the half-years of 2016; at 10% from 1 Jul 2016 to
   30 Jun 2018, 5.041096, 4.958904, 5.041096 and 4.931507 on a forward schedule.
 - **Kosamattam's monthly table** (Series II and VII): all 37 and 61 coupons to the paisa on the calendar
@@ -443,14 +455,18 @@ Worked examples reproduced in [`tests/test_corporates.py`](../tests/test_corpora
 - **RBI's WAY** 6.5059 from the WAP of 11 Nov 2026, and the cut-off rule's 7.72 against RBI's 7.69 for
   FRB 2034 from 30 Oct 2022 (cut-off yields from search summaries).
 
+Built on these rules elsewhere: the trade-yield check and the price panel's recomputed yields (`trades`,
+`price_panel`), G-, par and z-spreads (`credit_spreads`), asset swaps and FRB discount margins (`asset_swaps`),
+corporate bonds and FRBs in the return engine (`returns`) and their cost rows (HS20-HS25, CS06-CS07, PF04-PF05,
+SD06-SD07 in `cost_defaults.csv`): [`analytics.md`](analytics.md).
+
 Not built yet: a banking calendar in which first, third and fifth Saturdays pay (it needs a list of the NI
 Act holidays falling on Saturdays, which the shipped list leaves out), exchange and depository calendars
-(record dates roll on the payment calendar), recomputed yields and spreads for the price panel, checks of
-reported trade yields, G-spreads and z-spreads of corporate bonds, corporate bonds and FRBs in the return
-engine and the event ledger, cost rows for corporate bonds, a parser for RBI's FRB coupon releases (no
-saved sample), the meaning of RBI's printed FRB auction yield, MIBOR fixings (FBIL, licensed), coupon
-discretion and write-down of AT1 bonds (left in the spread), default interest and TDS, partial exercises of
-options, and amortisation between due dates. Each choice marked U above is a named parameter, listed with
+(record dates roll on the payment calendar), corporate bonds and FRBs in the event ledger (FRBs have no DV01
+there), a parser for RBI's FRB coupon releases (no saved sample), the meaning of RBI's printed FRB auction
+yield, MIBOR fixings (FBIL, licensed), coupon discretion and write-down of AT1 bonds (left in the spread),
+default interest and TDS, partial exercises of options, amortisation between due dates and irregular explicit
+schedules. Each choice marked U above is a named parameter, listed with
 its options in the build's decisions for the owner. Exchange calendars are also missing for G-secs. T+2 for
 FPI trades is `settlement_date(trade_date, GSEC, lag=2)`. MIBOR fixings and OIS dates use the Mumbai
 settlement calendar (the handbook's MIBOR business days taken as Mumbai business days, an equivalence

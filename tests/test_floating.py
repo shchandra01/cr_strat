@@ -345,8 +345,17 @@ def test_goi_frb_bond_from_rates():
     rates = goi_frb_rates(FRB2033, t, None, as_of="2026-11-20T20:00")
     bond = goi_frb_bond(FRB2033, rates)
     assert bond.index_pct == pytest.approx(6.45)  # flat at the latest computable base
+    # The current coupon was fixed on 22 Sep 2026 and no result before that day is in the data: auctions held after
+    # it say nothing of it, so it is unknown (the build projected it from them) and pricing through it is refused.
     current = rates.set_index("period_start").loc[D(2026, 9, 22)]
-    assert current["status"] == "projected" and "not in the data" in current["notes"]
+    assert current["status"] == "unknown" and "not in the data" in current["notes"]
+    with pytest.raises(ValueError, match="no rate for the coupon period from 2026-09-22.*not in the data"):
+        bond.dirty_price(7.0, D(2026, 11, 20))
+    proxy = goi_frb_rates(FRB2033, t, None, as_of="2026-11-20T20:00", allow_stale=True)
+    row = proxy.set_index("period_start").loc[D(2026, 9, 22)]
+    assert (row["status"], row["public_from_source"], row["rate_pct"]) == ("projected", "proxy", 6.45 + 1.22)
+    bond = goi_frb_bond(FRB2033, proxy)
+    assert bond.index_pct == pytest.approx(6.45)
     assert discount_margin_bp(bond, D(2026, 11, 20), 100.0) == pytest.approx(
         (bond.yield_from_price(100.0, D(2026, 11, 20)) - 6.45) * 100)
     again = goi_frb_rates(FRB2033, t, None, as_of="2026-11-20T20:00")
@@ -424,6 +433,165 @@ def test_frb_price_command(capsys, tmp_path):
     assert "spread duration" in out and "index dv01" in out
     assert main(["frb-price", "--isin", "IN0000000000", "--settlement", "2026-11-20", "--price", "100"]) == 2
     assert "not in" in capsys.readouterr().err
-    # Too few results without --allow-fewer and no announced coupon to fall back on: no index.
+    # Too few results without --allow-fewer and no announced coupon to fall back on: the current coupon is unknown
+    # (the build said only that no index was there to measure the margin from)
     assert main([*args, "--no-coupons", "--price", "100", "--as-of", "2026-11-05T10:00"]) == 2
-    assert "--index" in capsys.readouterr().err
+    assert "the coupon of the period from 2026-09-22 is not known" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------- fixes of the review (fixings as known, gaps, staleness)
+
+
+FRB2031 = load_frb_terms().set_index("isin").loc["IN0020180041"].to_dict() | {"isin": "IN0020180041"}
+
+
+def _skipped_week() -> pd.DataFrame:
+    """Weekly 182-day results from 2 Sep 2026: WAY 6.40 before FRB 2031's fixing of 7 Dec, 7.40 after; the auction of
+    Wednesday 2 Dec is not held."""
+    rows, d = [], D(2026, 9, 2)
+    while d <= D(2027, 1, 27):
+        if d != D(2026, 12, 2):
+            rows.append((d, 6.40 if d < D(2026, 12, 7) else 7.40, f"{d}T17:00"))
+        d += timedelta(days=7)
+    return tbills(rows)
+
+
+def test_a_skipped_auction_still_fixes_the_coupon():
+    """RBI's rule takes the last three results before the fixing day, however far back (11, 18 and 25 Nov: 6.40, so
+    7.40). The build never called it computed and re-projected it every week from auctions held after the fixing day:
+    7.73, 8.07, 8.40."""
+    t = _skipped_week()
+
+    def period(as_of):
+        return goi_frb_rates(FRB2031, t, None, as_of=as_of).set_index("period_start").loc[D(2026, 12, 7)]
+
+    before = period("2026-12-06T20:00")  # still ahead: flat at the latest results
+    assert (before["status"], before["rate_pct"], before["public_from_source"]) == ("projected", 7.40, "flat")
+    pending = period("2026-12-10T20:00")  # passed: only the results before it, flagged until a week has passed
+    assert (pending["status"], pending["rate_pct"], pending["public_from_source"]) == ("projected", 7.40,
+                                                                                       "before_fixing")
+    assert pending["auctions"] == "2026-11-11;2026-11-18;2026-11-25" and "12 days before it" in pending["notes"]
+    for as_of in ("2026-12-14T00:00", "2026-12-17T20:00", "2027-01-14T20:00"):
+        row = period(as_of)
+        assert (row["status"], row["rate_pct"], row["auctions"]) == ("computed", 7.40,
+                                                                     "2026-11-11;2026-11-18;2026-11-25")
+    assert goi_frb_fixing("2026-12-07", 1.0, t).status == "computed"  # the table runs past the fixing day's week
+    assert goi_frb_fixing("2026-12-07", 1.0, t, as_of="2026-12-10T20:00").status == "projected"
+
+
+def test_a_period_that_ended_unfixed_keeps_its_projection():
+    """The shipped coupons stop at FRB 2031's coupon from 7 Dec 2025: the next period was projected flat (6.52) and,
+    once it ended, became unknown (NaN), so the engine could not pay its coupon on 7 Dec 2026."""
+    raw = goi_frb_rates(FRB2031, None, as_of="2026-12-07T20:00")
+    r = raw.set_index("period_start")
+    ended = r.loc[D(2026, 6, 7)]
+    assert (ended["status"], ended["rate_pct"], ended["public_from_source"]) == ("unfixed", 6.52, "previous_coupon")
+    assert "ended on 2026-12-07 without its coupon" in ended["notes"]
+    new = r.loc[D(2026, 12, 7)]  # its base is now two periods old: refused, and why
+    assert new["status"] == "unknown" and "too old to project from" in new["notes"]
+    stale = goi_frb_rates(FRB2031, None, as_of="2026-12-07T20:00", allow_stale=True).set_index("period_start")
+    assert (stale.loc[D(2026, 12, 7), "status"], stale.loc[D(2026, 12, 7), "rate_pct"]) == ("projected", 6.52)
+    assert "stale base" in stale.loc[D(2026, 12, 7), "notes"]
+    bond = goi_frb_bond(FRB2031, raw)
+    with pytest.raises(ValueError, match="no rate for the coupon period from 2026-12-07.*too old to project from"):
+        bond.dirty_price(7.0, D(2026, 12, 8))
+    paid = [cf for cf in bond.cash_flows(D(2026, 12, 4), until=D(2026, 12, 7)) if cf.kind == "coupon"]
+    assert [round(cf.amount, 10) for cf in paid] == [3.26]  # 6.52 / 2, the rate it accrued at
+
+
+def test_a_stale_announced_coupon_is_not_projected():
+    """FRB 2028's shipped coupons jump from Oct 2021 (4.04%) to Apr 2026: in Jan 2026 the build projected the current
+    coupon at the 2021 rate."""
+    frb2028 = load_frb_terms().set_index("isin").loc["IN0020210160"].to_dict() | {"isin": "IN0020210160"}
+    r = goi_frb_rates(frb2028, None, as_of="2026-01-14T18:00").set_index("period_start")
+    current = r.loc[D(2025, 10, 4)]
+    assert current["status"] == "unknown" and "2021-10-04, more than one period before" in current["notes"]
+    flagged = goi_frb_rates(frb2028, None, as_of="2026-01-14T18:00", allow_stale=True).set_index("period_start")
+    assert (flagged.loc[D(2025, 10, 4), "rate_pct"], flagged.loc[D(2025, 10, 4), "public_from_source"]) == (4.04,
+                                                                                                         "proxy")
+    later = goi_frb_rates(frb2028, None, as_of="2026-04-10T18:00").set_index("period_start")
+    assert (later.loc[D(2026, 4, 4), "status"], later.loc[D(2026, 10, 4), "status"]) == ("announced", "projected")
+
+
+def test_times_before_their_own_date_are_refused():
+    """A result public before its auction, a fixing public before its date and a coupon announced weeks before its
+    fixing day are typos that would let the data look ahead."""
+    with pytest.raises(ValueError, match="2026-12-02 is public from 2026-11-02 18:30, before the auction itself"):
+        tbills([("2026-12-02", 6.5, "2026-11-02T18:30")])
+    assert len(tbills([("2026-12-02", 6.5, "2026-12-02T00:00")])) == 1
+    with pytest.raises(ValueError, match="before the fixing's own date"):
+        read_fixings(FIXINGS.assign(public_from=["2025-09-09T19:00", *FIXINGS["public_from"][1:]]))
+    early = pd.DataFrame({"isin": ["IN0020200120"], "period_start": ["2026-09-22"], "period_end": ["2027-03-22"],
+                          "rate_pct": ["6.80"], "announced": ["2026-08-01"], "source": ["typed"], "status": ["P"]})
+    with pytest.raises(ValueError, match="more than 14 days before its fixing day 2026-09-22"):
+        goi_frb_rates(FRB2033, None, early, as_of="2026-11-20T20:00")
+
+
+def test_without_as_of_every_row_says_it_looks_ahead():
+    r = goi_frb_rates(FRB2033, None)
+    assert r["notes"].str.contains("as_of not given").all()
+    assert not goi_frb_rates(FRB2033, None, as_of="2026-11-19T20:00")["notes"].str.contains("as_of not given").any()
+
+
+def test_index_dv01_holds_the_current_coupon():
+    """The current coupon was fixed when its period began: bumping it with the index (the build) turned FRB 2033's
+    index DV01 negative while that coupon was projected."""
+    s = D(2026, 11, 20)
+    starts = [st for st, _ in frb_periods(FRB2033) if st >= D(2026, 9, 22)]
+    rates = tuple((st, 6.75, "projected") for st in starts)
+    bond = GoiFloatingRateBond(D(2033, 9, 22), D(2020, 6, 22), 1.22, rates,
+                               first_coupon_date=D(2020, 9, 22), index_pct=5.53)
+    dm = discount_margin_bp(bond, s, 100.25)
+    rate_risk, spread_risk = index_dv01(bond, s, dm), spread_dv01(bond, s, dm)
+    assert 0 < rate_risk < 0.1 * spread_risk  # about the four months to the next reset, against seven years
+    held = bond.with_rates([(st, r + (0.005 if st > s else 0.0), status) for st, r, status, _ in bond.rates], 5.53)
+    dropped = bond.with_rates([(st, r - (0.005 if st > s else 0.0), status) for st, r, status, _ in bond.rates], 5.53)
+    by_hand = -(price_from_dm(held, s, dm, index_pct=5.535)[1] - price_from_dm(dropped, s, dm, index_pct=5.525)[1])
+    assert rate_risk == pytest.approx(by_hand, rel=1e-12)
+
+
+def test_a_corporate_reset_is_fixed_only_on_its_own_published_fixing():
+    """The math review's case: a quarterly reset on Wednesday 2 Dec 2026 whose fixing is published on 3 Dec at 11:00
+    was called fixed at 09:00 that day from the 25 Nov fixing; a gap in a daily table was used without a note."""
+    bond = CorporateBond(0.0, D(2028, 12, 2), D(2025, 12, 2), frequency=4)
+    terms = FloatingTerms("tb91", 2.30, 3)
+    fixings = pd.DataFrame({"benchmark": ["tb91"] * 3, "date": ["2026-11-18", "2026-11-25", "2026-12-02"],
+                            "value_pct": ["5.30", "5.40", "5.60"],
+                            "public_from": ["2026-11-18T17:00", "2026-11-25T17:00", "2026-12-03T11:00"]})
+
+    def reset(as_of):
+        r = corporate_frb_rates(bond, terms, fixings, as_of=as_of)
+        return r.set_index("period_start").loc[D(2026, 12, 2)]
+
+    early = reset("2026-12-03T09:00")
+    assert (early["status"], early["rate_pct"]) == ("projected", 7.7)
+    assert "the fixing of 2026-12-02 is not public yet" in early["notes"]
+    late = reset("2026-12-03T12:00")
+    assert (late["status"], late["rate_pct"], late["fixings_used"]) == ("fixed", 7.9, "2026-12-02")
+    daily = pd.DataFrame({"benchmark": ["mibor"] * 4, "date": ["2026-04-07", "2026-04-08", "2026-04-09", "2026-04-21"],
+                          "value_pct": ["5.5"] * 4,
+                          "public_from": ["2026-04-07T19:00", "2026-04-08T19:00", "2026-04-09T19:00",
+                                          "2026-04-21T19:00"]})
+    quarterly = CorporateBond(0.0, D(2027, 1, 15), D(2026, 1, 15), frequency=4)
+    r = corporate_frb_rates(quarterly, FloatingTerms("mibor", 1.0, 3, fixing_lag_days=1), daily,
+                            as_of="2026-11-20T20:00").set_index("period_start")
+    gap = r.loc[D(2026, 4, 15)]  # fixing date Tue 14 Apr: its own value is not in the table
+    assert gap["status"] == "unfixed" and gap["fixings_used"] == "2026-04-09"
+    assert "the fixing of 2026-04-14 is not in the table: the latest, of 2026-04-09, is 3 business days older" in \
+        gap["notes"]
+
+
+def test_coupons_as_known_are_quick_on_a_long_table():
+    """The engine asks for an FRB's coupons every day: with twelve years of weekly results the build took 0.06 s a
+    call here (each fixing read the whole table), 25 times the bisected records' 0.002 s."""
+    import time as clock
+
+    rows, d = [], D(2015, 1, 7)
+    while d <= D(2026, 12, 30):
+        rows.append((d, 6.0, f"{d}T17:00"))
+        d += timedelta(days=7)
+    table = tbills(rows)
+    start = clock.perf_counter()
+    for k in range(20):
+        goi_frb_rates(FRB2031, table, None, as_of=f"2026-11-{k + 1:02d}T20:00")
+    assert clock.perf_counter() - start < 0.5  # 20 calls: 1.1 s before

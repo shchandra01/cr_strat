@@ -558,7 +558,7 @@ CONVENTIONS: dict[str, BondConventions | DiscountConventions] = {
 # Listed non-convertible debentures issued from 1 Jan 2017 (SEBI 2016 applies to them). Sources at the top.
 NCD = CorporateConventions(
     name="Listed NCD (issued from 1 Jan 2017)",
-    day_count=ACT_ACT_SEBI,  # SEBI 2013 (copy) and 2016 para 1; NCS master circular Ch. III: actual/actual interest
+    day_count=ACT_ACT_SEBI,  # SEBI 2013 (copy) and 2016 para 3(b); NCS master circular Ch. III: actual/actual
     frequency=1,  # Descriptive: annual for most institutional and PSU issues; each bond carries its own
     compounding="annual",  # PARTLY VERIFIED: issuers' printed yields reproduce on annual XIRR; no rule text found
     settlement_lag=1,  # FIMMDA handbook 3.5.1: corporate bonds trade for T+1 to 17:15 (T+0 to 14:30)
@@ -596,13 +596,18 @@ NCD = CorporateConventions(
 )
 
 # Issues of 1 Dec 2013 to 31 Dec 2016: SEBI 2013 Annex A (copy) accrues a postponed coupon to its payment date
-# and starts the next period there (367 then 364 days, reproduced exactly), and pays the redemption and the
-# interest accrued to it on the previous working day.
+# and starts the next period there (367 then 364 days, reproduced exactly: postponed_coupon VERIFIED). PARTLY
+# VERIFIED, an interpretation: the note that "redemption and accrued interest are payable on the immediately previous
+# working day" is read as interest accruing to that payment date (redemption_interest="to_payment"); the
+# illustration's figures do not test it.
 NCD_2013 = replace(NCD, name="Listed NCD (issued 1 Dec 2013 - 31 Dec 2016)", postponed_coupon="to_payment",
                    redemption_interest="to_payment")
 
 # Issues before 1 Dec 2013 followed each issue's information memorandum. UNVERIFIED: actual/365 fixed, the
-# common reading (docs/rates_data_sources.md); pass the issue's own terms where known.
+# common reading (docs/rates_data_sources.md), and UNVERIFIED too that a postponed coupon and an early redemption
+# accrue to the payment date (to_payment, as NCD_2013's; the corporates spec had NCD's scheduled rule: a coupon due
+# on Sunday 13 Nov 2016 and paid on Tuesday 15 Nov is 9.073973 for 9% on to_payment, 9.024658 on scheduled). Pass
+# the issue's own terms where known (postponed_coupon="scheduled", redemption_interest="scheduled").
 NCD_PRE2013 = replace(NCD, name="Listed NCD (issued before 1 Dec 2013)", day_count="ACT/365F",
                       leap_year_rule="fixed365", postponed_coupon="to_payment", redemption_interest="to_payment")
 

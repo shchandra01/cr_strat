@@ -20,7 +20,10 @@ illustration (8.95% on Rs 10 lakh, 89,500 every year, 14,47,500 in all); ``calen
 reading, which reproduces one issuer's monthly table of 98 coupons but gives 89,487.94 and 89,512.06 in SEBI's
 illustration); ``fixed365`` is actual/365 (the default for issues before Dec 2013, UNVERIFIED). A coupon is
 ``face x rate x yf(start, end)`` per 100 original face, piecewise over rate steps; an annual coupon is the full
-rate. Amortised bonds pay interest on the outstanding face.
+rate, except for a bond allotted on 29 February, whose anniversaries fall on 28 February in common years: its years
+count 366 days when they hold a 29 February and 365 otherwise, as SEBI 2016 para 3(b) says (UNVERIFIED reading: the
+year from 29 Feb 2024 to 28 Feb 2025 pays 365/366 of the rate, the one from 28 Feb 2027 to 29 Feb 2028 366/365).
+Amortised bonds pay interest on the outstanding face.
 
 **Holidays.** A coupon due on a holiday is paid the next working day and the schedule does not move; a redemption
 due on a holiday is paid the previous working day (SEBI 2013, 2016; NCS master circular Ch. III). For issues from
@@ -33,9 +36,11 @@ the payment date (``redemption_interest="to_payment"``, as two 2025-26 term shee
 
 **Record dates and the ex-interest window.** The record date is ``record_days`` (default
 ``conventions.ex_coupon_days``, 15) calendar days before each due date, rolled on ``record_calendar`` (default the
-payment calendar) by ``record_roll``, and never before the allotment (its holder is the first on record). A
-settlement after a coupon's record date and before its due date is ex-interest: that coupon (and any principal due
-with it) is left out and the accrued interest is negative,
+payment calendar) by ``record_roll``, never before the allotment (its holder is the first on record) and always
+before the payment date (with ``record_days=0`` a redemption paid early on the preceding working day is on record the
+day before it is paid). An explicit schedule's record and payment dates must increase with the due dates, each
+record date before its payment date. A settlement after a coupon's record date and before its due date is
+ex-interest: that coupon (and any principal due with it) is left out and the accrued interest is negative,
 ``-F r yf(s, end)``, so the dirty price equals the cum-interest dirty price less the coupon's present value. A
 settlement on the record date is cum-interest. No exchange or FIMMDA rule for these trades was found: UNVERIFIED.
 Trading stops between the redemption's record date and the redemption (term sheets read): a settlement there is
@@ -56,15 +61,34 @@ puts separate unless asked), ``price_to_worst`` (lowest value over calls and mat
 callable bonds), ``price_to_best_put`` (highest over puts and maturity) and ``sebi_valuation`` (SEBI's master
 circular for mutual funds of 20 Mar 2026, 10.3.1: the call trigger date has the lowest value among calls and
 maturity, the put trigger date the highest among puts and maturity; with both the earlier one; a put and a call on
-one date at one price is a deemed maturity; AT1 bonds to the first call). An exercise counts only once its notice
-is public (``effective_bond``). ``perpetual_bond`` deems a perpetual to mature 100 years after issue (10.4.2).
+one date at one price is a deemed maturity; AT1 bonds to the first call). Decisions count only once public (rule 10):
+an exercise from its notice's ``exercised_public_from`` (``effective_bond``), a decision not to exercise likewise
+(``workouts(as_of=...)``: without ``as_of`` no decision is used), and ``as_known(as_of)`` is the bond as known then.
+An exercise public after the record date of its redemption (``record_days`` before the exercise date unless the
+option gives its own ``record_date``) is refused (``check_exercises``). The batch functions take each row's terms
+as known at 00:00 on its trade date by default (``default_as_of``: the trade date, else the settlement less the
+settlement lag; UNVERIFIED and conservative: a trade's time is rarely known). ``perpetual_bond`` deems a perpetual
+to mature 100 years after issue (10.4.2).
+
+**Price basis.** Prices are per 100 original face; ``price_basis="outstanding"`` (``price_factor``) reads a partly
+redeemed bond's price per 100 of the face it still has, as exchanges trade it after a part redemption (BSE notices
+through a search summary, not read: UNVERIFIED for this package's prints and marks; the trade check takes it as the
+default for reported prints, the other functions the original face).
 
 **Steps.** ``rate_steps`` changes the coupon from given dates (rating-linked steps, corporate FRB fixings from
 ``floating``); ``apply_rating_steps`` builds them from rating actions, each used only from its ``public_from``.
 
+**Term tables** (``read_term_table`` and its readers): one row per key, a column the table does not read refused
+with the nearest known name (a misspelt optional column would fall back to its default silently), ISINs upper-cased.
+Schedule rows with a coupon row make the schedule explicit (every due date listed; its gaps must be one period of
+the frequency, a first or last stub allowed); only principal and redemption rows are amortisation on the generated
+schedule. ``calendar_projected`` says when a payment or record date ahead falls in a year the holiday list does not
+cover (rolled on weekends only there).
+
 Not built: banking calendars with working Saturdays, exchange and depository calendars (record dates roll on the
-payment calendar), coupon discretion and write-down of AT1 bonds (in the spread), default interest, TDS, trade-yield
-checks and spread measures (the next build). Sources and the open choices: ``docs/conventions.md``.
+payment calendar), coupon discretion and write-down of AT1 bonds (in the spread), default interest, TDS, partial
+exercises of calls and puts, irregular explicit schedules (other than a first or last stub). Trade-yield checks are
+in ``trades``, spread measures in ``credit_spreads``. Sources and the open choices: ``docs/conventions.md``.
 """
 
 from __future__ import annotations

@@ -7,23 +7,38 @@ names and value units differ by venue and over time, so ``load_trades`` maps
 headers by pattern and reports what it mapped. Check that report against the
 first real file from each venue.
 
-Prices are per 100 of face value; yields are in percent as reported.
+Prices are per 100 of face value; yields are in percent as reported. A file
+in SEBI's reporting format (NCS master circular Ch. XVI Table 1) also carries
+each deal's type (direct, brokered or an inter-scheme transfer, IST) and the
+reported yield's type (YTM, YTC, YTP): both are kept (``deal_type``,
+``yield_type``) when the file has them, and ``isin_daily`` leaves inter-scheme
+transfers out, as the mutual-fund valuation rule leaves them out of the traded
+yields it uses (SEBI's MF master circular, 10.2.3).
 
 **Checking reported yields** (``check_trade_yields``). A reported yield is the reporting dealer's: its type (to
 maturity, call or put) is the dealer's choice (SEBI's NCS master circular, Ch. XVI Table 1), and a print can carry a
 dirty price or a yield on another basis. Each trade's yield is recomputed from its price and the bond's terms through
 ``corporates`` (SEBI actual/actual coupons, record dates, annual compounding on actual days over 365, the money-market
-rule in the last year), first on the standard reading (a clean price, the bond's own flow dates: due dates from 18 Aug
-2025, payment dates before; to maturity, or to worst with ``workout="worst"``), then on every other reading: the price
-read as dirty, due or payment dates, to each call and put still ahead, compounded instead of the money-market rule.
-The reading nearest the reported yield is kept: ``ok`` within ``tolerance_bp`` (1 bp, UNVERIFIED default),
-``mismatch`` beyond it, ``no_terms`` without the bond's terms, ``no_price`` and ``no_yield`` without either, ``error``
-when the bond cannot be priced for that settlement (inside the redemption record window, say). On one synthetic bond
-the misreadings are this large: payment dates for due dates +0.504 bp, the price read as dirty +256.97 bp (the
-corporates spec's T19). A trade without a settlement date is taken to settle T+1 on the bond's payment calendar
-(noted). ``isin_daily_checked`` turns checked trades into ISIN-day rows whose yield is the value-weighted recomputed
-yield (the mutual-fund rule's VWAY, SEBI's MF master circular 10.2.3), with the reported one beside it. Existing
-outputs are unchanged: the check appends columns (``CHECK_COLUMNS``) and ``isin_daily`` is untouched.
+rule in the last year), the terms as known at 00:00 on the trade date by default (an exercise, or a decision not to
+exercise, public by then; ``as_of`` or a trade's ``as_of`` cell otherwise), first on the standard reading (a clean
+price per 100 of the face outstanding, ``price_basis``, UNVERIFIED default: exchanges trade a partly redeemed bond
+on its reduced face; the bond's own flow dates: due dates from 18 Aug 2025, payment dates before; to maturity, or to
+worst with ``workout="worst"``), then on every other reading: the price read as dirty or on the other face basis,
+due or payment dates, to each call and put still ahead, compounded instead of the money-market rule. A declared
+``yield_type`` limits the readings to its workout. The reading nearest the reported yield is kept: ``ok`` within
+``tolerance_bp`` (1 bp, UNVERIFIED default) on the standard price reading; ``dirty_price`` or ``face_basis`` when it
+matches only with the price read as dirty or on the other face basis, the recomputed yield then read so (a dirty
+print would otherwise enter the panel hundreds of bp off, called ok); ``mismatch`` beyond the tolerance;
+``no_terms`` without the bond's terms, ``no_price`` and ``no_yield`` without either, ``error`` when the bond cannot be
+priced for that settlement (inside the redemption record window, say). On one synthetic bond the misreadings are
+this large: payment dates for due dates +0.504 bp, the price read as dirty +256.97 bp (the corporates spec's T19). A
+trade without a settlement date is taken to settle T+1 on the bond's payment calendar (noted). ``isin_daily_checked``
+turns checked trades into ISIN-day rows whose yield is the value-weighted recomputed yield (a value-weighted yield as
+the mutual-fund rule's VWAY is, SEBI's MF master circular 10.2.3, inter-scheme transfers left out; the rule's own
+filters on trade size and its waterfall are not built), with the reported one beside it and the day's statuses
+counted. ``recomputed_trades`` leaves out trades of bonds without terms, or keeps them on their reported yields
+(``without_terms="reported"``). Existing outputs are unchanged: the check appends columns (``CHECK_COLUMNS``) and
+``isin_daily`` is untouched for files without a deal type.
 """
 
 from __future__ import annotations
