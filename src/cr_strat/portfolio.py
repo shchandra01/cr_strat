@@ -981,14 +981,16 @@ HEDGE_METHODS = ("engine", "annuity")
 
 
 def hedge_ois_notional(dv01: float, curve, months: int, start, *, conventions: OisConventions | None = None,
-                       calendar=None, method: str = "engine") -> float:
+                       calendar=None, method: str = "engine", fixed_rate_pct: float | None = None) -> float:
     """The OIS notional (rupees) whose DV01 offsets ``dv01`` rupees per bp (F18); pay fixed against a long book's
     positive DV01. ``method="engine"`` (the default): ``N = |DV01| / |DV01_1|``, ``DV01_1`` the DV01 per rupee of
     notional of a par swap of ``months`` from ``start`` as ``ois.ois_npv`` measures it (the zero rates up 1 bp), the
     measure the engine's hedge test (L05), the gate and the risk tables use: the hedge's DV01 on it is ``dv01``.
     ``method="annuity"``: ``N = DV01 / (A x 1e-4)``, ``A`` the swap's annuity from ``start`` (the rule of
-    ``asset_swaps.hedge_notional``: a 1 bp move of the swap's par rate), larger on the engine's measure. Give the
-    book's DV01 on the measure to be neutralised (a bond's yield DV01 is not its curve DV01)."""
+    ``asset_swaps.hedge_notional``: a 1 bp move of the swap's par rate), larger on the engine's measure. The engine
+    sizing prices a par swap unless ``fixed_rate_pct`` names the swap's own fixed rate (an off-market swap's DV01
+    differs by a few parts in a thousand). Give the book's DV01 on the measure to be neutralised (a bond's yield DV01
+    is not its curve DV01)."""
     rk._choice(method, HEDGE_METHODS, "the hedge sizing method")
     target = abs(_num(dv01, "dv01"))
     if method == "annuity":
@@ -997,7 +999,8 @@ def hedge_ois_notional(dv01: float, curve, months: int, start, *, conventions: O
     s = rk._date(start, "the swap's start")
     conv = conventions if conventions is not None else getattr(curve, "conventions", MIBOR_OIS)
     cal = calendar if calendar is not None else getattr(curve, "calendar", None)
-    rate = ois_par_rate(curve, s, int(months), conv, cal)
+    rate = ois_par_rate(curve, s, int(months), conv, cal) if fixed_rate_pct is None else _num(fixed_rate_pct,
+                                                                                               "fixed_rate_pct")
     unit = ois_npv(curve, OisSwap(effective=s, months=int(months), fixed_rate_pct=rate, notional=1e7, pay_fixed=True,
                                   conventions=conv), calendar=cal).dv01
     if not (math.isfinite(unit) and unit != 0):

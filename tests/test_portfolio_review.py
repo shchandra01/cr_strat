@@ -32,6 +32,10 @@ def test_an_ois_hedge_is_dv01_neutral_on_the_engines_measure(months):
     dv01 = 1e9 / 100 * fx.GS2036.dv01(7.0, s)  # Rs 100 crore of GS2036's yield DV01, rupees per bp
     n = pf.hedge_ois_notional(dv01, curve, months, start, calendar=cal)
     assert abs(_engine_dv01(curve, months, start, n, cal)) / dv01 == pytest.approx(1.0, abs=1e-9)  # was 1.014 to 1.058
+    # an off-market swap (a fixed rate of 6%) sized on its own rate is neutral too
+    n6 = pf.hedge_ois_notional(dv01, curve, months, start, calendar=cal, fixed_rate_pct=6.0)
+    v6 = ois_npv(curve, OisSwap(effective=start, months=months, fixed_rate_pct=6.0, notional=n6), calendar=cal).dv01
+    assert abs(v6) / dv01 == pytest.approx(1.0, abs=1e-9)
     annuity = pf.hedge_ois_notional(dv01, curve, months, start, calendar=cal, method="annuity")
     assert annuity > n  # the par-rate (annuity) rule is the larger notional on the engine's measure
     with pytest.raises(ValueError, match="hedge sizing method"):
