@@ -155,13 +155,13 @@ def _sized_payer(state, market, months: int) -> rt.Order:
 
 def test_an_18_month_payer_against_a_10_year_bond_is_refused_by_the_hedging_only_test():
     market, ctx, state = _short_history_gate()
-    assert lm.ois_key_tenors_of_day(ctx, lf.END) == (0.25, 0.5, 1.0, 2.0, 3.0, 5.0)  # the B3 curve ends at 5 years
     order = _sized_payer(state, market, 18)
     _, rows = lm.PreTradeGate(None, ctx).check(state, [order])
     frame = lm.gate_frame(rows).set_index("limit_id")
     # the old rule netted the bond's 3- to 10-year KRDs into the swap's own last row (2 years): 0.995558, approved
     assert frame["decision"].iloc[0] == "refused"
     assert frame.loc["L06", "post_value"] == pytest.approx(1.923818, abs=1e-6)
+    assert lm.ois_key_tenors_of_day(ctx, lf.END) == (0.25, 0.5, 1.0, 2.0, 3.0, 5.0)  # the B3 curve ends at 5 years
     view = lm._view(state, [lm.order_risk(state, order, seq=1)], {})
     (_, ratio, ok, detail), = lm.metric_values(view, "ois_hedge_effect", "book", "b", "", "ratio")
     assert ok and "KRDs beyond 5 years netted into it: the OIS curve's last key tenor" in detail
@@ -209,3 +209,131 @@ def test_issuer_and_group_selectors_ignore_case_and_an_unknown_id_is_incomplete(
     frame = lm.gate_frame(out)
     assert frame["decision"].iloc[0] == "refused" and frame["post_value"].iloc[0] == pytest.approx(25.510856,
                                                                                                     abs=1e-6)
+
+
+# ---------------------------------------------------------------- back-tests: a strategy's late book; the other count
+
+
+def _late_book_frames(*, hole: bool = False):
+    days = [date(2026, 9, 1)]
+    while len(days) < 30:
+        days.append(fx.LEN.add_business_days(days[-1], 1))
+    hist = pd.DataFrame([{"date": d.isoformat(), "scope_type": st_, "scope": sc, "method": "hs_full",
+                          "horizon_days": 1, "alpha_var": 0.99, "var": 1000.0} for d in days[:-1]
+                         for st_, sc in (("book", "b1"), ("strategy", "S"), ("fund", "fund"))])
+    for c in rk.VAR_HISTORY_COLUMNS:
+        if c not in hist:
+            hist[c] = ""
+    b2_days = [d for k, d in enumerate(days[10:]) if not (hole and k == 5)]
+    nav = pd.DataFrame([{"date": d.isoformat(), "book": "b1", "nav": 1e6, "pnl": 10.0} for d in days]
+                       + [{"date": d.isoformat(), "book": "b2", "nav": 1e6, "pnl": 10.0} for d in b2_days])
+    books = pd.DataFrame([{"book": "b1", "strategy": "S", "effective_from": ""},
+                          {"book": "b2", "strategy": "S", "effective_from": ""}])
+    return days, hist, nav, books
+
+
+def test_a_strategy_is_back_tested_on_the_books_it_has_before_a_later_book_starts():
+    days, hist, nav, books = _late_book_frames()
+    detail, summary = rk.backtest(hist, nav, strategy_books=books)
+    s = summary.set_index(["scope_type", "scope"]).loc[("strategy", "S")]
+    # the old rule: S's P&L NaN until b2's first NAV row, 9 'missing' exceptions in 29, red
+    assert (s["observations"], s["exceptions"], s["zone"]) == (29, 0, "green")
+    d = detail[detail["scope"] == "S"].set_index("pnl_date")
+    assert d.loc[days[1], "pnl_actual"] == 10.0 and d.loc[days[9], "pnl_actual"] == 10.0  # b1 alone
+    assert d.loc[days[10], "pnl_actual"] == 20.0 and not d["missing"].any()  # b2 from its first row
+    # a row b2 misses after its first one is still missing
+    days, hist, nav, books = _late_book_frames(hole=True)
+    detail, summary = rk.backtest(hist, nav, strategy_books=books)
+    d = detail[detail["scope"] == "S"].set_index("pnl_date")
+    assert d.loc[days[15], "missing"] and d.loc[days[15], "exception_actual"]
+    assert summary.set_index(["scope_type", "scope"]).loc[("strategy", "S"), "exceptions"] == 1
+
+
+def test_the_other_hypothetical_count_leaves_out_the_last_var_days_missing_pair():
+    days = fx.CAL.business_days(date(2026, 11, 2), date(2026, 11, 13))
+    hist = pd.DataFrame([{"date": d, "as_of": "", "scope_type": "fund", "scope": "fund", "method": "hs_full",
+                          "horizon_days": 1, "alpha_var": 0.99, "var": 100.0, "alpha_es": 0.975, "es": 110.0,
+                          "n_obs": 250, "coverage": 1.0, "status": "ok"} for d in days])  # the last day's VaR too
+    nav = pd.DataFrame([{"date": d, "book": "b", "pnl": 2.0} for d in days])
+    att = pd.DataFrame([{"date": d, "book": "b", "instrument": "X", "line": line, "amount": 1.0, "memo": False}
+                        for d in days for line in ("accrual", "curve_parallel")])
+    for te, other in (("exclude", "kept"), ("include", "left out")):
+        detail, summary = rk.backtest(hist, nav, att, time_effects=te)
+        s = summary.iloc[0]
+        assert len(detail) == len(days) - 1 and s["observations"] == len(days) - 1
+        assert s["exceptions_hypothetical"] == 0 and s["exceptions"] == 0
+        # the old notes counted the last VaR day's pair, whose next-day P&L does not exist yet: 1
+        assert f"0 hypothetical exception(s) with time effects {other}" in s["notes"]
+
+
+# ---------------------------------------------------------------- ratings: another instrument of the issuer
+
+
+def _ratings(rows):
+    return pd.DataFrame(rows, columns=["agency", "rating", "public_from", "isin", "issuer_id"])
+
+
+def test_a_later_downgrade_on_another_instrument_of_the_issuer_is_not_masked():
+    as_of = datetime(2026, 11, 20, 20)
+    own = ("ICRA", "[ICRA]AA+ (Stable)", "2025-01-10T10:00", "INE222B07YY2", "ISSNCD")
+    sibling = ("ICRA", "[ICRA]A (Negative)", "2026-11-02T10:00", "INE222B07ZZ3", "ISSNCD")
+    # the old rule read the ISIN's older AA+
+    assert rk.rating_detail(_ratings([own, sibling]), "INE222B07YY2", "ISSNCD", as_of) == ("A", 6, "instrument")
+    assert rk.rating_detail(_ratings([own, sibling]), "INE222B07YY2", "ISSNCD", datetime(2026, 11, 1, 20)) == \
+        ("AA+", 2, "isin")  # the downgrade not yet public
+    # the ISIN's own action as recent as the other instrument's (one rationale; a subordinated bond rated lower by
+    # design): the ISIN's own grade
+    same_day = ("ICRA", "[ICRA]AA+ (Stable)", "2026-11-02T10:00", "INE222B07YY2", "ISSNCD")
+    assert rk.rating_detail(_ratings([same_day, sibling]), "INE222B07YY2", "ISSNCD", as_of) == ("AA+", 2, "isin")
+    # another agency's newer action on the other instrument counts at the issuer's level too
+    crisil = ("CRISIL", "CRISIL A-/Negative", "2026-11-10T10:00", "INE222B07ZZ3", "ISSNCD")
+    assert rk.rating_detail(_ratings([same_day, sibling, crisil]), "INE222B07YY2", "ISSNCD", as_of)[:2] == ("A-", 7)
+    # an upgrade on another instrument never lifts the ISIN above its own grade
+    up = ("ICRA", "[ICRA]AAA (Stable)", "2026-11-12T10:00", "INE222B07ZZ3", "ISSNCD")
+    assert rk.rating_detail(_ratings([own, up]), "INE222B07YY2", "ISSNCD", as_of) == ("AA+", 2, "isin")
+
+
+# ---------------------------------------------------------------- one ISIN prefix, two issuers
+
+
+def _prefix_book(issuer_rows):
+    d, s = date(2026, 11, 20), date(2026, 11, 23)
+    as_of = datetime(2026, 11, 20, 20)
+    trades = pd.DataFrame([{"trade_id": "C1", "book": "c", "isin": "INE000A14ZZ9", "kind": "cp", "side": "buy",
+                            "face": 6e8, "trade_date": "2026-11-19", "maturity_date": "2027-02-19",
+                            "issue_date": "2026-11-19"}])
+    settings = rt.EngineSettings(access=rt.ACCESS_PRESETS["nbfc_non_pd"], project_calendar=True)
+    market = rt.MarketData(corporate_terms=pd.DataFrame(NCD_TERMS),
+                           curves={"gsec": {d: rt.CurveEntry(fx.nss(s), fx.at(d))}},
+                           ois_curves={d: rt.CurveEntry(fx.b3_curve(d), fx.at(d))})
+    insts = rt.instruments_as_known(market, settings, ["INE000A07011", "INE000A14ZZ9"], as_of, terms=trades)
+    ncd, cp = insts["INE000A07011"].bond, insts["INE000A14ZZ9"].bond
+    rows = [fx.bond_row(ncd, "INE000A07011", "corporate", 7e8, d, s, ncd.yield_from_dirty_price(101.0, s), book="c",
+                        source="valuation")]
+    px = cp.price(6.4, s, rounded=False)
+    rows.append({**fx.bond_row(ncd, "INE000A14ZZ9", "cp", 6e8, d, s, 6.4, book="c", source="valuation"),
+                 "clean_mark": px, "accrued": 0.0, "value": 6e6 * px, "dv01": 6e6 * cp.dv01(6.4, s)})
+    ctx = rk.RiskContext(market=market, settings=settings, risk=rk.RiskSettings(), as_of=as_of, terms=trades,
+                         issuers=pd.DataFrame(issuer_rows) if issuer_rows else None,
+                         nav=pd.DataFrame([{"date": d, "book": "c", "nav": 1e10}]))
+    return rk.risk_book(pd.DataFrame(rows), ctx)
+
+
+def test_a_prefix_the_issuer_table_gives_another_issuer_than_the_terms_is_flagged():
+    conflict = [{"issuer_id": "ISS2", "group_id": "", "sector": "financials", "effective_from": "",
+                 "isin_prefix": "INE000A"}]
+    book = _prefix_book(conflict)
+    issuers = {p.isin: (p.issuer_id, p.flags) for p in book.positions}
+    assert issuers["INE000A07011"][0] == "ISS1" and issuers["INE000A14ZZ9"][0] == "ISS2"
+    assert all("issuer_prefix_conflict" in f for _, f in issuers.values())  # was no flag at all
+    assert any("prefix INE000A to ISS2 but the corporate terms give INE000A07011 to ISS1" in n for n in book.notes)
+    view = lm.MetricInputs(day=book.date, as_of=book.as_of, access=rt.ACCESS_PRESETS["nbfc_non_pd"],
+                           positions=rk.position_risk(book), nav=dict(book.nav), strategies=dict(book.strategies))
+    values = lm.metric_values(view, "exposure", "fund", "fund", "issuer=*", "pct_nav")
+    assert [k for k, *_ in values] == ["ISS1", "ISS2"]
+    assert all(not ok and "issuer_prefix_conflict" in d for _, _, ok, d in values)  # parts of one company
+    assert all(ok for _, _, ok, _ in lm.metric_values(view, "exposure", "fund", "fund", "sector=*", "pct_nav"))
+    # the same prefix given to the terms' issuer: one issuer, no flag
+    book = _prefix_book([{**conflict[0], "issuer_id": "ISS1"}])
+    assert {p.issuer_id for p in book.positions} == {"ISS1"}
+    assert not any("issuer_prefix_conflict" in p.flags for p in book.positions)

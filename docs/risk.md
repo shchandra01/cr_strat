@@ -150,23 +150,25 @@ The window is the latest 250 dates (`--window`) on which every factor of the sco
 (`--min-obs-hard`) has a change; a factor with fewer is left out and the figure is `incomplete` (coverage below one)
 unless the proxy table maps it to a factor with history (`proxied`). A factor whose last change is more than
 `max_gap_days` business days before the book's day (a series that stopped, or a hole at its end) is left out the same
-way (`stale_factor:<factor>`, proxied if the table maps it) rather than dragging the window back in time; a window
-that still ends before the book's day is flagged `stale_window` and `incomplete`. A hole inside the window is treated
-the same way (UNVERIFIED rule, its tolerance the same `max_gap_days`): the anchor is the latest 250 dates on which any
-of the scope's curve factors (G-sec, SDL, corporate curve or OIS key rates) has a change, and a spread factor (`corp:`,
-`cd:`, `sdl_spread:`, `frb_dm:`, `tbill182`, `resid:`) that misses more than 5 of them from its first change on is
-left out (`holey_factor:<factor>`, proxied if the table maps it), so that a spread table with a gap of a few months
-no longer pushes every factor's window back past it (a factor missing up to 5 dates is kept, and the window then
-reaches back those few dates). A curve factor is never left out this way: a hole in the curve history itself leaves
-the window short of those dates for every factor, and any window whose 250 dates leave out more than `max_gap_days`
-business days of a used factor's changes (a change over a gap of up to `max_gap_days` days counts as covering it, so
-a coarse weekly history is not caught) is flagged `holey_window:<days>` and `incomplete`. The gate's parametric VaR
-(`limits.parametric_from_frames`) leaves out the same factors and refuses such a window. With fewer than 60
-observations the figure is refused, with the count; below 250 (`--min-obs`) it is flagged `short_history`. VaR at level `a` is the
-`ceil(n(1 - a))`-th largest loss (`--quantile-rule`; `floor_plus_one` and `interpolate` also offered) and ES the mean
-of the worst `m = n(1 - a)` losses, a fractional last one counted in part (the tail size held as an exact fraction).
-The 10-day figures sum overlapping runs of 10 daily changes (`--horizon-rule sqrt_time` scales the one-day figure
-instead); the parametric method always scales by the square root of time.
+way (`stale_factor:<factor>`, proxied if the table maps it) rather than dragging the window back in time; a window that
+still ends before the book's day is flagged `stale_window` and `incomplete`. A hole inside the window is treated the
+same way (UNVERIFIED rule, its tolerance the same `max_gap_days`, `--max-gap-days` or the daily configuration's
+`max_gap_days`): the anchor is the latest 250 dates on which any of the scope's curve factors (G-sec, SDL, corporate
+curve or OIS key rates) has a change, and a spread factor (`corp:`, `cd:`, `sdl_spread:`, `frb_dm:`, `tbill182`,
+`resid:`) that misses more than `max_gap_days` (5) of them from its first change on is left out
+(`holey_factor:<factor>`, proxied if the table maps it), so that a spread table with a gap of a few months no longer
+pushes every factor's window back past it (a factor missing up to 5 dates is kept, and the window then reaches back
+those few dates). A curve factor is never left out this way: a hole in the curve history itself leaves the window short
+of those dates for every factor, and any window whose 250 dates leave out more than `max_gap_days` business days of a
+used factor's changes (a change over a gap of up to `max_gap_days` days counts as covering it, so a coarse weekly
+history is not caught; a change measured over a longer gap, which only a hand-built history can hold, counts as one day,
+and with `--gap-rule drop` a dropped change's days read as covered) is flagged `holey_window:<days>` and `incomplete`.
+The gate's parametric VaR (`limits.parametric_from_frames`) leaves out the same factors and refuses such a window. With
+fewer than 60 observations the figure is refused, with the count; below 250 (`--min-obs`) it is flagged `short_history`.
+VaR at level `a` is the `ceil(n(1 - a))`-th largest loss (`--quantile-rule`; `floor_plus_one` and `interpolate` also
+offered) and ES the mean of the worst `m = n(1 - a)` losses, a fractional last one counted in part (the tail size held
+as an exact fraction). The 10-day figures sum overlapping runs of 10 daily changes (`--horizon-rule sqrt_time` scales
+the one-day figure instead); the parametric method always scales by the square root of time.
 
 **Stressed ES** (`--stressed`): the window of `window` observations, searched over the whole history, in which the
 book's 10-day ES on the reduced set of factors (those whose history starts within 30 days of the earliest) is
@@ -187,9 +189,12 @@ hypothetical one the attribution's market lines on positions held from the previ
 convexity; trades, costs, funding and the benchmark left out). Time effects (accrual, pull to par, roll-down, OIS carry
 and roll-down) are left out of the hypothetical P&L by default, as the VaR has none (MAR32.27 and MAR10.32 ask the two
 to treat them alike; `time_effects="include"`, or `cr-strat var-backtest --time-effects include`, keeps them); the
-notes count both readings. A book with an actual P&L but no market line on a day the attribution covers held nothing
-from the previous close: its hypothetical P&L is 0, not missing. A strategy's P&L is the sum of its books' (the
-`strategy_books` map, as mapped on the VaR's day; `--strategy-books`), so a strategy is back-tested like a book; a
+notes count both readings, on the same pairs (the last VaR day, whose next-day P&L does not exist yet, in neither). A
+book with an actual P&L but no market line on a day the attribution covers held nothing from the previous close: its
+hypothetical P&L is 0, not missing. A strategy's P&L is the sum of its books' (the `strategy_books` map, as mapped on
+the VaR's day; `--strategy-books`), counting only the books with a NAV row on or before the P&L's day (the engine
+creates a book on its first flow or trade, so a strategy that gains a book later is back-tested on the others until
+then; a row a book misses after its first one is still missing), so a strategy is back-tested like a book; a
 scope with no P&L at all is reported as not back-tested, never as exceptions. An exception is a P&L strictly below
 minus the VaR; a missing VaR or P&L counts as one. Actual and hypothetical
 exceptions are counted apart and the larger count used. Over the last 250 pairs: Kupiec's proportion-of-failures test
@@ -608,7 +613,7 @@ UNVERIFIED (a choice with no source: listed in every run's `notes.txt`, settable
 | Liquidity | 20% participation; the ADV over the last 20 business days the marks cover (fewer than 5: the table or a proxy first); positions netted by ISIN, the scope's net cash at day 0; example proxies, stressed spreads 3 times, LVaR = VaR + stressed cost | U |
 | Liquidity horizons | MAR33.12 Table 2 as read for INR: key rates and T-bills 10 days; SDL spreads, G-sec residuals, FRB margins 20 (sovereign IG credit spread); corporate and CD spreads 40 (IG), 60 below | U (the mapping) |
 | National to FRTB grades and buckets | national AAA to BBB- read as investment grade; a fund's sector names (`bank`, `psu_bank`, `nbfc`, `hfc`, `pfi`, `insurance`) read as FRTB's financials | U |
-| Ratings | the worse of the ISIN's and its issuer's latest long-term ratings; a short-term grade read as the worst long-term grade paired with it (A1+ as A+); an issuer from the issuer table's `isin_prefix`, else its bonds' ISIN prefix | U |
+| Ratings | the worse of the ISIN's and its issuer's latest long-term ratings, the issuer's per agency the latest of its own rows and of its other instruments' rows newer than the ISIN's own action from that agency, all of them when the agency does not rate the ISIN (a later downgrade recorded on another NCD of the company counts; flagged `rating_from_other_instrument`; a subordinated sibling's lower grade counts only when its action is the newer); a short-term grade read as the worst long-term grade paired with it (A1+ as A+); an issuer from the issuer table's `isin_prefix`, else its bonds' ISIN prefix, a prefix the table and the terms give to two issuers flagged `issuer_prefix_conflict` | U |
 | Back-test P&L | the hypothetical P&L without time effects (MAR32.27); a flat book's hypothetical P&L 0; MAR32.19's desk rule counted, not enforced | U / V |
 | OIS counterparty risk | the current exposure method of the saved NBFC capital directions (add-ons 0.5%, 1%, 3%; CCP zero; weights 0/20/100%); no netting; a swap without a counterparty at 100% | P (read from the saved directions) / U |
 | OIS hedge sizing | the engine's DV01 (`method="engine"`), the annuity rule as an option | U |
@@ -683,8 +688,12 @@ commands write the same bytes as at commit 80f9e8b (7 runs, 63 files, by sha256)
 commit's back-test, with and without a risk recorder, writes its 9 files byte for byte.
 
 Checked after the review of the risk layer (tests `test_risk_review.py`, `test_limits_review.py`,
-`test_stress_review.py`, `test_portfolio_review.py`, `test_daily_review.py`, `test_counterparty_review.py`, each
-failing on the code before the fixes): a stale factor left out of the window instead of dragging it back; ratings
+`test_stress_review.py`, `test_portfolio_review.py`, `test_daily_review.py`, `test_counterparty_review.py`: 60 of their
+64 fail or error on the code before the fixes, commit da05d67, one of them, a strategy's NAV whatever the order of its
+books, only for some hash seeds (6 of 8 tried), since the old sum's rounding followed the order of a set; the other 4
+pass there: the FRTB guards for financials, covered bonds and other issuers, buckets the fixes had to keep, and the
+drawdown pin, which fails when the recovery test is moved by 1%): a stale factor left out of the window instead of
+dragging it back; ratings
 from short-term grades and issuer rows; one issuer for a company's CP, CD and NCDs; components keyed per position;
 strategy back-tests on their books' P&L; flat books; the stressed window's ties; callable flags; the 20-day sovereign
 spread horizons; the gate's cache across orders; breach episodes carried through incomplete days; selector values;
@@ -693,6 +702,18 @@ ISIN with cash at day 0; the ADV window; FRTB's buckets for a fund's sector name
 government issuers; an FRB under a yield shock; OIS hedges sized on the engine's DV01 (ratio 1.0000); strategy
 returns without -100% days; the daily configuration's risk keys; the report's open breaches; the OIS counterparty
 exposure.
+
+Checked after the verification of those fixes (tests `test_risk_verify.py`, 9 tests, each failing on the code before
+these fixes, commit 593d23a): a spread factor with a hole inside the window left out, the window kept on the latest
+dates (in the verifier's case, 400 days of fits, it had moved back past the hole with 7 of the last 100 volatile days
+in it and the VaR 71% lower), a few missing days
+kept, a weekly spread table beside daily curves left out, a hole in the curve history itself flagged `holey_window`
+and refused by the gate's VaR, a coarse weekly history not flagged; L06 netting into the OIS curve's last key tenor
+(an 18-month payer against a 10-year bond refused at 1.923818 instead of approved at 0.995558); issuer and group
+selectors compared without case and an unknown id `incomplete`; a strategy back-tested on its started books before a
+later one has a NAV row; the hypothetical count with the time effects the other way cut at the latest P&L; a later
+downgrade recorded on another instrument of the issuer; one ISIN prefix given to two issuers flagged and their
+concentration `incomplete`.
 
 Not checked: any real book, curve history, spread history or OIS quote; a stressed window on a real stress period;
 the revaluation's speed on a large real book (the demo's six positions with 300 days of history take about 2.3 s

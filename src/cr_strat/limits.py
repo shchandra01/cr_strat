@@ -845,6 +845,17 @@ def _unmatched(view: MetricInputs, selector) -> list[str]:
     return out
 
 
+def _conflicted(selector, members: Sequence[Mapping]) -> str:
+    """A note when a selector groups or filters by issuer or group and some of ``members`` carry the risk run's
+    ``issuer_prefix_conflict`` flag (the issuer table and the corporate terms name two issuers for one ISIN prefix:
+    the value is a part of one company's, so the metric is incomplete); empty otherwise."""
+    if not any(_sel(selector, k) for k in ID_KEYS):
+        return ""
+    isins = sorted({_text(r.get("isin")) for r in members
+                    if "issuer_prefix_conflict" in _text(r.get("flags")).split(";")})
+    return f"; issuer ids in conflict for {', '.join(isins)} (issuer_prefix_conflict)" if isins else ""
+
+
 def _no_match(missing: Sequence[str]) -> list[Value]:
     return [("", math.nan, False, f"selector matched nothing: {', '.join(missing)} is not an id of the book, the "
              "issuer table or the corporate terms")]
@@ -932,8 +943,10 @@ def _m_cs01(view: MetricInputs, st: str, sc: str, sel, unit: str) -> list[Value]
         raw = _fsum(float(r["cs01"]) for r in members)
         value, ok = _per_nav(_abs(sel, raw), view.nav_of(st, sc), unit, years=True)
         missing = sorted({_text(r.get("isin")) for r in unknown.get(key, [])})
-        out.append((key, value, ok and not missing, f"CS01 Rs {raw:,.2f} per bp of {len(members)} position(s)"
-                    + (f"; CS01 not known for {', '.join(missing)}" if missing else "")))
+        conflict = _conflicted(sel, [*members, *unknown.get(key, [])])
+        out.append((key, value, ok and not missing and not conflict,
+                    f"CS01 Rs {raw:,.2f} per bp of {len(members)} position(s)"
+                    + (f"; CS01 not known for {', '.join(missing)}" if missing else "") + conflict))
     return out
 
 
@@ -950,8 +963,9 @@ def _m_exposure(view: MetricInputs, st: str, sc: str, sel, unit: str, *, kinds=C
     for key, members in sorted(groups.items()):
         raw = _fsum(r["mv"] for r in members)
         value, ok = _per_nav(raw, nav, unit)
-        out.append((key, value, ok, f"market value Rs {raw:,.2f} of {len(members)} position(s)"
-                    + ("" if members else ": none held")))
+        conflict = _conflicted(sel, members)
+        out.append((key, value, ok and not conflict, f"market value Rs {raw:,.2f} of {len(members)} position(s)"
+                    + ("" if members else ": none held") + conflict))
     return out
 
 
@@ -1184,7 +1198,8 @@ def _m_jtd(view: MetricInputs, st: str, sc: str, sel, unit: str) -> list[Value]:
     for key, members in sorted(groups.items()):
         raw = _fsum(float(r["jtd"]) for r in members)
         value, ok = _per_nav(raw, nav, unit)
-        out.append((key, value, ok, f"JTD Rs {raw:,.2f} of {len(members)} position(s)"))
+        conflict = _conflicted(sel, members)
+        out.append((key, value, ok and not conflict, f"JTD Rs {raw:,.2f} of {len(members)} position(s)" + conflict))
     return out
 
 

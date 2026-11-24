@@ -368,7 +368,7 @@ the pressure variable and the price response for each event.
   stress period. Its VaR needs 250 days of fitted curves with their public times (60 at the least: fewer is refused);
   credit VaR needs spread histories the fund keeps, else it is incomplete. The scenario sizes marked U (most but
   BCBS's IRRBB shocks and FRTB's weights) are examples for the fund's own policy, and the conventions marked
-  UNVERIFIED (key tenors, the quantile rule, gap scaling, the window's stale factors, liquidity participation,
+  UNVERIFIED (key tenors, the quantile rule, gap scaling, the window's stale and holey factors, liquidity participation,
   spreads and horizons, the 0% floor, national grades read as FRTB's, the ratings rule, the back-test's hypothetical
   P&L and its reading below six observations) are listed in every run's `notes.txt`, with what the VaR leaves out
   (carry and funding, default, exit costs, callable options, bond-specific basis). Callable bonds are valued to

@@ -644,6 +644,28 @@ def issuer_prefixes(issuers: Mapping[str, Mapping], corp_terms: Mapping[str, Map
     return given, inferred, tuple(sorted(p for p, ids in seen.items() if len(ids) > 1))
 
 
+def _given_prefix(isin: str, given: Mapping[str, str]) -> str | None:
+    hits = sorted((p for p in given if isin.startswith(p)), key=len, reverse=True)
+    return hits[0] if hits else None
+
+
+def issuer_prefix_conflicts(issuers: Mapping[str, Mapping], corp_terms: Mapping[str, Mapping]
+                            ) -> dict[str, tuple[tuple[str, str, str], ...]]:
+    """``{prefix: ((terms ISIN, its terms issuer, the table's issuer), ...)}``: the issuer table's ``isin_prefix``
+    values whose issuer (the longest prefix an ISIN starts with) is not the one the corporate terms give a bond with
+    that prefix. One company's CP (named by the prefix) and NCD (named by its terms) would otherwise be two issuers with
+    nothing said, and the concentration and JTD limits would each see a part; their positions are flagged
+    ``issuer_prefix_conflict`` and the run's notes name the rows."""
+    given = issuer_prefixes(issuers, {})[0]
+    out: dict[str, list[tuple[str, str, str]]] = {}
+    for isin, rec in sorted(corp_terms.items()):
+        issuer = _text(rec.get("issuer_id"))
+        prefix = _given_prefix(isin, given) if issuer else None
+        if prefix is not None and given[prefix] != issuer:
+            out.setdefault(prefix, []).append((isin, issuer, given[prefix]))
+    return {p: tuple(v) for p, v in sorted(out.items())}
+
+
 # ---------------------------------------------------------------- curves and ratings as known at a time
 
 
@@ -712,12 +734,17 @@ def _latest_by_agency(rows: pd.DataFrame, as_of: datetime, scale: str) -> dict[s
 def rating_detail(ratings: pd.DataFrame | None, isin: str, issuer_id: str, as_of: datetime
                   ) -> tuple[str | None, int | None, str]:
     """(bucket, notch, how) of a credit position's rating as known at ``as_of``: the worse of the worst of each agency's
-    latest long-term rating on the ISIN's rows and on its issuer's rows (``how`` ``isin``, ``issuer`` or ``both``),
+    latest long-term rating on the ISIN's rows and the worst of each agency's latest long-term action on its issuer,
     so that an issuer's later downgrade is never masked by an older rating of the instrument (UNVERIFIED,
-    conservative: a credit enhancement on the ISIN is not credited above its issuer); with no long-term grade on
-    either, the worst short-term one read through ``ST_TO_LT`` (the worst long-term grade it is paired with;
-    ``how`` ``short_term:<grade>``). A rating known only by its date counts from 23:59:59 that day (UNVERIFIED,
-    ``corporates.public_time``). ``(None, None, "")`` without one."""
+    conservative: a credit enhancement on the ISIN is not credited above its issuer). An agency's latest action on the
+    issuer is the latest of its rows for the issuer (no ISIN) and of its rows for the issuer's other instruments that
+    are newer than the ISIN's own latest action from that agency (all of them when the agency does not rate the ISIN):
+    an action recorded on another NCD of the company is an action on the company (UNVERIFIED, conservative: an
+    instrument rated lower by design, a subordinated bond, counts only when its action is the newer). ``how`` is
+    ``isin``, ``issuer``, ``instrument`` (another instrument's action decides) or ``both``; with no long-term grade on
+    any of them, the worst short-term one of the ISIN and the issuer read through ``ST_TO_LT`` (the worst long-term
+    grade it is paired with; ``how`` ``short_term:<grade>``). A rating known only by its date counts from 23:59:59 that
+    day (UNVERIFIED, ``corporates.public_time``). ``(None, None, "")`` without one."""
     if ratings is None or not len(ratings):
         return None, None, ""
     frame = ratings
@@ -727,19 +754,22 @@ def rating_detail(ratings: pd.DataFrame | None, isin: str, issuer_id: str, as_of
         frame.iloc[0:0]
     issuer = of_issuer[isins.loc[of_issuer.index] == ""]  # the issuer's own rows (no ISIN)
     others = of_issuer[~isins.loc[of_issuer.index].isin(("", isin))]  # the issuer's other instruments
-    long_own, long_issuer = _latest_by_agency(own, as_of, "LT"), _latest_by_agency(issuer, as_of, "LT")
-    notches = {"isin": max((n for _, n, _ in long_own.values()), default=None),
-               "issuer": max((n for _, n, _ in long_issuer.values()), default=None)}
-    known = {k: v for k, v in notches.items() if v is not None}
-    if known:
-        notch = max(known.values())
-        how = "both" if len(known) == 2 and notches["isin"] == notches["issuer"] else \
-            max(known, key=lambda k: (known[k], k == "isin"))
-        return rating_bucket(notch), notch, how
-    long_others = _latest_by_agency(others, as_of, "LT")  # neither rated: the issuer's other instruments (the
-    if long_others:  # engine's rule of ISIN rows, else the issuer's)
-        notch = max(n for _, n, _ in long_others.values())
-        return rating_bucket(notch), notch, "issuer"
+    long_own = _latest_by_agency(own, as_of, "LT")
+    level = {a: (when, notch, "issuer") for a, (when, notch, _) in _latest_by_agency(issuer, as_of, "LT").items()}
+    for agency, (when, notch, _) in _latest_by_agency(others, as_of, "LT").items():
+        if agency in long_own and when <= long_own[agency][0]:
+            continue  # the ISIN's own action from that agency is as recent: the other instrument's adds nothing
+        if agency not in level or when > level[agency][0]:
+            level[agency] = (when, notch, "instrument")
+    notch_isin = max((n for _, n, _ in long_own.values()), default=None)
+    notch_issuer = max((n for _, n, _ in level.values()), default=None)
+    if notch_isin is not None or notch_issuer is not None:
+        if notch_issuer is None or (notch_isin is not None and notch_isin > notch_issuer):
+            return rating_bucket(notch_isin), notch_isin, "isin"
+        if notch_isin == notch_issuer:
+            return rating_bucket(notch_isin), notch_isin, "both"
+        how = "issuer" if any(n == notch_issuer and k == "issuer" for _, n, k in level.values()) else "instrument"
+        return rating_bucket(notch_issuer), notch_issuer, how
     short = {**_latest_by_agency(issuer, as_of, "ST"), **{f"{a}|isin": v for a, v in
                                                           _latest_by_agency(own, as_of, "ST").items()}}
     mapped = [(LT_NOTCH[ST_TO_LT[g]], g) for _, _, g in short.values() if g in ST_TO_LT]
@@ -1075,6 +1105,9 @@ def _position(rec: Mapping, inst: rt.Instrument, ctx: RiskContext, d: date, stra
     terms_row = statics["corp_terms"].get(inst.isin) if kind == "corporate" else None
     issuer_id, issuer_flags = _issuer_of(kind, inst.isin, terms_row, master.get(inst.isin), statics.get("prefixes"))
     flags.extend(issuer_flags)
+    conflicts = statics.get("prefix_conflicts") or {}
+    if conflicts and kind in CREDIT_KINDS and _given_prefix(inst.isin, statics["prefixes"][0]) in conflicts:
+        flags.append("issuer_prefix_conflict")  # the issuer table and the terms name two issuers for one prefix
     issuer = issuers.get(issuer_id, {})
     group_id = _text(issuer.get("group_id"))
     if kind in CREDIT_KINDS and issuer_id not in ("GOI",) and not group_id:
@@ -1097,6 +1130,8 @@ def _position(rec: Mapping, inst: rt.Instrument, ctx: RiskContext, d: date, stra
             rating_source = "ratings"
             if how.startswith("short_term:"):
                 flags.append("rating_from_short_term")
+            elif how == "instrument":
+                flags.append("rating_from_other_instrument")  # an action on another instrument of the issuer
         elif inst.rating_bucket:
             rating, rating_source = inst.rating_bucket, "static"
             flags.append("static_rating")
@@ -1518,6 +1553,7 @@ def _assemble(d: date, ctx: RiskContext, bond_rows: list, swap_rows: list, insts
                                                                         for c in ("isin", "seniority")))),
                "master": _master_rows(ctx), "corp_terms": corp_terms,
                "prefixes": issuer_prefixes(issuers, corp_terms),
+               "prefix_conflicts": issuer_prefix_conflicts(issuers, corp_terms),
                "frb_index": _frb_indices(ctx, [i for i, inst in insts.items() if inst.kind == "frb"])}
     positions = []
     for rec in bond_rows:
@@ -1538,6 +1574,12 @@ def _assemble(d: date, ctx: RiskContext, bond_rows: list, swap_rows: list, insts
     positions.sort(key=lambda p: (p.book, p.isin, p.state, p.settlement))
     swaps.sort(key=lambda s: (s.book, s.isin))
     notes = []
+    for prefix, rows in statics["prefix_conflicts"].items():
+        if any(_given_prefix(p.isin, statics["prefixes"][0]) == prefix for p in positions):
+            notes.append(f"the issuer table gives the ISIN prefix {prefix} to {rows[0][2]} but the corporate terms "
+                         "give " + ", ".join(f"{isin} to {issuer}" for isin, issuer, _ in rows)
+                         + ": the positions of that prefix are risked as more than one issuer (flagged "
+                         "issuer_prefix_conflict); correct the issuer table or the terms")
     for name, (curve, flags) in sorted((k, v) for k, v in curves.items() if not k.startswith("_")):
         if curve is None:
             notes.append(f"no {name} curve of {d} or before public by {ctx.as_of:%Y-%m-%d %H:%M}: its positions are "
@@ -1669,7 +1711,9 @@ def credit_table(book: RiskBook) -> pd.DataFrame:
                              "flags": _flags(*(f for p in members for f in p.flags
                                                if f in ("static_rating", "no_group", "no_curve", "issuer_from_isin",
                                                         "issuer_from_prefix", "issuer_prefix_ambiguous", "no_issuer",
-                                                        "stale_mark", "rating_from_short_term", "cs01_from_yield",
+                                                        "stale_mark", "rating_from_short_term",
+                                                        "rating_from_other_instrument", "cs01_from_yield",
+                                                        "issuer_prefix_conflict",
                                                         "callable_to_maturity", "callable_in_the_money")))})
     return pd.DataFrame(rows, columns=list(CREDIT_COLUMNS))
 
@@ -2284,7 +2328,10 @@ def window_gap(changes: np.ndarray, rows: np.ndarray, upto: np.ndarray, bdi: np.
     ``tol`` business days, the gap rule's scaled change; one day when its series broke there), summed (``bdi``:
     ``_business_index`` of the history's dates). A day a factor moved on that is missing from the window (because
     another factor has no change then, or no factor has: a hole in every series) counts; a coarse history whose
-    every change spans its gap counts nothing."""
+    every change spans its gap counts nothing. The coverage is read from the dates alone, as the gate's wide frames
+    hold no more: a change more than ``tol`` business days after the factor's previous one (which the library's own
+    histories never hold, the gap rule breaking the series there) counts as one day, so a hand-built history with such
+    changes reads holes it may not have; with ``gap_rule="drop"`` a dropped change's days read as bridged."""
     if len(rows) < 2:
         return 0
     ok = np.asarray(upto, dtype=bool)
@@ -3250,11 +3297,13 @@ def backtest(var_history, nav, attribution=None, *, alpha: float = VAR_ALPHA, wi
     (MAR32.18); an exception when ``PnL < -VaR`` strictly; a missing VaR counts as an exception of both series, a
     missing P&L as one of its own series. A book with an actual P&L but no market line on a day the attribution
     covers held nothing from the previous close: its hypothetical P&L is 0. A strategy's P&L is the sum of its books'
-    (``strategy_books``, ``STRATEGY_BOOK_COLUMNS``, as mapped on the VaR's day; default each book its own strategy);
-    a scope with no P&L at all is reported as not back-tested, never as exceptions. Over the last ``window`` pairs
-    ending at ``end`` (default the last VaR with a next business day): Kupiec, Christoffersen (on the sequence of the
-    larger count), the traffic light and, at 99%, MAR32.19's desk rule (reported in the notes, not enforced: more
-    than 12 exceptions at 99% or 30 at 97.5% in the last 250 pairs). Returns ``(BACKTEST_COLUMNS,
+    (``strategy_books``, ``STRATEGY_BOOK_COLUMNS``, as mapped on the VaR's day; default each book its own strategy)
+    that have a NAV row on or before the P&L's day (a book the engine has not created yet adds nothing; a row missing
+    after a book's first one is missing); a scope with no P&L at all is reported as not back-tested, never as
+    exceptions. Over the last ``window`` pairs ending at ``end`` (default the last VaR with a next business day, the
+    pairs cut at the latest P&L, for the notes' count with the time effects the other way too): Kupiec, Christoffersen
+    (on the sequence of the larger count), the traffic light and, at 99%, MAR32.19's desk rule (reported in the notes,
+    not enforced: more than 12 exceptions at 99% or 30 at 97.5% in the last 250 pairs). Returns ``(BACKTEST_COLUMNS,
     BACKTEST_SUMMARY_COLUMNS)``."""
     _choice(time_effects, TIME_EFFECTS, "time_effects")
     cal = calendar if calendar is not None else mumbai_settlement_calendar().lenient()
@@ -3416,9 +3465,12 @@ UNVERIFIED_RULES = (
     "liquidity horizons (MAR33.12 Table 2) by factor class: INR key rates and the T-bill factor 10 days; SDL spreads, "
     "a G-sec's residual and FRB margins 20 (sovereign IG credit spread); corporate and CD spreads 40 (IG), 60 below",
     "national ratings AAA to BBB- read as investment grade (FRTB buckets, liquidity horizons, FRTB_CSR)",
-    "a credit position's rating: the worse of the ISIN's and its issuer's latest long-term ratings; a short-term "
-    "grade read as the worst long-term grade it is paired with (A1+ as A+); an issuer from the issuer table's "
-    "isin_prefix, else from the ISIN prefix of its bonds' terms (a company's CP and CD join its NCDs)",
+    "a credit position's rating: the worse of the ISIN's and its issuer's latest long-term ratings, the issuer's "
+    "per agency the latest of its own rows and of its other instruments' rows newer than the ISIN's own action from "
+    "that agency, all of them when the agency does not rate the ISIN (flagged rating_from_other_instrument); a "
+    "short-term grade read as the worst long-term grade it is paired with (A1+ as A+); an issuer from the issuer "
+    "table's isin_prefix, else from the ISIN prefix of its bonds' terms (a company's CP and CD join its NCDs); a "
+    "prefix the table gives one issuer and the terms another is flagged issuer_prefix_conflict",
     "a credit position without its curve: CS01 taken as its yield DV01 (cs01_from_yield)",
     "back-test: no exception below six observations is green; the hypothetical P&L is the attribution's market "
     "lines with time effects (accrual, pull to par, roll-down, OIS carry and roll-down) left out, as the VaR has none "
