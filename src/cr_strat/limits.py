@@ -222,12 +222,15 @@ UNVERIFIED_RULES = (
     "counted as an unknown counterparty at 100%",
     "a holding known only by its rating bucket takes the bucket's worst notch",
     "the OIS hedge effect: the larger of the swaps' effect on parametric VaR and on the sum of absolute KRDs (each "
-    "tenor's G-sec and OIS KRDs netted, the KRDs beyond the OIS curve's last node netted into it); while the VaR "
-    "cannot be computed the key-rate test alone decides; L06 enforced (APPROVED) though it is this reading (counsel)",
+    "tenor's G-sec and OIS KRDs netted, the KRDs beyond the OIS curve's last key tenor netted into it, whatever the "
+    "swaps' tenors; without the day's curve the settings' last OIS key tenor); while the VaR cannot be computed the "
+    "key-rate test alone decides; L06 enforced (APPROVED) though it is this reading (counsel)",
     "CRAR: bank CDs weighted 0% (the cash and bank balances line), a CD weighted 100% only when the issuer table "
     "gives its issuer the sector pfi (a public financial institution); counsel and the accountant to confirm",
     "selector values: key tenors, curves, rating buckets, kinds and tenor buckets must be the risk layer's (case "
-    "ignored); sectors compare in lower case, so a sector the fund does not hold reads 0",
+    "ignored); sectors compare in lower case, so a sector the fund does not hold reads 0; issuer and group ids "
+    "compare without case and must name an id of the book, the issuer table or the corporate terms, else the metric "
+    "is incomplete (selector matched nothing)",
     "the gate: VaR and ES parametric (EWMA) on the post-trade sensitivities; queued orders count as filled; a purchase "
     "under a preset that cannot borrow keeps 1% of its consideration in cash for the fill and costs",
 )
@@ -348,7 +351,9 @@ def _canonical_values(metric: str, key: str, values: tuple[str, ...], where: str
     """Selector values in the form the risk tables use, or refused naming the line: a key tenor as its label
     (``10`` or ``10y``: ``10y``; one of the risk layer's key tenors), a curve, rating bucket, kind or tenor bucket of
     the known ones (case ignored), a sector in lower case (the issuer table's), an ISIN in upper case. A value that
-    matched nothing would otherwise read 0 and be ``ok`` for ever."""
+    matched nothing would otherwise read 0 and be ``ok`` for ever. Issuer and group ids are the fund's own and are
+    checked against the day's data instead (``_unmatched``: compared without case; an unknown one makes the metric
+    incomplete)."""
     def each(fn):
         return tuple(v if v == "*" else fn(v) for v in values)
 
@@ -661,7 +666,11 @@ class MetricInputs:
     is funding only), liquidity and funding liquidity; the engine's NAV history, the day's NAV by scope and each book's
     net cash and borrowing; the engine's positions (``funded``); ratings, stock, issue dates and notified amounts for
     the concentration and when-issued metrics; the risk weights and the board resolution date. ``changes`` is the
-    factor history (``risk.FACTOR_CHANGE_COLUMNS``) for the parametric VaR of the gate and the hedge-effect test."""
+    factor history (``risk.FACTOR_CHANGE_COLUMNS``) for the parametric VaR of the gate and the hedge-effect test, and
+    ``ois_key_tenors`` the key tenors of the day's OIS curve as public by ``as_of`` (``risk._curve_tenors``: those up
+    to its last node), which the hedge-effect test nets the longer KRDs into. ``entity_ids`` are the issuer and group
+    ids an issuer or group selector may name (``entity_ids``: the issuer table's and the corporate terms', with GoI),
+    besides those of the positions themselves."""
 
     day: date
     as_of: datetime
@@ -689,6 +698,8 @@ class MetricInputs:
     changes: pd.DataFrame | None = None
     risk_settings: rk.RiskSettings = field(default_factory=rk.RiskSettings)
     var_method: str | None = None  # the gate: every VaR and ES by this method (parametric)
+    ois_key_tenors: tuple[float, ...] = ()  # the key tenors of the day's OIS curve (none: no curve given)
+    entity_ids: frozenset[str] = frozenset()  # issuer and group ids of the issuer table and terms, case-folded
     notes: tuple[str, ...] = ()
     _rows: list | None = None
     _wide: Any = None
@@ -767,13 +778,18 @@ def _dimension(rec: Mapping, key: str) -> str:
     raise KeyError(key)
 
 
+ID_KEYS = ("issuer", "group")  # selector keys naming the fund's own ids: compared without case, checked to exist
+
+
 def _select(rows: Iterable[dict], selector, dims: Sequence[str], *, default_kinds: Sequence[str] | None = None
             ) -> dict[str, list[dict]]:
     """Rows grouped by the selector: keys of ``dims`` given ``*`` group (the key joins their values with ``:``),
-    other given values filter; ``default_kinds`` filter by kind when the selector names none."""
+    other given values filter (an issuer or group id whatever its case); ``default_kinds`` filter by kind when the
+    selector names none."""
     groups: dict[str, list[dict]] = {}
     by = [k for k in dims if _sel(selector, k) == ("*",)]
     kinds = _sel(selector, "kind")
+    wanted = {k: {v.casefold() for v in _sel(selector, k) or ()} for k in ID_KEYS}
     for rec in rows:
         if kinds is None and default_kinds is not None and rec["kind"] not in default_kinds:
             continue
@@ -782,7 +798,8 @@ def _select(rows: Iterable[dict], selector, dims: Sequence[str], *, default_kind
             values = _sel(selector, k)
             if values is None or values == ("*",):
                 continue
-            if _dimension(rec, k) not in values:
+            value = _dimension(rec, k)
+            if not (value.casefold() in wanted[k] if k in ID_KEYS else value in values):
                 ok = False
                 break
         if not ok:
@@ -790,6 +807,47 @@ def _select(rows: Iterable[dict], selector, dims: Sequence[str], *, default_kind
         key = ":".join(_dimension(rec, k) for k in by)
         groups.setdefault(key, []).append(rec)
     return groups
+
+
+def entity_ids(ctx: rk.RiskContext) -> frozenset[str]:
+    """The issuer and group ids a limit's issuer or group selector may name, case-folded: GoI's, and every
+    ``issuer_id`` and ``group_id`` of the issuer table and of the corporate terms (an issuer held without either is
+    named by the positions themselves)."""
+    ids = {"goi"}
+    tables = []
+    if ctx.issuers is not None:
+        tables.append(rk.read_issuers(ctx.issuers))
+    if ctx.market.corporate_terms is not None and len(ctx.market.corporate_terms):
+        tables.append(rk._frame(ctx.market.corporate_terms, "the corporate terms"))
+    for frame in tables:
+        for column in ("issuer_id", "group_id"):
+            if column in frame:
+                ids |= {_text(v).casefold() for v in frame[column] if _text(v)}
+    return frozenset(ids)
+
+
+def _unmatched(view: MetricInputs, selector) -> list[str]:
+    """The issuer and group values of a selector (other than ``*``) that name no id of the book, the issuer table
+    or the terms (``state:`` ids, an SDL's state, are taken as named): a misspelt id would otherwise read 0 for ever
+    and never block."""
+    out = []
+    known = None
+    for key in ID_KEYS:
+        values = _sel(selector, key)
+        if not values or values == ("*",):
+            continue
+        if known is None:
+            known = set(view.entity_ids)
+            for rec in view.rows():
+                known |= {_text(rec.get("issuer_id")).casefold(), _text(rec.get("group_id")).casefold()}
+        out.extend(f"{key} {v!r}" for v in values if v.casefold() not in known and not v.casefold().startswith(
+            "state:"))
+    return out
+
+
+def _no_match(missing: Sequence[str]) -> list[Value]:
+    return [("", math.nan, False, f"selector matched nothing: {', '.join(missing)} is not an id of the book, the "
+             "issuer table or the corporate terms")]
 
 
 def _abs(selector, value: float) -> float:
@@ -855,6 +913,9 @@ def _m_krd(view: MetricInputs, st: str, sc: str, sel, unit: str) -> list[Value]:
 
 
 def _m_cs01(view: MetricInputs, st: str, sc: str, sel, unit: str) -> list[Value]:
+    missing = _unmatched(view, sel)
+    if missing:
+        return _no_match(missing)
     scope_rows = [r for r in view.rows() if view.in_scope(r, st, sc) and not r["is_swap"]]
     rows = [r for r in scope_rows if _finite(r.get("cs01"))]
     dims = ("rating_bucket", "issuer", "group", "sector", "tenor_bucket", "kind")
@@ -877,6 +938,9 @@ def _m_cs01(view: MetricInputs, st: str, sc: str, sel, unit: str) -> list[Value]
 
 
 def _m_exposure(view: MetricInputs, st: str, sc: str, sel, unit: str, *, kinds=CREDIT_KINDS) -> list[Value]:
+    missing = _unmatched(view, sel)
+    if missing:
+        return _no_match(missing)
     rows = [r for r in view.rows() if view.in_scope(r, st, sc) and not r["is_swap"]]
     groups = _select(rows, sel, ("issuer", "group", "sector", "rating_bucket", "kind", "isin"), default_kinds=kinds)
     if not groups:
@@ -1108,6 +1172,9 @@ def _m_stress_loss(view: MetricInputs, st: str, sc: str, sel, unit: str) -> list
 
 
 def _m_jtd(view: MetricInputs, st: str, sc: str, sel, unit: str) -> list[Value]:
+    missing = _unmatched(view, sel)
+    if missing:
+        return _no_match(missing)
     rows = [r for r in view.rows() if view.in_scope(r, st, sc) and not r["is_swap"] and _finite(r.get("jtd"))]
     groups = _select(rows, sel, ("issuer", "group"))
     if not groups:
@@ -1363,10 +1430,13 @@ def parametric_from_frames(sens: pd.DataFrame, changes: pd.DataFrame, settings: 
     """``(VaR, ES, coverage, observations, detail)`` of a set of sensitivity rows (``SENSITIVITY_COLUMNS``; par-quote
     rows left out) on a wide factor history (date x factor, bp): the factors with at least ``min_obs_hard`` changes
     and, with ``day`` (the book's), a change within ``max_gap_days`` business days of it (a factor whose series
-    stopped would drag every factor's dates back: it is left out, coverage below one), the dates on which all of them
-    have one, the EWMA (or sample) covariance of the latest of them, as ``risk.parametric_var`` computes it (no
-    proxies). Raises below ``min_obs_hard`` observations, and when the dates end more than ``max_gap_days`` business
-    days before ``day``."""
+    stopped would drag every factor's dates back: it is left out, coverage below one) and no hole in the window (a
+    spread factor missing more than ``max_gap_days`` of the latest ``window`` rate-factor dates, ``risk
+    .holey_factors``: left out the same way), the dates on which all of them have one, the EWMA (or sample) covariance
+    of the latest of them, as ``risk.parametric_var`` computes it (no proxies). Raises below ``min_obs_hard``
+    observations, and, with ``day``, when the dates end more than ``max_gap_days`` business days before it or when the
+    latest ``window`` of them leave out more than ``max_gap_days`` business days of a factor's changes (``risk
+    .window_gap``: the risk run calls that VaR ``incomplete``, flagged ``holey_window``)."""
     a_var = settings.var_alpha if alpha_var is None else alpha_var
     a_es = settings.es_alpha if alpha_es is None else alpha_es
     use = sens[sens["basis"].astype(str) != "par"] if len(sens) else sens
@@ -1378,27 +1448,43 @@ def parametric_from_frames(sens: pd.DataFrame, changes: pd.DataFrame, settings: 
     d = rk.as_date(day) if day is not None else None
     cal = (calendar if calendar is not None else mumbai_settlement_calendar()).lenient()
     stale: set[str] = set()
+    holey: dict[str, int] = {}
+    upto = None
     if d is not None and changes is not None:
         for f in s_by:
             if f in changes.columns and counts.get(f, 0):
                 last = changes.index[changes[f].notna().to_numpy()][-1]
                 if rk._gap_days(cal, rk.as_date(last), d) > settings.max_gap_days:
                     stale.add(f)
-    used = sorted(f for f in s_by if counts.get(f, 0) >= settings.min_obs_hard and f not in stale)
+        upto = np.array([rk.as_date(x) <= d for x in changes.index], dtype=bool)
+        current = sorted(f for f in s_by if counts.get(f, 0) >= settings.min_obs_hard and f not in stale)
+        holey = rk.holey_factors(changes[current].to_numpy(dtype=float), current, upto, window=settings.window,
+                                 tol=settings.max_gap_days)
+    used = sorted(f for f in s_by if counts.get(f, 0) >= settings.min_obs_hard and f not in stale
+                  and f not in holey)
     covered = _fsum(abs(s_by[f]) for f in used)
     coverage = covered / total if total > 0 else 1.0
     if not used:
         if total > 0:
             raise ValueError("no factor of the scope has a history of min_obs_hard changes"
-                             + (f" up to {d} (stale: {', '.join(sorted(stale))})" if stale else ""))
+                             + (f" up to {d} (stale: {', '.join(sorted(stale))})" if stale else "")
+                             + (f" (with a hole in the window: {', '.join(sorted(holey))})" if holey else ""))
         return 0.0, 0.0, 1.0, 0, "no sensitivity"
     block = changes[used].to_numpy(dtype=float)
     rows = np.flatnonzero(np.all(np.isfinite(block), axis=1))
+    if upto is not None:
+        rows = rows[upto[rows]]  # only dates up to the book's day, as risk.parametric_var reads them
     if d is not None and len(rows):
         end = rk.as_date(changes.index[rows[-1]])
         if rk._gap_days(cal, end, d) > settings.max_gap_days:
             raise ValueError(f"the dates with every factor end on {end}, more than {settings.max_gap_days} business "
                              f"days before {d}")
+        bdi = rk._business_index(cal, [rk.as_date(x) for x in changes.index])
+        gap = rk.window_gap(block, rows[-settings.window:], upto, bdi, tol=settings.max_gap_days)
+        if gap > settings.max_gap_days:
+            raise ValueError(f"the latest {len(rows[-settings.window:])} dates with every factor leave out {gap} "
+                             f"business days of a factor's changes, more than max_gap_days {settings.max_gap_days} (a "
+                             "hole in the history)")
     if settings.cov_method == "ewma":
         rows = rows[-settings.ewma_max_obs:]
     else:
@@ -1414,7 +1500,10 @@ def parametric_from_frames(sens: pd.DataFrame, changes: pd.DataFrame, settings: 
     sigma = math.sqrt(max(float(s @ cov @ s), 0.0))
     var, es = rk.normal_var_es(sigma, a_var, a_es, horizon_days)
     return var, es, coverage, n, f"parametric {settings.cov_method}:{n} on {len(used)} factor(s)" + (
-        f"; stale factor(s) left out: {', '.join(sorted(stale))}" if stale else "")
+        f"; stale factor(s) left out: {', '.join(sorted(stale))}" if stale else "") + (
+        "; factor(s) with a hole in the window left out: " + ", ".join(f"{f} ({k} dates missing)"
+                                                                      for f, k in sorted(holey.items()))
+        if holey else "")
 
 
 def _sens_in_scope(view: MetricInputs, st: str, sc: str, *, swaps: bool = True) -> pd.DataFrame:
@@ -1450,6 +1539,18 @@ def _gate_var(view: MetricInputs, st: str, sc: str, what: str, horizon: int, alp
     return value, nav, coverage >= 1 - 1e-12, f"{detail}, coverage {coverage:.4f} (the gate's approximation)"
 
 
+def ois_key_tenors_of_day(ctx: rk.RiskContext, day, curve=None) -> tuple[float, ...]:
+    """The key tenors of the OIS curve a day's swaps are risked on (``risk._curve_tenors``: the OIS set up to the
+    curve's last node): ``curve`` when given (the risk book's), else the curve of ``day`` or the latest earlier one
+    public by ``ctx.as_of``, rolled to the day as the risk book rolls it; empty without one."""
+    if curve is None:
+        d = rk.as_date(day)
+        curve, mark, _ = rk._curve_of_day(ctx.market.ois_curves, d, ctx.as_of, ctx.default_time)
+        if curve is not None and mark is not None and mark < d:
+            curve = rt.rolled(curve, d)
+    return rk._curve_tenors("ois", curve, ctx.risk) if curve is not None else ()
+
+
 def _abs_krd_sum(sens: pd.DataFrame, last_node: float | None = None) -> float:
     """The sum over key tenors of the absolute zero-rate KRD, each tenor's G-sec and OIS (and any other curve's)
     KRDs netted (UNVERIFIED: the basis between the curves is left to the VaR half of the hedge-effect test), so that a
@@ -1475,22 +1576,27 @@ def _ratio(a: float, b: float) -> float:
 
 def _m_ois_hedge_effect(view: MetricInputs, st: str, sc: str, sel, unit: str) -> list[Value]:
     """The swaps' effect on the scope's risk (L06, L19, E30): the larger of the ratio of the sum of absolute KRDs with
-    the swaps to without (each tenor netted across curves, the KRDs beyond the OIS curve's last node netted into it)
-    and of the parametric VaRs with and without. When the VaR cannot be computed (a short or stale factor history),
-    the key-rate ratio alone decides, complete: it needs no history, so a swap that raises the key-rate risk is
-    refused from the first day under a hedging-only preset (UNVERIFIED reading of RBI's definition of hedging)."""
+    the swaps to without (each tenor netted across curves, the KRDs beyond the OIS curve's last key tenor netted into
+    it: ``view.ois_key_tenors``, the curve's own, whatever the swaps' tenors; without a curve, the last OIS key tenor
+    of the settings, which nets less and so refuses more) and of the parametric VaRs with and without. When the VaR
+    cannot be computed (a short or stale factor history), the key-rate ratio alone decides, complete: it needs no
+    history, so a swap that raises the key-rate risk is refused from the first day under a hedging-only preset
+    (UNVERIFIED reading of RBI's definition of hedging)."""
     with_s = _sens_in_scope(view, st, sc)
     swaps = with_s[with_s["isin"].astype(str).str.startswith("OIS:")] if len(with_s) else with_s
     if not len(swaps):
         return [("", 1.0, True, "no swaps in scope")]
     without = _sens_in_scope(view, st, sc, swaps=False)
-    ois = swaps[(swaps["basis"].astype(str) == "zero") & (swaps["curve"].astype(str) == "ois")]
-    tenors = pd.to_numeric(ois["tenor"], errors="coerce").dropna()
-    last = float(tenors.max()) if len(tenors) else None
+    if view.ois_key_tenors:
+        last = float(max(view.ois_key_tenors))
+        node = f"KRDs beyond {last:g} years netted into it: the OIS curve's last key tenor"
+    else:
+        last = float(max(view.risk_settings.ois_key_tenors))
+        node = (f"KRDs beyond {last:g} years netted into it: no OIS curve of the day given, the last OIS key tenor of "
+                "the settings")
     k_with, k_without = _abs_krd_sum(with_s, last), _abs_krd_sum(without, last)
     ratio_k = 1.0 if k_with == k_without else _ratio(k_with, k_without)
-    detail = f"sum of absolute KRDs Rs {k_with:,.2f} with the swaps, Rs {k_without:,.2f} without" + (
-        f" (KRDs beyond {last:g} years netted into it)" if last is not None else "")
+    detail = f"sum of absolute KRDs Rs {k_with:,.2f} with the swaps, Rs {k_without:,.2f} without ({node})"
     wide = _wide_changes(view)
     if wide is None:
         return [("", ratio_k, True, f"{detail}; no factor history: the key-rate test decides")]
@@ -1951,6 +2057,8 @@ def metric_inputs(risk, engine, ctx: rk.RiskContext, *, day=None, board_resoluti
     if hist is None and hasattr(risk, "history"):
         hist = risk.history.frame()
     ratings = rk._ratings_frame(ctx.market.ratings)
+    book = getattr(risk, "book", None)
+    book_curve = book.ois_curve if isinstance(book, rk.RiskBook) and book.date == d else None
     funding_liq = rf["funding_liquidity"]
     engine_positions = ef["positions"]
     if engine_positions is not None and len(engine_positions):
@@ -1970,7 +2078,8 @@ def metric_inputs(risk, engine, ctx: rk.RiskContext, *, day=None, board_resoluti
         risk_weights=read_risk_weights(risk_weights) if risk_weights is not None else read_risk_weights(),
         board_resolution=rk._opt_date(board_resolution_date, "board_resolution_date")
         if board_resolution_date is not None else None,
-        changes=hist, risk_settings=ctx.risk, counterparties=read_counterparties(ctx.counterparties))
+        changes=hist, risk_settings=ctx.risk, counterparties=read_counterparties(ctx.counterparties),
+        ois_key_tenors=ois_key_tenors_of_day(ctx, d, book_curve), entity_ids=entity_ids(ctx))
 
 
 def limit_metrics(risk, engine, ctx: rk.RiskContext, *, limits=None, day=None, board_resolution_date=None,
@@ -2818,6 +2927,8 @@ def _view(state: PortfolioState, items: Sequence[OrderRisk], cache: dict) -> Met
     book = _book_with(state.book, items)
     if "stress" not in cache:
         cache["stress"] = _stress_rows(state, state.book)
+    if "entity_ids" not in cache:
+        cache["entity_ids"] = entity_ids(state.ctx)
     extra = [o for o in items if o.item is not None]
     stress_parts = [cache["stress"]]
     for o in extra:
@@ -2847,7 +2958,9 @@ def _view(state: PortfolioState, items: Sequence[OrderRisk], cache: dict) -> Met
         issue_dates=_issue_dates(state.ctx), notified=_notified(state.ctx, state.day),
         risk_weights=read_risk_weights(), board_resolution=state.board_resolution, changes=state.changes,
         risk_settings=state.ctx.risk, var_method="parametric",
-        counterparties=read_counterparties(state.ctx.counterparties))
+        counterparties=read_counterparties(state.ctx.counterparties),
+        ois_key_tenors=ois_key_tenors_of_day(state.ctx, state.day, state.book.ois_curve),
+        entity_ids=cache["entity_ids"])
 
 
 def _cached_values(view: MetricInputs, cache: dict, metric: str, st: str, sc: str, selector: str, unit: str

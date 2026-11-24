@@ -40,18 +40,23 @@ days is kept scaled by ``1/sqrt(g)`` (``gap_rule``), a longer gap breaks the ser
 **VaR and ES** (R2.2-R2.7). Per scope (fund, each book, each strategy) and method: ``hs_sensitivity`` (historical
 simulation, P&L the sensitivities times each day's factor changes, with half the convexity on request), ``hs_full``
 (each scenario revalued in full on the shifted curves and spreads) and ``parametric`` (normal, the sensitivities on an
-EWMA covariance, lambda 0.94 over at most 550 observations with normalised weights, or the sample covariance). A
-scope's factors with at least ``min_obs_hard`` changes are used and the window is the latest ``window`` dates on which
-all of them have one; the others are left out (``coverage`` below one: ``incomplete``) unless the proxy table maps them
-to a factor with history. Fewer than ``min_obs_hard`` observations: refused, with the count; fewer than ``min_obs``:
-flagged ``short_history``. VaR at ``a`` is the ``ceil(n(1 - a))``-th largest loss (``quantile_rule``) and ES the
-Acerbi-Tasche tail mean with the tail ``m = n(1 - a)`` counted exactly (``Fraction``); both are reported at 99% and
-97.5%. The 10-day figures sum overlapping runs of 10 changes (``horizon_rule``; the parametric method scales by the
-square root of time). With ``windows`` including ``stressed``, the stressed ES (MAR33.6) searches the history for the
-window of ``window`` observations with the largest ES on the reduced set of factors that have the longest history
-(those starting within 30 days of the earliest) and scales it by the current full-to-reduced ratio, floored at one;
-``liquidity_horizons`` adds the MAR33.4 cascade of the 10-day ES over the liquidity horizons of each factor class
-(``LIQUIDITY_HORIZONS``). Euler components split each VaR and ES by position and by factor (``VAR_COMPONENT_COLUMNS``).
+EWMA covariance, lambda 0.94 over at most 550 observations with normalised weights, or the sample covariance). A scope's
+factors with at least ``min_obs_hard`` changes are used and the window is the latest ``window`` dates on which all of
+them have one; the others are left out (``coverage`` below one: ``incomplete``) unless the proxy table maps them to a
+factor with history, and so is a factor whose series stopped more than ``max_gap_days`` business days before the book's
+day (``stale_factor``) or a spread factor with a hole inside the window (``holey_factor``: more than ``max_gap_days`` of
+the latest ``window`` dates of the scope's curve factors missing), either of which would otherwise push the window back
+past the dates it misses; a window that still leaves out more than ``max_gap_days`` business days of a used factor's
+changes (a hole in the curve history itself) is ``incomplete``, flagged ``holey_window``. Fewer than ``min_obs_hard``
+observations: refused, with the count; fewer than ``min_obs``: flagged ``short_history``. VaR at ``a`` is the
+``ceil(n(1 - a))``-th largest loss (``quantile_rule``) and ES the Acerbi-Tasche tail mean with the tail ``m = n(1 - a)``
+counted exactly (``Fraction``); both are reported at 99% and 97.5%. The 10-day figures sum overlapping runs of 10
+changes (``horizon_rule``; the parametric method scales by the square root of time). With ``windows`` including
+``stressed``, the stressed ES (MAR33.6) searches the history for the window of ``window`` observations with the largest
+ES on the reduced set of factors that have the longest history (those starting within 30 days of the earliest) and
+scales it by the current full-to-reduced ratio, floored at one; ``liquidity_horizons`` adds the MAR33.4 cascade of the
+10-day ES over the liquidity horizons of each factor class (``LIQUIDITY_HORIZONS``). Euler components split each VaR and
+ES by position and by factor (``VAR_COMPONENT_COLUMNS``).
 
 **Back-tests** (R2.8). The one-day VaR of business day ``d`` against the P&L of ``d + 1``: actual (the engine's
 ``nav.csv`` ``pnl``) and hypothetical (``hypothetical_pnl``: the market lines of the attribution on positions held from
@@ -2236,14 +2241,78 @@ def _var_factors(item) -> dict[str, float]:
     return out
 
 
+def _business_index(cal: BusinessCalendar, dates: Sequence[date]) -> np.ndarray:
+    """For ascending ``dates``, the business days from the first of them up to each (included): ``b[j] - b[i]`` is
+    the number of business days in ``(dates[i], dates[j]]``, ``_gap_days`` without its floor of one."""
+    if not len(dates):
+        return np.zeros(0, dtype=np.int64)
+    days = np.array([d.toordinal() for d in cal.lenient().business_days(dates[0], dates[-1])], dtype=np.int64)
+    return np.searchsorted(days, np.array([d.toordinal() for d in dates], dtype=np.int64), side="right")
+
+
+def holey_factors(changes: np.ndarray, factors: Sequence[str], upto: np.ndarray, *, window: int, tol: int
+                  ) -> dict[str, int]:
+    """The spread factors among ``factors`` (``SPREAD_CLASSES``: tables the user keeps beside the fitted curves)
+    with a hole in the current window: each column of ``changes`` (dates x ``factors``, NaN where a factor has no
+    change; only the rows ``upto`` the book's day count) is checked against the anchor dates, the latest ``window``
+    dates on which any rate factor among ``factors`` (a curve's key rate) has a change, and a spread factor missing
+    more than ``tol`` of them from its first change on is returned with the count (UNVERIFIED rule: ``tol`` is the
+    VaR's ``max_gap_days``). Rate factors are never returned (a hole in the curve history leaves every factor short
+    of those dates, which the window check flags); without a rate factor nothing is."""
+    rate = [j for j, f in enumerate(factors) if _factor_class(f) not in SPREAD_CLASSES]
+    spread = [j for j, f in enumerate(factors) if _factor_class(f) in SPREAD_CLASSES]
+    if not rate or not spread:
+        return {}
+    finite = np.isfinite(changes) & np.asarray(upto, dtype=bool)[:, None]
+    anchor = np.flatnonzero(finite[:, rate].any(axis=1))[-window:]
+    out = {}
+    for j in spread:
+        seen = np.flatnonzero(finite[:, j])
+        if not seen.size:
+            continue
+        mine = anchor[anchor >= seen[0]]
+        missing = int((~finite[mine, j]).sum())
+        if missing > tol:
+            out[factors[j]] = missing
+    return out
+
+
+def window_gap(changes: np.ndarray, rows: np.ndarray, upto: np.ndarray, bdi: np.ndarray, *, tol: int) -> int:
+    """The most business days of one factor's changes that a window leaves out: for each column of ``changes``
+    (the used factors, every one with a change on each of ``rows``, the window's dates), the business days between
+    consecutive window dates less those its change on the later date covers (back to its previous change, at most
+    ``tol`` business days, the gap rule's scaled change; one day when its series broke there), summed (``bdi``:
+    ``_business_index`` of the history's dates). A day a factor moved on that is missing from the window (because
+    another factor has no change then, or no factor has: a hole in every series) counts; a coarse history whose
+    every change spans its gap counts nothing."""
+    if len(rows) < 2:
+        return 0
+    ok = np.asarray(upto, dtype=bool)
+    step = np.maximum(bdi[rows[1:]] - bdi[rows[:-1]], 1)
+    worst = 0
+    for j in range(changes.shape[1]):
+        seen = np.flatnonzero(ok & np.isfinite(changes[:, j]))
+        prev = seen[np.searchsorted(seen, rows[1:]) - 1]
+        back = np.maximum(bdi[rows[1:]] - bdi[prev], 1)
+        worst = max(worst, int((step - np.where(back <= tol, back, 1)).sum()))
+    return worst
+
+
 def _plan(book: RiskBook, history: FactorHistory, scope_type: str, scope: str, proxies=None,
-          *, min_obs_hard: int, end: date | None = None, stale_days: int | None = None) -> _Plan:
+          *, min_obs_hard: int, end: date | None = None, stale_days: int | None = None,
+          window: int | None = None) -> _Plan:
     """The scope's VaR inputs. A factor is used when it has at least ``min_obs_hard`` changes up to the book's day
     (``end``) and, with ``stale_days`` (the VaR's ``max_gap_days``), its last change is at most that many business
     days before the day: a series that stopped (or a long hole at its end) would otherwise drag the window of every
-    factor back to when it last had changes. A factor that fails either test is left out (coverage below one,
-    flagged ``short_factor:`` or ``stale_factor:``) unless the proxy table maps it to one that passes (``proxied``);
-    a window ending more than ``stale_days`` business days before the day is flagged ``stale_window:<end>``."""
+    factor back to when it last had changes. With ``window`` as well, a spread factor with a hole inside the window
+    (``holey_factors``: more than ``stale_days`` of the latest ``window`` rate-factor dates missing) is left out for
+    the same reason: the window is the dates on which every used factor has a change, and a hole would push its start
+    back past the dates it misses. A factor that fails a test is left out (coverage below one, flagged
+    ``short_factor:``, ``stale_factor:`` or ``holey_factor:``) unless the proxy table maps it to one that passes
+    (``proxied``); a window ending more than ``stale_days`` business days before the day is flagged
+    ``stale_window:<end>``, and one that leaves out more than ``stale_days`` business days of a used factor's changes
+    (``window_gap``: a hole in every series, or holes of several factors on different days) ``holey_window:<days>``.
+    """
     items = tuple(i for i in book.items if book.in_scope(i, scope_type, scope))
     proxy = {}
     if proxies is not None:
@@ -2259,9 +2328,19 @@ def _plan(book: RiskBook, history: FactorHistory, scope_type: str, scope: str, p
             seen = np.flatnonzero(upto & np.isfinite(history.changes[:, j]))
             if seen.size and _gap_days(cal, history.dates[seen[-1]], last) > stale_days:
                 stale.add(f)
+    holey: dict[str, int] = {}
+    if stale_days is not None and window is not None:
+        def current(f: str) -> bool:
+            return counts.get(f, 0) >= min_obs_hard and f not in stale
+
+        wanted = {f for item in items for f in _var_factors(item)}
+        candidates = sorted({f for f in wanted if current(f)}
+                            | {proxy[f][0] for f in wanted if f in proxy and current(proxy[f][0])})
+        cols_c = [history.index(f) for f in candidates]
+        holey = holey_factors(history.changes[:, cols_c], candidates, upto, window=window, tol=stale_days)
 
     def usable(f: str) -> bool:
-        return counts.get(f, 0) >= min_obs_hard and f not in stale
+        return counts.get(f, 0) >= min_obs_hard and f not in stale and f not in holey
 
     flags: list[str] = []
     uncovered: dict[str, float] = {}
@@ -2280,6 +2359,8 @@ def _plan(book: RiskBook, history: FactorHistory, scope_type: str, scope: str, p
                 uncovered[_factor_class(factor)] = uncovered.get(_factor_class(factor), 0.0) + abs(value)
                 if target in stale and counts.get(target, 0):
                     flags.append(f"stale_factor:{target}")
+                elif target in holey:
+                    flags.append(f"holey_factor:{target}")
                 elif counts.get(target, 0):
                     flags.append(f"short_factor:{target}")
                 continue
@@ -2301,6 +2382,11 @@ def _plan(book: RiskBook, history: FactorHistory, scope_type: str, scope: str, p
         rows = np.flatnonzero(upto)
     if stale_days is not None and len(rows) and _gap_days(cal, history.dates[rows[-1]], last) > stale_days:
         flags.append(f"stale_window:{history.dates[rows[-1]].isoformat()}")
+    if stale_days is not None and window is not None and len(cols) and len(rows) > 1:
+        gap = window_gap(history.changes[:, cols], rows[-window:], upto, _business_index(cal, history.dates),
+                         tol=stale_days)
+        if gap > stale_days:
+            flags.append(f"holey_window:{gap}")
     return _Plan(items=items, factors=factors, cols=cols, S=S, rows=rows, total_abs=total, covered_abs=covered,
                  uncovered=uncovered, flags=tuple(dict.fromkeys(flags)), item_factor_map=tuple(maps))
 
@@ -2545,8 +2631,8 @@ class VarResult:
 def _status(n_obs: int, coverage: float, settings: RiskSettings, flags: list[str]) -> str:
     if n_obs < settings.min_obs:
         flags.append(f"short_history:{n_obs}<{settings.min_obs}")
-    if coverage < 1 - 1e-12 or any(f.startswith("stale_window:") for f in flags):
-        return "incomplete"  # a factor left out, or a window that ends well before the book's day
+    if coverage < 1 - 1e-12 or any(f.startswith(("stale_window:", "holey_window:")) for f in flags):
+        return "incomplete"  # a factor left out, a window that ends well before the book's day or has a hole
     return "short_history" if n_obs < settings.min_obs else "ok"
 
 
@@ -2582,7 +2668,8 @@ def historical_var(book: RiskBook, history: FactorHistory, settings: RiskSetting
     the count) below ``min_obs_hard`` observations; flagged ``short_history`` below ``min_obs``; ``incomplete`` when a
     factor of the scope has no history (coverage below one)."""
     st = settings if settings is not None else book.settings
-    plan = _plan(book, history, *scope, proxies, min_obs_hard=st.min_obs_hard, stale_days=st.max_gap_days)
+    plan = _plan(book, history, *scope, proxies, min_obs_hard=st.min_obs_hard, stale_days=st.max_gap_days,
+                 window=st.window)
     use = _window_rows(plan, st) if rows is None else rows
     n_days = len(use)
     flags = _plan_flags(plan, history)
@@ -2635,7 +2722,8 @@ def parametric_var(book: RiskBook, history: FactorHistory, settings: RiskSetting
     factor sensitivities and ``Sigma`` the EWMA (or sample) covariance as of ``as_of``; ``VaR = z_a sigma_p sqrt(h)``,
     ``ES = sigma_p sqrt(h) phi(z_a) / (1 - a)`` (the square root of time for any horizon)."""
     st = settings if settings is not None else book.settings
-    plan = _plan(book, history, *scope, proxies, min_obs_hard=st.min_obs_hard, stale_days=st.max_gap_days)
+    plan = _plan(book, history, *scope, proxies, min_obs_hard=st.min_obs_hard, stale_days=st.max_gap_days,
+                 window=st.window)
     cov, rows, n = _covariance(plan, history, st)
     flags = _plan_flags(plan, history)
     if n < st.min_obs_hard:
@@ -2695,7 +2783,8 @@ def stressed_window(book: RiskBook, history: FactorHistory, settings: RiskSettin
     step of ``stressed_step`` observations, ties to the earliest start; by the sensitivity method (U: the search is
     fast; the stressed ES itself is then computed by each method asked)."""
     st = settings if settings is not None else book.settings
-    plan = _plan(book, history, *scope, proxies, min_obs_hard=st.min_obs_hard, stale_days=st.max_gap_days)
+    plan = _plan(book, history, *scope, proxies, min_obs_hard=st.min_obs_hard, stale_days=st.max_gap_days,
+                 window=st.window)
     reduced = _restricted(plan, history, _reduced_factors(plan, history), book.date)
     rows = reduced.rows
     if len(rows) < st.window:
@@ -2732,7 +2821,8 @@ def stressed_es(book: RiskBook, history: FactorHistory, settings: RiskSettings |
     stressed window (``stressed_window``), C the current one; ``var`` is the stressed window's VaR on the reduced set,
     unscaled (flagged)."""
     st = settings if settings is not None else book.settings
-    plan = _plan(book, history, *scope, proxies, min_obs_hard=st.min_obs_hard, stale_days=st.max_gap_days)
+    plan = _plan(book, history, *scope, proxies, min_obs_hard=st.min_obs_hard, stale_days=st.max_gap_days,
+                 window=st.window)
     reduced_names = _reduced_factors(plan, history)
     reduced = _restricted(plan, history, reduced_names, book.date)
     start, end, _ = stressed_window(book, history, st, horizon_days=horizon_days, scope=scope, proxies=proxies)
@@ -2779,7 +2869,8 @@ def liquidity_horizon_es(book: RiskBook, history: FactorHistory, settings: RiskS
     at least ``LH_j`` moved (``LIQUIDITY_HORIZONS``: rates 10, FRB margins 20, IG corporate spreads 40, high yield 60;
     the INR mapping UNVERIFIED)."""
     st = settings if settings is not None else book.settings
-    plan = _plan(book, history, *scope, proxies, min_obs_hard=st.min_obs_hard, stale_days=st.max_gap_days)
+    plan = _plan(book, history, *scope, proxies, min_obs_hard=st.min_obs_hard, stale_days=st.max_gap_days,
+                 window=st.window)
     rows = _window_rows(plan, st)
     if len(rows) < st.min_obs_hard:
         raise ValueError(f"{scope[0]} {scope[1]}: {len(rows)} observation(s), below min_obs_hard: refused")
@@ -2915,7 +3006,7 @@ def var_components(book: RiskBook, history: FactorHistory, settings: RiskSetting
         base = {"date": book.date, "as_of": _iso(book.as_of), "scope_type": r.scope_type, "scope": r.scope,
                 "method": r.method, "horizon_days": r.horizon_days}
         plan = _plan(book, history, r.scope_type, r.scope, proxies, min_obs_hard=st.min_obs_hard,
-                     stale_days=st.max_gap_days)
+                     stale_days=st.max_gap_days, window=st.window)
         parts: dict[str, dict[str, tuple[float, float]]] = {}
         if r.method == "parametric":
             cov, _, _ = _covariance(plan, history, st)
@@ -3111,10 +3202,13 @@ DESK_RULE = {0.99: 12, 0.975: 30}  # MAR32.19 (verified): more exceptions in 12 
 
 
 def _pairs(hist: pd.DataFrame, actual: Mapping, hypo: Mapping | None, members, cal: BusinessCalendar,
-           last: date | None) -> list[dict]:
+           last: date | None, first_row: Mapping[str, date] | None = None) -> list[dict]:
     """One row per VaR of ``hist``: the VaR of ``d`` against the P&L of the next business day, actual and (with
     ``hypo``) hypothetical, each series' exception counted on its own: a missing VaR, or a missing P&L of that series,
-    is an exception of it."""
+    is an exception of it. With ``first_row`` (each book's first date in the NAV table) a scope's P&L counts only the
+    books that have started by the P&L's day: the engine creates a book on its first flow or trade, so a strategy
+    that gains a book later has, before then, only its other books' P&L (a book's missing row after its first one is
+    still missing)."""
     rows = []
     for rec in hist.to_dict("records"):
         d = _date(rec["date"], "the VaR history's date")
@@ -3123,6 +3217,8 @@ def _pairs(hist: pd.DataFrame, actual: Mapping, hypo: Mapping | None, members, c
             continue
         scope_type, scope = _text(rec["scope_type"]), _text(rec["scope"])
         books = members(scope_type, scope, d)
+        if first_row is not None:
+            books = [b for b in books if b in first_row and first_row[b] <= nxt]
         var = _num(rec["var"], "var", blank=math.nan)
         pa = _scope_pnl(actual, nxt, books)
         ph = _scope_pnl(hypo, nxt, books) if hypo is not None else math.nan
@@ -3203,14 +3299,25 @@ def backtest(var_history, nav, attribution=None, *, alpha: float = VAR_ALPHA, wi
         return out
 
     last = as_date(end) if end is not None else None
-    detail = pd.DataFrame(_pairs(hist, actual, hypo, members, cal, last), columns=list(BACKTEST_COLUMNS))
+    first_row: dict[str, date] = {}
+    for day, b in actual:
+        if b not in first_row or day < first_row[b]:
+            first_row[b] = day
     known = set(actual) | set(hypo or {})
     latest = max(d for d, _ in known) if known else None
-    if len(detail):
-        if latest is not None and last is None:
-            detail = detail[detail["pnl_date"] <= latest]
-        detail = detail.sort_values(["scope_type", "scope", "method", "var_date"], kind="mergesort")
-        detail = detail.reset_index(drop=True)
+
+    def paired(table: pd.DataFrame, series: Mapping | None) -> pd.DataFrame:
+        """The pairs of a VaR table against ``series``, cut at the latest P&L when no ``end`` is given (the last VaR
+        day's next-day P&L does not exist yet), in scope, method and date order."""
+        out = pd.DataFrame(_pairs(table, actual, series, members, cal, last, first_row),
+                           columns=list(BACKTEST_COLUMNS))
+        if len(out):
+            if latest is not None and last is None:
+                out = out[out["pnl_date"] <= latest]
+            out = out.sort_values(["scope_type", "scope", "method", "var_date"], kind="mergesort")
+        return out.reset_index(drop=True)
+
+    detail = paired(hist, hypo)
     other = None  # the hypothetical count with the time effects the other way, for the notes
     if attribution is not None and len(detail):
         flip = "include" if time_effects == "exclude" else "exclude"
@@ -3219,13 +3326,11 @@ def backtest(var_history, nav, attribution=None, *, alpha: float = VAR_ALPHA, wi
         for key in actual:
             if key not in hypo2 and key[0] in covered:
                 hypo2[key] = 0.0
-        other = pd.DataFrame(_pairs(hist, actual, hypo2, members, cal, last), columns=list(BACKTEST_COLUMNS))
+        other = paired(hist, hypo2)
     desk = None
     if abs(alpha - 0.99) < 1e-12:
         lower = one_day[[abs(_num(a, "alpha_var") - 0.975) < 1e-12 for a in one_day["alpha_var"]]]
-        desk = pd.DataFrame(_pairs(lower, actual, hypo, members, cal, last), columns=list(BACKTEST_COLUMNS))
-        if len(desk) and latest is not None and last is None:
-            desk = desk[desk["pnl_date"] <= latest]
+        desk = paired(lower, hypo)
     summary = []
     p = 1 - alpha
     for (scope_type, scope, method_), group in detail.groupby(["scope_type", "scope", "method"], sort=True):
@@ -3296,7 +3401,10 @@ UNVERIFIED_RULES = (
     "takes the nearest in-range change; 60 observations the least for a VaR",
     "the window: the latest dates on which every factor of the scope with at least min_obs_hard observations has "
     "a change; a factor with fewer, or whose last change is more than max_gap_days business days before the book's "
-    "day, is left out (coverage below one) unless proxied, and a window ending earlier than that is incomplete",
+    "day, is left out (coverage below one) unless proxied, and a window ending earlier than that is incomplete; a "
+    "spread factor missing more than max_gap_days of the latest window dates of the scope's curve factors is left out "
+    "the same way (holey_factor), and a window leaving out more than max_gap_days business days of a used factor's "
+    "changes is incomplete (holey_window)",
     "EWMA lambda 0.94 over up to 550 observations, the weights normalised; the sample covariance with ddof 1",
     "the stressed window searched by the sensitivity method on the factors whose history starts within 30 days of "
     "the earliest",

@@ -151,8 +151,18 @@ The window is the latest 250 dates (`--window`) on which every factor of the sco
 unless the proxy table maps it to a factor with history (`proxied`). A factor whose last change is more than
 `max_gap_days` business days before the book's day (a series that stopped, or a hole at its end) is left out the same
 way (`stale_factor:<factor>`, proxied if the table maps it) rather than dragging the window back in time; a window
-that still ends before the book's day is flagged `stale_window` and `incomplete`. With fewer than 60 observations the figure is
-refused, with the count; below 250 (`--min-obs`) it is flagged `short_history`. VaR at level `a` is the
+that still ends before the book's day is flagged `stale_window` and `incomplete`. A hole inside the window is treated
+the same way (UNVERIFIED rule, its tolerance the same `max_gap_days`): the anchor is the latest 250 dates on which any
+of the scope's curve factors (G-sec, SDL, corporate curve or OIS key rates) has a change, and a spread factor (`corp:`,
+`cd:`, `sdl_spread:`, `frb_dm:`, `tbill182`, `resid:`) that misses more than 5 of them from its first change on is
+left out (`holey_factor:<factor>`, proxied if the table maps it), so that a spread table with a gap of a few months
+no longer pushes every factor's window back past it (a factor missing up to 5 dates is kept, and the window then
+reaches back those few dates). A curve factor is never left out this way: a hole in the curve history itself leaves
+the window short of those dates for every factor, and any window whose 250 dates leave out more than `max_gap_days`
+business days of a used factor's changes (a change over a gap of up to `max_gap_days` days counts as covering it, so
+a coarse weekly history is not caught) is flagged `holey_window:<days>` and `incomplete`. The gate's parametric VaR
+(`limits.parametric_from_frames`) leaves out the same factors and refuses such a window. With fewer than 60
+observations the figure is refused, with the count; below 250 (`--min-obs`) it is flagged `short_history`. VaR at level `a` is the
 `ceil(n(1 - a))`-th largest loss (`--quantile-rule`; `floor_plus_one` and `interpolate` also offered) and ES the mean
 of the worst `m = n(1 - a)` losses, a fractional last one counted in part (the tail size held as an exact fraction).
 The 10-day figures sum overlapping runs of 10 daily changes (`--horizon-rule sqrt_time` scales the one-day figure
@@ -297,7 +307,10 @@ tables). One row per limit: `limit_id` (unique across the tables used together),
 (`key=value` pairs joined by `;`, alternatives by `|`, `*` to check each value separately, as in
 `sector=*;kind=corporate|cp`; selector values are checked against the risk tables' own (key tenors such as `10y`,
 the curves, rating buckets, kinds, tenor buckets; sectors read in lower case and ISINs in upper case), so a value that
-would match nothing is refused naming the line, never read as 0; besides each metric's own keys, `abs=yes` compares absolute values and `min_assets_cr`
+would match nothing is refused naming the line, never read as 0; an `issuer` or `group` value (the fund's own ids,
+which only the day's data can check) compares without case and must name an id of the book, the issuer table or the
+corporate terms (or GoI, or a `STATE:` id), else the metric reads `incomplete` with `selector matched nothing` rather
+than 0; besides each metric's own keys, `abs=yes` compares absolute values and `min_assets_cr`
 and `max_assets_cr` make a row apply only from, or below, a size of total assets in crore), `unit`, `direction` (`max`
 or `min`), `warning_level` and `hard_level` (a blank warning is the hard level), `legal_form` (`any` or a preset),
 `effective_from`, `effective_to`, `approved_by`, `approval_date`, `approval_ref`, `cure_business_days`, `action`
@@ -374,7 +387,7 @@ under either preset; these rules change with it:
 |---|---|---|
 | Borrowing (repo, TREPS) | none: L01 and the gate's cash rule (V) | allowed; below Rs 1,000 crore of assets, outside liabilities at most 7 times owned fund (L10, V) |
 | Short sales | none (L04, V) | none for a non-PD NBFC (L18, V) |
-| OIS | hedging only: the engine's DV01 test (L05, V) and the swaps must not raise the risk (L06, APPROVED and enforced, the reading U: the larger of the VaR ratio and the ratio of absolute key rates with the swaps' key rates beyond the OIS curve's last node netted into it; with too little history for a VaR the key-rate ratio alone binds). A resident with a net worth of at least Rs 500 crore (or turnover of Rs 1,000 crore) is a non-retail user that may use OIS for any purpose (Rupee IRD Directions para 5.2(ii)): not applied, a question for counsel | any purpose; OIS views of a base-layer NBFC (L19, DRAFT, P: warns) |
+| OIS | hedging only: the engine's DV01 test (L05, V) and the swaps must not raise the risk (L06, APPROVED and enforced, the reading U: the larger of the VaR ratio and the ratio of the sums of absolute key-rate DV01s with and without the swaps, each tenor's G-sec and OIS KRDs netted and every KRD beyond the OIS curve's own last key tenor netted into it (5 years for a curve quoted to 5 years, whatever the swaps' tenors; without the day's curve, the last OIS key tenor of the settings, 10 years); with too little history for a VaR the key-rate ratio alone binds). A resident with a net worth of at least Rs 500 crore (or turnover of Rs 1,000 crore) is a non-retail user that may use OIS for any purpose (Rupee IRD Directions para 5.2(ii)): not applied, a question for counsel | any purpose; OIS views of a base-layer NBFC (L19, DRAFT, P: warns) |
 | Size | assets below Rs 1,000 crore for the exemption (L02, V) | net owned fund at least Rs 10 crore (L09, V); from Rs 1,000 crore of assets CRAR 15% (OIS counted by the current exposure method), Tier 1 10%, single party 25% and single group 40% (L11-L14, V). The Concentration Directions (para 16) exempt an NBFC not accessing public funds and not issuing guarantees from the exposure norms: L13-L14 are applied anyway (conservative), a question for counsel |
 | ALM | not applicable (nothing borrowed) | from Rs 100 crore of assets, negative mismatches at most 10%, 10% and 20% in 1-7, 8-14 and 15-30 days (L15-L17, V) |
 | Settlement payables | leverage at most 1 and purchases covered by cash (L07-L08, DRAFT: warn) | counted as outside liabilities (U) |
