@@ -2082,7 +2082,7 @@ def _limits(args: argparse.Namespace) -> int:
             return 1
         access = return_engine.access_policy(args.access)
         as_of = _layer_as_of(args, day, access)
-        table = limits_layer.limit_table(_layer_table(args.limits), limits_layer.legal_form_limits(access))
+        table = limits_layer.monitoring_limits(_layer_table(args.limits))
         market = _layer_market(args, calendar)
         ctx = risk_layer.RiskContext(
             market=market, settings=return_engine.EngineSettings(access=access, project_calendar=args.project_calendar),

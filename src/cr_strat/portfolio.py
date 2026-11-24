@@ -21,8 +21,9 @@ w)_i = b_i w' Sigma w`` (Maillard, Roncalli and Teiletche, J. Portfolio Manageme
 coordinate descent ``y_i <- (-a_i + sqrt(a_i^2 + 4 Sigma_ii b_i)) / (2 Sigma_ii)``, ``a_i = sum_{j != i} Sigma_ij
 y_j`` (Griveau-Billion, Richard and Roncalli, 2013), with Newton's method on ``F(y) = 0.5 y' Sigma y - sum b_i ln y_i``
 (Spinu, 2013) as the check, both to ``w = y / sum y``; ``erc_es``, budgeted shares of the historical ES (Euler
-contributions with the Acerbi-Tasche tail weights) by the damped fixed point ``w_i <- w_i (b_i / s_i)^{1/2}`` (not
-proven to converge: refused after ``max_iter`` with the last error, UNVERIFIED); ``budget``: no weights, each
+contributions with the Acerbi-Tasche tail weights) by the damped fixed point ``w_i <- w_i (b_i / s_i)^p``, ``p``
+starting at 1/2 and halved (down to 1/1024) whenever the error rises (not proven to converge, and exact parity need not
+exist for a historical ES: refused after ``max_iter`` with the last error, UNVERIFIED); ``budget``: no weights, each
 strategy's scale ``min(1, budget / |metric|)`` from ``BUDGET_COLUMNS`` (DV01, CS01, VaR or ES, the sizing a strategy
 reads, P6.5). Bounds (``BOUNDS_COLUMNS``) other than 0 and 1 are applied by clipping and re-solving on the strategies
 left free (UNVERIFIED).
@@ -65,6 +66,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from cr_strat import returns as rt
 from cr_strat import risk as rk
 from cr_strat.ois import MIBOR_OIS, OisConventions, as_time, ois_schedule
 
@@ -114,7 +116,8 @@ UNVERIFIED_RULES = (
     "covariance pairwise on the days both strategies had capital; shrunk to the diagonal in steps of 0.05 until "
     "positive definite; 20 joint observations at the least",
     "ERC by cyclical coordinate descent, checked by Newton's method; bounds by clipping and re-solving",
-    "ES parity by the damped fixed point w <- w (b/s)^0.5, refused after 500 iterations",
+    "ES parity by the damped fixed point w <- w (b/s)^p, p = 0.5 halved (to 1/1024 at least) whenever the error "
+    "rises, refused after 500 iterations",
     "budget scales min(1, budget/|metric|), no scaling up unless asked",
     "rebalancing on the first business day of a month or a band of 5 percentage points or 20%, never while a hard "
     "breach in scope is open",
@@ -560,10 +563,9 @@ def feasible_strategies(access, strategies: Sequence[str]) -> dict[str, tuple[bo
     DV01 budgets scale with equity); leverage at most 1. Under ``nbfc_non_pd`` every strategy, leverage within the
     base layer's 7 times outside liabilities to owned fund, CRAR 15% (corporate bonds at 100%) from Rs 1,000 crore of
     assets. A name that is not S1-S10 is allowed with a note that no legal-form rule is known for it."""
-    name = getattr(access, "name", str(access))
-    ois = getattr(access, "ois", "any")
-    borrows = bool(getattr(access, "repo", False) or getattr(access, "treps", False))
-    shorts = bool(getattr(access, "short_sale", False))
+    access = access if isinstance(access, rt.AccessPolicy) else rt.access_policy(str(access))  # a name too
+    name, ois = access.name, access.ois
+    borrows, shorts = bool(access.repo or access.treps), bool(access.short_sale)
     out = {}
     for strategy in strategies:
         code = strategy_code(strategy)
@@ -571,9 +573,8 @@ def feasible_strategies(access, strategies: Sequence[str]) -> dict[str, tuple[bo
             out[strategy] = (True, f"not one of S1-S10: no legal-form rule known for it under {name} (check it)")
             continue
         if code == "S7" and ois != "any":
-            out[strategy] = (False, f"{code} trades OIS views; {name} allows OIS for "
-                                    f"{'hedging only (Rupee IRD Directions 2025 para 5.4(i))' if ois == 'hedge_only' else 'nothing'}"
-                                    ": weight 0")
+            allowed = "hedging only (Rupee IRD Directions 2025 para 5.4(i))" if ois == "hedge_only" else "nothing"
+            out[strategy] = (False, f"{code} trades OIS views; {name} allows OIS for {allowed}: weight 0")
             continue
         notes = []
         if code in ("S3", "S5") and not shorts:

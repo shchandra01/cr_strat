@@ -63,8 +63,8 @@ from __future__ import annotations
 import difflib
 import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from dataclasses import dataclass, field, replace
+from datetime import date, datetime
 from pathlib import Path
 from statistics import NormalDist
 from typing import Any
@@ -72,11 +72,15 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from cr_strat import costs as cost_rules
 from cr_strat import returns as rt
 from cr_strat import risk as rk
+from cr_strat import stress as st
+from cr_strat.bonds import DiscountInstrument
 from cr_strat.calendars import mumbai_settlement_calendar
+from cr_strat.floating import GoiFloatingRateBond, index_dv01
 from cr_strat.issuance import TENOR_BUCKETS
-from cr_strat.ois import as_time
+from cr_strat.ois import MIBOR_OIS, OisSwap, as_time, effective_date, ois_npv, ois_par_rate
 from cr_strat.rating_scale import LT_NOTCH, parse_rating
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
@@ -489,6 +493,13 @@ def limit_table(*sources) -> pd.DataFrame:
 def example_limits() -> pd.DataFrame:
     """The shipped example table (E01-E30, every row EXAMPLE)."""
     return read_limits(EXAMPLE_LIMITS_CSV)
+
+
+def monitoring_limits(user=None) -> pd.DataFrame:
+    """The table the limit monitoring reads: the fund's table (``None``: none) joined with the whole legal-form table,
+    every preset's rows, so that the checks list the other legal form's rules as ``not_applicable`` ("applies under
+    ...": which rules depend on the form). The gate adds only its own preset's rows (``legal_form_limits``)."""
+    return limit_table(user, read_limits(LEGAL_FORM_LIMITS_CSV, origin="legal_form"))
 
 
 def legal_form_limits(access) -> pd.DataFrame:
@@ -1494,12 +1505,12 @@ def metrics_frame(view: MetricInputs, limits) -> pd.DataFrame:
                      for r in table.to_dict("records")})
     rows, seen = [], set()
     for metric, scope_type, scope, selector, unit in wanted:
-        for st, sc in _scopes_for(view, scope_type, scope):
-            if (metric, st, sc, selector, unit) in seen:
+        for stype, sc in _scopes_for(view, scope_type, scope):
+            if (metric, stype, sc, selector, unit) in seen:
                 continue
-            seen.add((metric, st, sc, selector, unit))
-            for key, value, complete, detail in metric_values(view, metric, st, sc, selector, unit):
-                rows.append({"date": view.day, "as_of": rk._iso(view.as_of), "metric": metric, "scope_type": st,
+            seen.add((metric, stype, sc, selector, unit))
+            for key, value, complete, detail in metric_values(view, metric, stype, sc, selector, unit):
+                rows.append({"date": view.day, "as_of": rk._iso(view.as_of), "metric": metric, "scope_type": stype,
                              "scope": sc, "selector": selector, "key": key, "value": value, "unit": unit,
                              "inputs_complete": bool(complete), "detail": detail})
     frame = pd.DataFrame(rows, columns=list(METRIC_COLUMNS))
@@ -1590,7 +1601,6 @@ def _notified(ctx: rk.RiskContext | None, day: date) -> dict[str, float]:
 def _scenario_map(stress_frame: pd.DataFrame | None, rows=None) -> dict[str, tuple[str, bool]]:
     out: dict[str, tuple[str, bool]] = {}
     if rows is not None:
-        from cr_strat import stress as st
         for sid, srows in st.scenarios_by_id(rows).items():
             out[sid] = (srows[0].family, all(r.component in st.FUNDING_COMPONENTS for r in srows))
         return out
@@ -1662,8 +1672,10 @@ def limit_metrics(risk, engine, ctx: rk.RiskContext, *, limits=None, day=None, b
                   risk_weights=None) -> pd.DataFrame:
     """``METRIC_COLUMNS`` for every metric, scope and selector the ``limits`` ask for (default: the example table and
     the legal-form rows of ``ctx``'s preset), from the risk run and the engine's frames of the day (``metric_inputs``),
-    as of ``ctx.as_of``."""
+    as of ``ctx.as_of``: only the rows in force then for the preset are computed (another preset's rows and rows not
+    yet effective are listed by ``check_limits``, never measured)."""
     table = limits if limits is not None else limit_table(example_limits(), legal_form_limits(ctx.settings.access))
+    table = limits_in_force(table, as_of=ctx.as_of, legal_form=ctx.settings.access.name)
     view = metric_inputs(risk, engine, ctx, day=day, board_resolution_date=board_resolution_date,
                          risk_weights=risk_weights)
     return metrics_frame(view, table)
@@ -1722,7 +1734,8 @@ def check_limits(metrics: pd.DataFrame, limits, *, as_of, legal_form, scales: Ma
                                                      "unit", "direction", "warning_level", "hard_level",
                                                      "policy_status", "legal_form", "counsel")},
                      "key": "", "value": math.nan, "utilisation": math.nan, "status": "not_applicable",
-                     "detail": f"applies under {rec['legal_form']}, not {name}"})
+                     "detail": ("EXAMPLE; " if rec["policy_status"] == "EXAMPLE" else "")
+                     + f"applies under {rec['legal_form']}, not {name}"})
     m = metrics
     for rec in live.to_dict("records"):
         hit = m[(m["metric"] == rec["metric"]) & (m["selector"] == rec["selector"]) & (m["unit"] == rec["unit"])
@@ -1736,7 +1749,9 @@ def check_limits(metrics: pd.DataFrame, limits, *, as_of, legal_form, scales: Ma
                 continue  # no scope of that type exists today
             rows.append({**head, "scope": rec["scope"], "key": "", "value": math.nan,
                          "warning_level": rec["warning_level"], "hard_level": rec["hard_level"],
-                         "utilisation": math.nan, "status": "incomplete", "detail": "no metric computed for it"})
+                         "utilisation": math.nan, "status": "incomplete",
+                         "detail": ("EXAMPLE; " if rec["policy_status"] == "EXAMPLE" else "")
+                         + "no metric computed for it"})
             continue
         for mrec in hit.to_dict("records"):
             hard = _scaled(rec["hard_level"], rec, mrec["scope_type"], mrec["scope"], scales)
@@ -1918,6 +1933,7 @@ def write_limits(metrics: pd.DataFrame, checks: pd.DataFrame, breaches: pd.DataF
 
 ORDER_COLUMNS = ("order_id", "book", "isin", "side", "face", "months", "venue", "limit", "purpose", "special_repo_pct",
                  "auction_date")
+WARNING_ONLY = "warning only: "  # the prefix of a refused order's rows that warn without refusing it
 CASH_BUFFER_PCT = 1.0  # UNVERIFIED: a purchase must leave this share of its consideration in cash (fill and costs)
 _DEFAULT_SCENARIOS = None
 
@@ -2020,7 +2036,6 @@ def _marks_frame(ctx: rk.RiskContext, day: date) -> pd.DataFrame:
 
 
 def _scenario_rows(ctx: rk.RiskContext, scenarios):
-    from cr_strat import stress as st
     if scenarios is None:
         return st.read_scenarios(as_of=ctx.as_of)
     if isinstance(scenarios, (list, tuple)) and all(isinstance(r, st.ScenarioRow) for r in scenarios):
@@ -2033,8 +2048,6 @@ def _scenario_rows(ctx: rk.RiskContext, scenarios):
 def with_cost_table(ctx: rk.RiskContext) -> rk.RiskContext:
     """``ctx`` with its engine settings' cost table parsed once (``costs.CostTable``: the same rows), so that the
     stress and liquidity code does not read and check the cost file for every position and scenario."""
-    from dataclasses import replace
-    from cr_strat import costs as cost_rules
     c = ctx.settings.costs
     if isinstance(c, cost_rules.CostTable):
         return ctx
@@ -2057,7 +2070,6 @@ def state_from_snapshot(snapshot: rt.Snapshot, ctx: rk.RiskContext, *, scenarios
     instruments as known, the NAV by book), as of the snapshot's ``as_of``: each book's net cash taken as its NAV less
     its positions' values (receivables counted as cash, UNVERIFIED), the engine's queue (``Snapshot.open_orders``)
     counted as filled, the factor history and marks public then. Reads the snapshot only through its accessors."""
-    from dataclasses import replace
     c = with_cost_table(replace(ctx, as_of=snapshot.as_of))
     book = rk.book_from_snapshot(snapshot, c)
     positions = snapshot.positions
@@ -2066,6 +2078,9 @@ def state_from_snapshot(snapshot: rt.Snapshot, ctx: rk.RiskContext, *, scenarios
         mine = positions[positions["book"] == name] if len(positions) else positions
         value = _fsum(pd.to_numeric(mine["value"], errors="coerce").fillna(0.0)) if len(mine) else 0.0
         balance[name] = {"net_cash": float(nav) - value, "borrowed": 0.0}
+    cash = pd.DataFrame([{"date": snapshot.day, "book": name, "nav": float(nav), "cash": balance[name]["net_cash"]}
+                         for name, nav in sorted(snapshot.nav.items())], columns=["date", "book", "nav", "cash"])
+    c = replace(c, nav=cash)  # the day's cash by book, which the ALM and settlement cover read (the snapshot's own)
     marks = snapshot.marks()
     marks = marks.assign(isin=marks["isin"].astype(str).str.upper()) if len(marks) else marks
     state = PortfolioState(as_of=snapshot.as_of, day=snapshot.day, book=book, ctx=c, balance=balance,
@@ -2087,6 +2102,9 @@ def state_from_result(engine, day, ctx: rk.RiskContext, *, orders=None, risk=Non
     d = rk.as_date(day)
     ctx = with_cost_table(ctx)
     ef = _frames_of(engine, ENGINE_FRAMES, "the engine's")
+    if ctx.nav is None or ctx.funding is None:  # each book's cash and borrowing: the ALM and settlement cover read them
+        ctx = replace(ctx, nav=ef["nav"] if ctx.nav is None else ctx.nav,
+                      funding=ef["funding"] if ctx.funding is None else ctx.funding)
     positions = ef["positions"] if ef["positions"] is not None else pd.DataFrame(columns=list(rt.POSITION_COLUMNS))
     mine = positions[[rk._date(v, "date") == d for v in positions["date"]]] if len(positions) else positions
     nav_rows = [r for r in ef["nav"].to_dict("records") if rk._date(r["date"], "date") == d] \
@@ -2099,9 +2117,7 @@ def state_from_result(engine, day, ctx: rk.RiskContext, *, orders=None, risk=Non
     if risk is not None and getattr(risk, "book", None) is not None:
         book = risk.book
     elif len(mine):
-        from dataclasses import replace
-        book = rk.risk_book(mine, replace(ctx, nav=ef["nav"], funding=ef["funding"]) if ctx.nav is None else ctx,
-                            day=d)
+        book = rk.risk_book(mine, ctx, day=d)
     else:
         book = _empty_book(ctx, d, nav, strategies)
     changes = risk.history.frame() if risk is not None and getattr(risk, "history", None) is not None else \
@@ -2199,7 +2215,6 @@ def _instrument(state: PortfolioState, isin: str):
 def _price_for(inst, y: float, s: date) -> tuple[float, float]:
     """(clean, dirty) of the bond at yield ``y`` for settlement ``s``."""
     bond = inst.bond
-    from cr_strat.bonds import DiscountInstrument
     if isinstance(bond, DiscountInstrument):
         p = bond.price(y, s, rounded=False)
         return p, p
@@ -2207,7 +2222,6 @@ def _price_for(inst, y: float, s: date) -> tuple[float, float]:
 
 
 def _yield_of(inst, clean: float, s: date) -> float:
-    from cr_strat.bonds import DiscountInstrument
     bond = inst.bond
     if isinstance(bond, DiscountInstrument):
         return bond.yield_from_price(clean, s)
@@ -2348,8 +2362,8 @@ def order_risk(state: PortfolioState, order: rt.Order, *, seq: int = 0) -> Order
         model = _model_yield(state, inst, settle)
         if model is None:
             return OrderRisk(**base, kind=inst.kind, refusal=f"no public price for {isin} by "
-                                                             f"{ctx.as_of:%Y-%m-%d %H:%M} (no traded or valuation mark, "
-                                                             "and no model price: curve and residual)")
+                             f"{ctx.as_of:%Y-%m-%d %H:%M} (no traded or valuation mark, and no model price: curve and "
+                             "residual)")
         y, source = model
         age = 0
         flags.append("model_price")
@@ -2359,7 +2373,6 @@ def order_risk(state: PortfolioState, order: rt.Order, *, seq: int = 0) -> Order
         return OrderRisk(**base, kind=inst.kind, refusal=f"{isin} cannot be priced for {settle}: {exc}")
     face = sign * float(order.face)
     units = face / 100
-    from cr_strat.floating import GoiFloatingRateBond, index_dv01
     dv01 = units * (index_dv01(inst.bond, settle, 0.0, index_pct=y) if isinstance(inst.bond, GoiFloatingRateBond)
                     else inst.bond.dv01(y, settle))
     rec = {"date": state.day, "book": order.book, "isin": isin, "kind": inst.kind, "state": "pending", "face": face,
@@ -2396,7 +2409,6 @@ def _auction_settlement(ctx: rk.RiskContext, isin: str, day) -> date | None:
 
 
 def _swap_order(state: PortfolioState, order: rt.Order, base: dict, side: str, fill_day: date) -> OrderRisk:
-    from cr_strat.ois import MIBOR_OIS, OisSwap, effective_date, ois_npv, ois_par_rate
     ctx = state.ctx
     if side not in ("pay", "receive"):
         return OrderRisk(**base, kind="ois", refusal=f"an OIS order's side is pay or receive fixed, not "
@@ -2419,7 +2431,11 @@ def _swap_order(state: PortfolioState, order: rt.Order, base: dict, side: str, f
     tid = base["order_id"] or f"G{abs(base['seq']):06d}"
     swap = OisSwap(effective=effective, months=int(order.months), fixed_rate_pct=rate, notional=float(order.face),
                    pay_fixed=pay)
-    val = ois_npv(rk._plain(curve), swap, fixings=rk._fixings_as_of(ctx), calendar=cal)
+    try:
+        val = ois_npv(rk._plain(curve), swap, fixings=rk._fixings_as_of(ctx), calendar=cal)
+    except ValueError as exc:
+        return OrderRisk(**base, kind="ois", refusal=f"the swap cannot be valued on the run's calendar: {exc} (the "
+                                                     "engine's project_calendar extends it past its holiday list)")
     rec = {"date": state.day, "book": order.book, "isin": f"OIS:{tid}", "kind": "ois", "state": "ois",
            "face": -float(order.face) if pay else float(order.face), "settlement_date": effective,
            "clean_mark": rate, "mark_source": "par_rate", "mark_age_days": 0, "yield_pct": rate, "accrued": 0.0,
@@ -2435,7 +2451,6 @@ def _swap_order(state: PortfolioState, order: rt.Order, base: dict, side: str, f
 
 
 def _book_with(book: rk.RiskBook, items: Sequence[OrderRisk]) -> rk.RiskBook:
-    from dataclasses import replace
     positions = [*book.positions, *(o.item for o in items if isinstance(o.item, rk.RiskPosition))]
     swaps = [*book.swaps, *(o.item for o in items if isinstance(o.item, rk.RiskSwap))]
     positions.sort(key=lambda p: (p.book, p.isin, p.state, p.settlement))
@@ -2448,7 +2463,6 @@ def _book_with(book: rk.RiskBook, items: Sequence[OrderRisk]) -> rk.RiskBook:
 
 
 def _stress_rows(state: PortfolioState, book: rk.RiskBook) -> pd.DataFrame:
-    from cr_strat import stress as st
     sctx = st.StressContext(risk=state.ctx)
     rows = []
     for _, srows in st.scenarios_by_id(state.scenarios).items():
@@ -2460,7 +2474,6 @@ def _view(state: PortfolioState, items: Sequence[OrderRisk], cache: dict) -> Met
     """The ``MetricInputs`` of the state with ``items`` (queued and approved orders, and the one being checked)
     added: every table recomputed on the book with them, the stress P&L of the state revalued in full once and each
     order's added in full, VaR and ES by the parametric method (the gate's approximation)."""
-    from cr_strat import stress as st
     book = _book_with(state.book, items)
     if "stress" not in cache:
         cache["stress"] = _stress_rows(state, state.book)
@@ -2543,7 +2556,12 @@ class PreTradeGate:
                                                                                        "line"])
         if legal_form_rows:
             extra = legal_form_limits(ctx.settings.access)
-            extra = extra[~extra["limit_id"].isin(set(table["limit_id"]))]
+            mine = table[table["origin"] != "legal_form"] if len(table) else table
+            clash = sorted(set(mine["limit_id"]) & set(read_limits(LEGAL_FORM_LIMITS_CSV)["limit_id"]))
+            if clash:
+                raise ValueError(f"limit_id {clash[0]} is in the fund's limit table and in the legal-form table "
+                                 "(legal_form_limits.csv), which the gate always adds: give the fund's row another id")
+            extra = extra[~extra["limit_id"].isin(set(table["limit_id"]))]  # rows already given with the table
             table = pd.concat([table, extra], ignore_index=True) if len(table) else extra.reset_index(drop=True)
         examples = table[table["policy_status"] == "EXAMPLE"]
         if len(examples) and not allow_example_limits:
@@ -2634,7 +2652,8 @@ class PreTradeGate:
         """``(approved orders, GATE_COLUMNS rows)`` of a decision (see the class)."""
         scale_of = {**self.scales, **(scales or {})}
         live = limits_in_force(self.limits, as_of=state.as_of, legal_form=state.access.name)
-        live = live[live["action"] != "report"].to_dict("records")
+        live = live[live["action"] != "report"]
+        live = live.sort_values("limit_id", kind="mergesort").to_dict("records")  # ids are unique: any row order
         cache: dict = {}
         approved: list[rt.Order] = []
         accepted: list[OrderRisk] = list(state.queued)
@@ -2662,12 +2681,13 @@ class PreTradeGate:
             if not failures:
                 rows.append(_gate_row(state, risked, decision))
             for f in failures:
+                why = f["reason"] if f["hard"] or not hard else f"{WARNING_ONLY}{f['reason']}"
                 rows.append(_gate_row(state, risked, decision, limit_id=f.get("limit_id", ""),
                                       metric=f.get("metric", ""), scope=f.get("scope", ""),
                                       pre_value=f.get("pre", math.nan), post_value=f.get("post", math.nan),
                                       warning_level=f.get("warning", math.nan), hard_level=f.get("hard_level",
                                                                                                  math.nan),
-                                      reason=f["reason"]))
+                                      reason=why))
             if not hard:
                 approved.append(order)
                 accepted.append(risked)
@@ -2685,15 +2705,15 @@ class PreTradeGate:
                 continue
             enforced = self._enforced(rec)
             tag = "" if enforced else f"{rec['policy_status']} (not enforced): "
-            for st, sc in sorted(scopes):
-                hard = _scaled(rec["hard_level"], rec, st, sc, scales)
-                warning = _scaled(rec["warning_level"], rec, st, sc, scales)
-                label = f"limit {rec['limit_id']} {rec['metric']} ({st} {sc})" if st != "fund" else \
+            for stype, sc in sorted(scopes):
+                hard = _scaled(rec["hard_level"], rec, stype, sc, scales)
+                warning = _scaled(rec["warning_level"], rec, stype, sc, scales)
+                label = f"limit {rec['limit_id']} {rec['metric']} ({stype} {sc})" if stype != "fund" else \
                     f"limit {rec['limit_id']} {rec['metric']} (fund)"
-                common = {"limit_id": rec["limit_id"], "metric": rec["metric"], "scope": f"{st} {sc}",
+                common = {"limit_id": rec["limit_id"], "metric": rec["metric"], "scope": f"{stype} {sc}",
                           "warning": warning, "hard_level": hard}
                 if rec["action"] == "halt":
-                    now = _cached_values(pre, cache, rec["metric"], st, sc, rec["selector"], rec["unit"])
+                    now = _cached_values(pre, cache, rec["metric"], stype, sc, rec["selector"], rec["unit"])
                     if any(ok and past(v, hard, rec["direction"]) for v, ok, _ in now.values()):
                         out.append({**common, "hard": enforced, "reason": f"{tag}{label} is in breach and halts "
                                                                           "every new order in its scope"})
@@ -2716,15 +2736,15 @@ class PreTradeGate:
                                     "reason": f"{tag}{label}: the purchase is rated {_fmt(notch, 'notch')}, past the "
                                               f"warning floor {_fmt(warning, 'notch')}"})
                     continue
-                before = _cached_values(pre, cache, rec["metric"], st, sc, rec["selector"], rec["unit"])
-                after = _cached_values(post, cache, rec["metric"], st, sc, rec["selector"], rec["unit"])
+                before = _cached_values(pre, cache, rec["metric"], stype, sc, rec["selector"], rec["unit"])
+                after = _cached_values(post, cache, rec["metric"], stype, sc, rec["selector"], rec["unit"])
                 for key, (value, ok, detail) in sorted(after.items()):
                     if detail.startswith("not_applicable"):
                         continue
                     old = before.get(key)
                     where = label + (f" [{key}]" if key else "")
                     item = {**common, "pre": old[0] if old else math.nan, "post": value,
-                            "scope": f"{st} {sc}" + (f" [{key}]" if key else "")}
+                            "scope": f"{stype} {sc}" + (f" [{key}]" if key else "")}
                     if not ok:
                         if old is not None and not old[1] and _same(old[0], value):
                             continue  # incomplete before and unchanged: reported by the daily checks

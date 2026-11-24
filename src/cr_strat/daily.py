@@ -47,7 +47,7 @@ import json
 import math
 import tomllib
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time
 from pathlib import Path
 from typing import Any
@@ -59,6 +59,7 @@ from cr_strat import limits as lm
 from cr_strat import portfolio as pf
 from cr_strat import returns as rt
 from cr_strat import risk as rk
+from cr_strat import stress as st
 from cr_strat.calendars import mumbai_settlement_calendar
 from cr_strat.ois import as_time
 
@@ -525,8 +526,9 @@ def report_markdown(result: DailyResult) -> str:
     lines: list[str] = []
     table = result.limits if result.limits is not None else pd.DataFrame(columns=["policy_status"])
     live = lm.limits_in_force(table, as_of=result.as_of, legal_form=cfg.access) if len(table) else table
-    examples = len(live) and (live["policy_status"] == "EXAMPLE").any()
-    lines.append(f"# Daily risk report: {cfg.fund}, {result.day}")
+    examples = bool(len(live)) and bool((live["policy_status"] == "EXAMPLE").any())
+    title = f"# Daily risk report: {cfg.fund}, {result.day}"
+    lines.append(f"{title} (EXAMPLE limits)" if examples else title)
     lines.append("")
     if examples:
         lines.append(f"**{lm.EXAMPLE_NOTE}.**")
@@ -535,6 +537,11 @@ def report_markdown(result: DailyResult) -> str:
                  "a question for counsel). Synthetic or paper data unless the inputs say otherwise; every UNVERIFIED "
                  "rule used is listed at the end.")
     lines.append("")
+    if len(live):
+        counts = live["policy_status"].value_counts()
+        lines.append("Limits in force: " + ", ".join(f"{int(counts[s])} {s}" for s in lm.POLICY_STATUSES if s in counts)
+                     + " (EXAMPLE rows are not the fund's policy; DRAFT rows warn and are never enforced)")
+        lines.append("")
     log = result.breach_log
     hot = log[log["status"].isin(("escalated", "new"))] if len(log) else log
     hot = hot[hot["last_date"] == result.day] if len(hot) else hot
@@ -697,7 +704,8 @@ def report_markdown(result: DailyResult) -> str:
     lines.append("")
     lines.append("## UNVERIFIED rules used")
     lines.append("")
-    lines += [f"- {r}" for r in (*rk.UNVERIFIED_RULES, *lm.UNVERIFIED_RULES, *pf.UNVERIFIED_RULES[4:6])]
+    derisk = [r for r in pf.UNVERIFIED_RULES if r.startswith("drawdown scale")]  # the only portfolio rule used
+    lines += [f"- {r}" for r in (*rk.UNVERIFIED_RULES, *lm.UNVERIFIED_RULES, *derisk)]
     lines.append("")
     return "\n".join(lines)
 
@@ -770,7 +778,7 @@ def run_daily(config: DailyConfig, day, *, orders=None, out_dir) -> DailyResult:
     market = _market(config, cal)
     trades, swaps, flows = (_book_file(config, root, k) for k in ("trades", "swaps", "flows"))
     user = lm.example_limits() if config.limits in (None, "example") else lm.read_limits(config.limits)
-    table = lm.limit_table(user, lm.legal_form_limits(settings.access))
+    table = lm.monitoring_limits(user)  # every preset's legal-form rows: the other form's read not_applicable
     proposed = lm.read_orders(orders) if orders is not None else pd.DataFrame(columns=list(lm.ORDER_COLUMNS))
     risk_settings = _risk_settings(config)
     ctx = rk.RiskContext(
@@ -787,12 +795,10 @@ def run_daily(config: DailyConfig, day, *, orders=None, out_dir) -> DailyResult:
     engine = rt.run_book(trades, swaps, flows, market=market, settings=settings, start=config.inception, end=d)
     out = root / d.isoformat()
     paths = list(rt.write_result(engine, out / "engine"))
-    from dataclasses import replace
     ctx = lm.with_cost_table(replace(ctx, nav=engine.nav, funding=engine.funding))
     notes: list[str] = []
     day_positions = engine.positions[engine.positions["date"] == d] if len(engine.positions) else engine.positions
     rr = None
-    from cr_strat import stress as st
     scenarios = st.read_scenarios(as_of=as_of, extend=config.inputs.get("scenarios"))
     if len(day_positions):
         rr = rk.run_risk(day_positions, ctx, day=d, scenarios=scenarios,
@@ -803,7 +809,9 @@ def run_daily(config: DailyConfig, day, *, orders=None, out_dir) -> DailyResult:
         notes.append(f"no position on {d}: no risk tables")
     strategies = rk._strategy_map(ctx.strategy_books, sorted(set(engine.nav["book"].astype(str)) - {"fund"}), d)
     scales = derisk_scales(table, engine.nav, as_of=as_of, legal_form=config.access, strategies=strategies)
-    metrics = lm.limit_metrics(rr if rr is not None else {}, engine, ctx, limits=table, day=d,
+    # the limits read the files just written, so cr-strat limits and pre-trade on this report's engine/ and risk/
+    # directories reproduce its limit and gate files byte for byte (the CSVs round the last digits)
+    metrics = lm.limit_metrics(out / "risk" if rr is not None else {}, out / "engine", ctx, limits=table, day=d,
                                board_resolution_date=config.board_resolution_date)
     checks = lm.check_limits(metrics, table, as_of=as_of, legal_form=settings.access, scales=scales)
     prev = _previous_dir(root, d)
@@ -814,7 +822,7 @@ def run_daily(config: DailyConfig, day, *, orders=None, out_dir) -> DailyResult:
     breaches = lm.breaches_of_day(log, d)
     paths += lm.write_limits(metrics, checks, breaches, out / "limits", breach_log=log)
     if gate is not None:
-        state = lm.state_from_result(engine, d, ctx, risk=rr, scenarios=scenarios,
+        state = lm.state_from_result(out / "engine", d, replace(ctx, nav=None, funding=None), scenarios=scenarios,
                                      board_resolution_date=config.board_resolution_date)
         approved, rows = gate.check(state, lm.orders_from_frame(proposed), scales=scales)
         notes.extend(state.notes)
@@ -868,6 +876,8 @@ def run_daily(config: DailyConfig, day, *, orders=None, out_dir) -> DailyResult:
     used = dict(config.inputs)
     if orders is not None and not isinstance(orders, pd.DataFrame):
         used["orders"] = Path(orders)
+    if config.limits not in (None, "example"):
+        used["limits"] = Path(config.limits)  # the fund's limit table, hashed like every other input
     result.manifest = manifest(config, used, paths, as_of, out=out,
                                settings={"risk": {k: (list(v) if isinstance(v, tuple) else v) for k, v in
                                                   sorted(config.risk.items())},
@@ -913,8 +923,14 @@ def summary_lines(result: DailyResult) -> list[str]:
     if len(decided):
         dec = decided["decision"].value_counts()
         lines.append("orders: " + ", ".join(f"{int(dec.get(s, 0))} {s}" for s in lm.DECISIONS))
-        for rec in result.gate[result.gate["decision"] == "refused"].to_dict("records"):
-            lines.append(f"refused order {rec['seq']} ({rec['book']} {rec['side']} {rec['isin']}): {rec['reason']}")
+        refused = result.gate[result.gate["decision"] == "refused"]
+        for rec in refused.to_dict("records"):
+            if not str(rec["reason"]).startswith(lm.WARNING_ONLY):
+                lines.append(f"refused order {rec['seq']} ({rec['book']} {rec['side']} {rec['isin']}): "
+                             f"{rec['reason']}")
+        warned = int(refused["reason"].astype(str).str.startswith(lm.WARNING_ONLY).sum())
+        if warned:
+            lines.append(f"(and {warned} warning(s) on refused orders: orders/gate.csv)")
     if len(result.reconciliation):
         lines.append(f"reconciliation: {len(result.reconciliation)} difference(s) with the previous report")
     return lines

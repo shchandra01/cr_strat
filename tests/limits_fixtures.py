@@ -6,6 +6,7 @@ from positions rows without the engine. Nothing here is a real price; the bonds'
 
 from dataclasses import replace
 from datetime import date, datetime
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -80,9 +81,9 @@ def market_and_trades():
     return market, trades, flows, entries, run_days
 
 
-def context(market, preset, *, trades=None, as_of=None, **kw) -> rk.RiskContext:
+def context(market, preset, *, trades=None, as_of=None, project_calendar=False, **kw) -> rk.RiskContext:
     _, _, entries = fits()
-    st = rt.EngineSettings(access=rt.ACCESS_PRESETS[preset])
+    st = rt.EngineSettings(access=rt.ACCESS_PRESETS[preset], project_calendar=project_calendar)
     return rk.RiskContext(market=market, settings=st, risk=rk.RiskSettings(min_obs_hard=60),
                           as_of=as_of or fx.at(END, 20), terms=trades, nss_table={"gsec": entries}, **kw)
 
@@ -154,6 +155,59 @@ def approved(**kw) -> dict:
     return base
 
 
+ORDERS = pd.DataFrame([{"book": "b", "isin": "GS2036", "side": "buy", "face": 1e8},
+                       {"book": "c", "isin": NCD, "side": "buy", "face": 3e7},
+                       {"book": "b", "isin": "GS2054", "side": "sell", "face": 1e8}])
+DAY1, DAY2 = date(2026, 11, 18), date(2026, 11, 19)
+
+
+def paper_fund(root, preset="unregulated_company", *, allow_example=True, limits="example", extra="") -> Path:
+    """A paper fund's folder for ``daily.run_daily``: the marks, NSS fits and NCD terms of ``market_and_trades``, the
+    capital flows, the paper trades (13 and 16 Nov), an orders file for DAY1 and ``config.toml`` (``extra`` added to
+    its top-level keys)."""
+    market, trades, flows, entries, _ = market_and_trades()
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    market.marks.to_csv(root / "marks.csv", index=False)
+    pd.DataFrame([rt.nss_params_row(e.curve, d, public_from=e.public_from) for d, e in entries.items()]).to_csv(
+        root / "nss.csv", index=False)
+    pd.DataFrame(NCD_TERMS).to_csv(root / "corporate_terms.csv", index=False)
+    flows.to_csv(root / "flows.csv", index=False)
+    trades.to_csv(root / "trades.csv", index=False)
+    ORDERS.to_csv(root / "orders.csv", index=False)
+    (root / "config.toml").write_text(f"""fund = "paper"
+access = "{preset}"
+inception = "2026-11-13"
+board_resolution_date = "2026-04-02"
+allow_example_limits = {str(allow_example).lower()}
+limits = "{limits}"
+{extra}
+[inputs]
+marks = "marks.csv"
+nss_params = "nss.csv"
+corporate_terms = "corporate_terms.csv"
+flows = "flows.csv"
+trades = "trades.csv"
+
+[risk]
+min_obs_hard = 60
+""", encoding="utf-8")
+    return root
+
+
+def append_approved(root, day) -> None:
+    """The operator's step: the day's approved trades appended to the paper trades file."""
+    root = Path(root)
+    book = pd.read_csv(root / "trades.csv", dtype=str, keep_default_na=False)
+    new = pd.read_csv(root / day.isoformat() / "orders" / "approved_trades.csv", dtype=str, keep_default_na=False)
+    pd.concat([book, new], ignore_index=True).to_csv(root / "trades.csv", index=False)
+
+
+def files_under(root) -> dict[str, bytes]:
+    root = Path(root)
+    return {str(p.relative_to(root)): p.read_bytes() for p in sorted(root.rglob("*")) if p.is_file()}
+
+
 __all__ = ["END", "NCD", "NCD_TERMS", "BONDS", "MASTER", "fits", "market_and_trades", "context", "engine_and_risk",
            "nav_rows", "state", "gsec_row", "ois_entries", "ois_market", "scenario_rows", "limit_frame", "approved",
-           "np", "fx"]
+           "ORDERS", "DAY1", "DAY2", "paper_fund", "append_approved", "files_under", "np", "fx"]
