@@ -415,7 +415,7 @@ def es_parity_weights(pnl, budgets=None, *, alpha: float = rk.ES_ALPHA, tol: flo
     if np.any(sd <= 0):
         raise ValueError(f"ES parity needs every strategy to move: {[labels[i] for i in np.flatnonzero(sd <= 0)]}")
     w = (1 / sd) / (1 / sd).sum()
-    err = math.inf
+    err, last, power = math.inf, math.inf, 0.5
     for k in range(1, max_iter + 1):
         comp = component_es(x * w, alpha).to_numpy()
         es = float(comp.sum())
@@ -428,7 +428,10 @@ def es_parity_weights(pnl, budgets=None, *, alpha: float = rk.ES_ALPHA, tol: flo
         err = float(np.max(np.abs(share - b)))
         if err < tol:
             return pd.Series(w, index=labels, dtype=float), k
-        w = w * np.sqrt(b / share)
+        if err >= last:
+            power = max(power / 2, 1 / 1024)  # the error rose: damp harder (UNVERIFIED safeguard)
+        last = err
+        w = w * (b / share) ** power
         w = w / w.sum()
     raise ValueError(f"ES parity did not converge in {max_iter} iterations (last error {err:.3e} in the shares)")
 
@@ -443,8 +446,8 @@ def _rows_in_force(table, columns: Sequence[str], required: Sequence[str], what:
         if start > as_of.date():
             continue
         rows.append({**rec, "effective_from": start, "line": n})
-    return pd.DataFrame(rows, columns=[*frame.columns, "line"]) if rows else pd.DataFrame(
-        columns=[*frame.columns, "line"])
+    columns = list(dict.fromkeys([*frame.columns, "effective_from", "line"]))
+    return pd.DataFrame(rows, columns=columns)
 
 
 def read_fixed_weights(table, *, as_of) -> pd.Series:

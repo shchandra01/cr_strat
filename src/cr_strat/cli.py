@@ -2016,6 +2016,264 @@ def _var_backtest(args: argparse.Namespace) -> int:
     return 0 if len(summary) else 1
 
 
+def _layer_market(args: argparse.Namespace, calendar) -> return_engine.MarketData:
+    """The market data of the limits and pre-trade commands, from the flags each gives (missing flags: none)."""
+    def given(name):
+        value = getattr(args, name, None)
+        if value and not Path(value).exists():
+            raise FileNotFoundError(f"--{name.replace('_', '-')}: {value} not found")
+        return value
+    fixings, times = ({}, None)
+    if given("fixings"):
+        series, times = _read_fixings(args.fixings)
+        fixings = {d: float(v) for d, v in series.items()}
+    credit = {flag: getattr(args, flag) for flag in ("corporate_terms", "corporate_schedule", "corporate_options",
+                                                       "corporate_amortisation", "corporate_steps", "ratings",
+                                                       "corporate_floating", "benchmark_fixings", "frb_terms")
+              if given(flag)}
+    return return_engine.MarketData(
+        marks=_read_csv_text(args.marks) if given("marks") else None,
+        curves=return_engine.read_nss_params(args.nss_params, calendar=calendar) if given("nss_params") else {},
+        ois_curves=_ois_curves_from_quotes(args.ois_quotes, calendar) if given("ois_quotes") else {},
+        fixings=fixings, fixing_times=times,
+        liquidity=_read_csv_text(args.liquidity) if given("liquidity") else None,
+        master=read_master(args.master) if given("master") else None,
+        residual_history=_read_csv_text(args.residual_history) if given("residual_history") else None,
+        stock=_read_csv_text(args.stock) if given("stock") else None,
+        auctions=_read_csv_text(args.auctions) if given("auctions") else None, **credit)
+
+
+def _layer_table(value: str):
+    """``--limits``: ``example`` (the shipped example table) or the fund's table."""
+    from cr_strat import limits as limits_layer
+    if value == "example":
+        return limits_layer.example_limits()
+    if not Path(value).exists():
+        raise FileNotFoundError(f"--limits: {value} not found")
+    return limits_layer.read_limits(value)
+
+
+def _layer_as_of(args: argparse.Namespace, day: dt.date, access) -> dt.datetime:
+    valuation = return_engine.EngineSettings(access=access).decision_time
+    return _time_arg(args.as_of, "--as-of") if args.as_of else dt.datetime.combine(day, valuation)
+
+
+def _limits(args: argparse.Namespace) -> int:
+    """Limit metrics, checks and the breach log of one day from the outputs of cr-strat risk and cr-strat returns."""
+    from cr_strat import limits as limits_layer
+    from cr_strat import risk as risk_layer
+    try:
+        for flag in ("risk_dir", "engine_dir"):
+            if not Path(getattr(args, flag)).is_dir():
+                raise FileNotFoundError(f"--{flag.replace('_', '-')}: {getattr(args, flag)} is not a directory")
+        for flag in ("strategy_books", "trades"):
+            value = getattr(args, flag, None)
+            if value and not Path(value).exists():
+                raise FileNotFoundError(f"--{flag.replace('_', '-')}: {value} not found")
+        calendar = mumbai_settlement_calendar()
+        calendar = calendar.lenient() if args.project_calendar else calendar
+        day = _date_arg(args.date, "--date")
+        nav_path = Path(args.engine_dir) / "nav.csv"
+        if not nav_path.exists():
+            raise FileNotFoundError(f"--engine-dir: {nav_path} not found (cr-strat returns writes it)")
+        nav = _read_csv_text(str(nav_path))
+        if not (nav["date"] == day.isoformat()).any():
+            print(f"nothing to compute: no NAV on {day} in {nav_path}")
+            return 1
+        access = return_engine.access_policy(args.access)
+        as_of = _layer_as_of(args, day, access)
+        table = limits_layer.limit_table(_layer_table(args.limits), limits_layer.legal_form_limits(access))
+        market = _layer_market(args, calendar)
+        ctx = risk_layer.RiskContext(
+            market=market, settings=return_engine.EngineSettings(access=access, project_calendar=args.project_calendar),
+            risk=risk_layer.RiskSettings(min_obs_hard=args.min_obs_hard, min_obs=max(args.min_obs_hard, 250)),
+            as_of=as_of, terms=_read_csv_text(args.trades) if args.trades else None,
+            strategy_books=_read_csv_text(args.strategy_books) if args.strategy_books else None)
+        metrics = limits_layer.limit_metrics(Path(args.risk_dir), Path(args.engine_dir), ctx, limits=table, day=day,
+                                             board_resolution_date=args.board_resolution_date)
+        checks = limits_layer.check_limits(metrics, table, as_of=as_of, legal_form=access)
+        fills = Path(args.engine_dir) / "fills.csv"
+        books = sorted(set(nav["book"].astype(str)) - {"fund"})
+        strategies = risk_layer._strategy_map(ctx.strategy_books, books, day)
+        log = limits_layer.update_breach_log(args.breach_log, checks, as_of=as_of, calendar=calendar,
+                                             fills=_read_csv_text(str(fills)) if fills.exists() else None,
+                                             limits=table, strategies=strategies)
+        breaches = limits_layer.breaches_of_day(log, day)
+        written = limits_layer.write_limits(metrics, checks, breaches, Path(args.out_dir), breach_log=log)
+    except (ValueError, TypeError, OSError, KeyError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    live = limits_layer.limits_in_force(table, as_of=as_of, legal_form=access.name)
+    if (live["policy_status"] == "EXAMPLE").any():
+        print(limits_layer.EXAMPLE_NOTE)
+    for path in written:
+        print(f"wrote {path}")
+    counts = checks["status"].value_counts()
+    print("limit checks: " + ", ".join(f"{int(counts.get(s, 0))} {s}" for s in limits_layer.CHECK_STATUSES))
+    for rec in breaches.to_dict("records"):
+        print(f"breach {rec['limit_id']} {rec['scope_type']} {rec['scope']} {rec['key']}: {rec['status']} "
+              f"({rec['origin']}), first {rec['first_date']}, cure due {rec['cure_due']}")
+    return 0
+
+
+def _pre_trade(args: argparse.Namespace) -> int:
+    """The pre-trade gate on a file of proposed orders against one day's book of cr-strat returns."""
+    from cr_strat import daily as daily_layer
+    from cr_strat import limits as limits_layer
+    from cr_strat import risk as risk_layer
+    try:
+        if not Path(args.engine_dir).is_dir():
+            raise FileNotFoundError(f"--engine-dir: {args.engine_dir} is not a directory")
+        for flag in ("orders", "queued", "trades", "swaps", "issuers", "strategy_books", "factor_history", "adv",
+                     "seniority", "scenarios", "costs"):
+            value = getattr(args, flag, None)
+            if value and not Path(value).exists():
+                raise FileNotFoundError(f"--{flag.replace('_', '-')}: {value} not found")
+        calendar = mumbai_settlement_calendar()
+        calendar = calendar.lenient() if args.project_calendar else calendar
+        day = _date_arg(args.date, "--date")
+        access = return_engine.access_policy(args.access)
+        as_of = _layer_as_of(args, day, access)
+        market = _layer_market(args, calendar)
+        settings = return_engine.EngineSettings(access=access, project_calendar=args.project_calendar,
+                                                costs=read_cost_table(overrides=args.costs) if args.costs else None)
+        ctx = risk_layer.RiskContext(
+            market=market, settings=settings,
+            risk=risk_layer.RiskSettings(min_obs_hard=args.min_obs_hard, min_obs=max(args.min_obs_hard, 250)),
+            as_of=as_of, swaps=_read_csv_text(args.swaps) if args.swaps else None,
+            terms=_read_csv_text(args.trades) if args.trades else None,
+            issuers=_read_csv_text(args.issuers) if args.issuers else None,
+            strategy_books=_read_csv_text(args.strategy_books) if args.strategy_books else None,
+            factor_history=_read_csv_text(args.factor_history) if args.factor_history else None,
+            adv=_read_csv_text(args.adv) if args.adv else None,
+            seniority=_read_csv_text(args.seniority) if args.seniority else None, nss_table=market.curves or None)
+        from cr_strat import stress as stress_layer
+        scenarios = stress_layer.read_scenarios(as_of=as_of, extend=args.scenarios)
+        proposed = limits_layer.read_orders(args.orders)
+        gate = limits_layer.PreTradeGate(_layer_table(args.limits), ctx, allow_example_limits=args.allow_example_limits,
+                                         cash_buffer_pct=args.cash_buffer_pct)
+        state = limits_layer.state_from_result(Path(args.engine_dir), day, ctx, orders=args.queued,
+                                               scenarios=scenarios, board_resolution_date=args.board_resolution_date)
+        approved, rows = gate.check(state, limits_layer.orders_from_frame(proposed))
+        frame = limits_layer.gate_frame(rows)
+        trades_next, swaps_next = daily_layer.approved_trades(frame, proposed, day, calendar=calendar)
+        out = Path(args.out_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        written = []
+        for name, table in (("gate", frame), ("approved_trades", trades_next), ("approved_swaps", swaps_next)):
+            path = out / f"{name}.csv"
+            table.to_csv(path, index=False, date_format="%Y-%m-%d")
+            written.append(path)
+    except (ValueError, TypeError, OSError, KeyError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if args.allow_example_limits and (gate.limits["policy_status"] == "EXAMPLE").any():
+        print(limits_layer.EXAMPLE_NOTE)
+    for path in written:
+        print(f"wrote {path}")
+    for note in state.notes:
+        print(f"note: {note}")
+    decided = frame.drop_duplicates("seq") if len(frame) else frame
+    counts = decided["decision"].value_counts() if len(decided) else {}
+    print("orders: " + ", ".join(f"{int(counts.get(s, 0)) if len(decided) else 0} {s}"
+                                 for s in limits_layer.DECISIONS))
+    for rec in frame[frame["decision"] != "approved"].to_dict("records"):
+        print(f"order {rec['seq']} ({rec['book']} {rec['side']} {rec['isin']}) {rec['decision']}: {rec['reason']}")
+    return 0
+
+
+def _allocate(args: argparse.Namespace) -> int:
+    """Capital weights across strategy books (portfolio.allocate) from the books' NAV history."""
+    from cr_strat import portfolio as portfolio_layer
+    try:
+        for flag in ("nav", "strategy_books", "fixed", "budgets", "bounds"):
+            value = getattr(args, flag)
+            if value and not Path(value).exists():
+                raise FileNotFoundError(f"--{flag.replace('_', '-')}: {value} not found")
+        if args.risk_dir and not Path(args.risk_dir).is_dir():
+            raise FileNotFoundError(f"--risk-dir: {args.risk_dir} is not a directory")
+        access = return_engine.access_policy(args.access)
+        text = args.as_of.strip()
+        as_of = _time_arg(text, "--as-of") if "T" in text or " " in text else dt.datetime.combine(
+            _date_arg(text, "--as-of"), return_engine.EngineSettings(access=access).decision_time)
+        returns = portfolio_layer.strategy_returns(_read_csv_text(args.nav), _read_csv_text(args.strategy_books)
+                                                   if args.strategy_books else None, as_of=as_of)
+        metrics = None
+        if args.budgets:
+            if not args.risk_dir:
+                raise ValueError("--budgets needs --risk-dir (cr-strat risk's outputs: each strategy's DV01, CS01, "
+                                 "VaR or ES)")
+            metrics = _strategy_metrics(Path(args.risk_dir), args.budget_metric or "dv01")
+        frame = portfolio_layer.allocate(
+            args.method, as_of=as_of, access=access, returns=returns,
+            fixed=_read_csv_text(args.fixed) if args.fixed else None,
+            budgets=_read_csv_text(args.budgets) if args.budgets else None,
+            bounds=_read_csv_text(args.bounds) if args.bounds else None, metrics=metrics,
+            budget_metric=args.budget_metric, algorithm=args.algorithm, cov_method=args.cov_method,
+            allow_scale_up=args.allow_scale_up)
+        written = [portfolio_layer.write_allocation(frame, args.out)]
+        if args.correlation:
+            cov, obs = portfolio_layer.covariance(returns, method=args.cov_method)
+            shrunk, _ = portfolio_layer.make_positive_definite(cov)
+            table = portfolio_layer.correlation_table(shrunk, obs, as_of=as_of)
+            Path(args.correlation).parent.mkdir(parents=True, exist_ok=True)
+            table.to_csv(args.correlation, index=False, date_format="%Y-%m-%d")
+            written.append(Path(args.correlation))
+    except (ValueError, TypeError, OSError, KeyError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    for path in written:
+        print(f"wrote {path}")
+    for rec in frame.to_dict("records"):
+        print(f"{rec['strategy']}: weight {rec['weight']:.6f}, risk share {rec['risk_share']:.6f}, scale "
+              f"{rec['scale']:.6f} ({'allowed' if rec['allowed'] else 'not allowed'}: {rec['notes']})")
+    return 0 if len(frame) else 1
+
+
+def _strategy_metrics(risk_dir: Path, metric: str) -> dict[str, float]:
+    """Each strategy's DV01 or CS01 (risk_summary.csv) or one-day VaR or 97.5% ES (var.csv) of a cr-strat risk run."""
+    if metric in ("dv01", "cs01"):
+        path = risk_dir / "risk_summary.csv"
+        if not path.exists():
+            raise FileNotFoundError(f"{path} not found (cr-strat risk writes it)")
+        table = _read_csv_text(str(path))
+        rows = table[(table["scope_type"] == "strategy") & (table["dimension"] == "total")]
+        column = "dv01_yield" if metric == "dv01" else "cs01"
+        return {r["scope"]: float(r[column] or 0.0) for r in rows.to_dict("records")}
+    path = risk_dir / "var.csv"
+    if not path.exists():
+        raise FileNotFoundError(f"{path} not found (cr-strat risk writes it)")
+    table = _read_csv_text(str(path))
+    out: dict[str, float] = {}
+    for method in ("hs_full", "hs_sensitivity", "parametric"):
+        rows = table[(table["scope_type"] == "strategy") & (table["method"] == method) & (table["horizon_days"] == "1")
+                     & (table["window"] == "current") & (table["alpha_var"].astype(float) == 0.99)]
+        for r in rows.to_dict("records"):
+            value = r["var"] if metric == "var" else r["es"]
+            if value and r["scope"] not in out:
+                out[r["scope"]] = float(value)
+    return out
+
+
+def _daily_report(args: argparse.Namespace) -> int:
+    """The daily paper process (daily.run_daily): engine replay, risk, limits, the pre-trade check, back-test,
+    reconciliation and the report, for one day."""
+    from cr_strat import daily as daily_layer
+    try:
+        if args.orders and not Path(args.orders).exists():
+            raise FileNotFoundError(f"--orders: {args.orders} not found")
+        config = daily_layer.DailyConfig.read(args.config)
+        result = daily_layer.run_daily(config, _date_arg(args.date, "--date"), orders=args.orders or None,
+                                       out_dir=Path(args.out_dir))
+    except (ValueError, TypeError, OSError, KeyError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    for line in daily_layer.summary_lines(result):
+        print(line)
+    print(f"wrote {len(result.paths)} files under {result.out} (report.md, manifest.json)")
+    return 0
+
+
 def _corporate_table_args(p: argparse.ArgumentParser, *, terms_help: str, required: bool = False) -> None:
     """The corporate terms table and its schedule, options and amortisation tables (``corporates``' readers)."""
     p.add_argument("--terms", required=required, help=terms_help)
@@ -2626,6 +2884,103 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--project-calendar", action="store_true")
     p.add_argument("--out-dir", required=True)
     p.set_defaults(func=_var_backtest)
+
+    def _layer_files(p: argparse.ArgumentParser) -> None:
+        """The market files the limits and pre-trade commands read (as cr-strat risk)."""
+        p.add_argument("--marks", help="the engine's marks (MARK_COLUMNS): order prices and the ADV")
+        p.add_argument("--nss-params", help="NSS curves CSV with public_from: today's curve and the VaR's history")
+        p.add_argument("--ois-quotes", help="OIS quotes CSV (date, tenor, rate_pct, overnight_pct, public_from)")
+        p.add_argument("--fixings", help="overnight MIBOR CSV (date, rate_pct, optional public_from)")
+        p.add_argument("--master", help="security master CSV (kind, coupon, dates, issue dates by ISIN)")
+        p.add_argument("--trades", help="the bond trades of the run (TRADE_COLUMNS): terms the master lacks")
+        p.add_argument("--liquidity", help="CCIL liquidity classes kept by you (effective_date, isin, liquidity)")
+        p.add_argument("--residual-history", help="curvefit residual history (model prices of unmarked orders)")
+        p.add_argument("--stock", help="outstanding stock (isin, date, outstanding_cr): the ISIN-share limits")
+        p.add_argument("--auctions", help="the auction table (notified amounts for the when-issued limits)")
+        p.add_argument("--ratings", help="rating actions (agency, rating, public_from, isin or issuer_id)")
+        p.add_argument("--corporate-terms", help="corporate_terms.csv (corporates)")
+        p.add_argument("--corporate-schedule", help="corporate_schedule.csv")
+        p.add_argument("--corporate-options", help="corporate_options.csv")
+        p.add_argument("--corporate-amortisation", help="corporate_amortisation.csv")
+        p.add_argument("--corporate-steps", help="rating-linked coupon steps")
+        p.add_argument("--corporate-floating", help="frb_corp bonds' benchmark terms")
+        p.add_argument("--benchmark-fixings", help="their benchmark fixings")
+        p.add_argument("--frb-terms", help="GoI FRB terms CSV (default: the shipped table)")
+        p.add_argument("--strategy-books", help="book to strategy map (book, strategy, effective_from)")
+        p.add_argument("--board-resolution-date", help="the board resolution of the financial year (L03), YYYY-MM-DD")
+        p.add_argument("--min-obs-hard", type=int, default=60, help="fewer observations: no parametric VaR (60)")
+        p.add_argument("--project-calendar", action="store_true",
+                       help="treat weekdays of years without a holiday list (2027 on) as business days")
+
+    p = sub.add_parser("limits", help="limit metrics, checks against the limits in force and the breach log of one "
+                                      "day, from cr-strat risk's and cr-strat returns' outputs (docs/risk.md)")
+    p.add_argument("--risk-dir", required=True, help="the directory cr-strat risk wrote for the day")
+    p.add_argument("--engine-dir", required=True, help="the directory cr-strat returns wrote")
+    p.add_argument("--date", required=True, help="the day, YYYY-MM-DD")
+    p.add_argument("--as-of", help="the time the limits are in force at (default: the day at 20:00)")
+    p.add_argument("--limits", required=True, help="the fund's limit table (limits.LIMIT_COLUMNS), or example for the "
+                                                   "shipped examples; the legal-form table is always added")
+    p.add_argument("--access", required=True, choices=sorted(return_engine.ACCESS_PRESETS),
+                   help="the fund's access preset (a question for counsel; no default)")
+    p.add_argument("--breach-log", help="the previous day's breach_log.csv (carried forward)")
+    _layer_files(p)
+    p.add_argument("--out-dir", required=True)
+    p.set_defaults(func=_limits)
+
+    p = sub.add_parser("pre-trade", help="check a file of proposed orders against one day's book and the limits in "
+                                         "force: approved and refused with reasons (docs/risk.md)")
+    p.add_argument("--orders", required=True, help="proposed orders (limits.ORDER_COLUMNS: book, isin, side, face, "
+                                                   "months, venue, purpose ...)")
+    p.add_argument("--engine-dir", required=True, help="the directory cr-strat returns wrote")
+    p.add_argument("--date", required=True, help="the decision day, YYYY-MM-DD")
+    p.add_argument("--as-of", help="the decision time (default: the day at 20:00)")
+    p.add_argument("--limits", required=True, help="the fund's limit table, or example (needs --allow-example-limits)")
+    p.add_argument("--allow-example-limits", action="store_true",
+                   help="let the gate run on EXAMPLE limits (tests only: they are not the fund's policy)")
+    p.add_argument("--access", required=True, choices=sorted(return_engine.ACCESS_PRESETS),
+                   help="the fund's access preset (a question for counsel; no default)")
+    p.add_argument("--queued", help="orders decided earlier and not yet booked (counted as filled)")
+    p.add_argument("--swaps", help="the OIS trades of the run (SWAP_TRADE_COLUMNS)")
+    p.add_argument("--issuers", help="issuer table (risk.ISSUER_COLUMNS)")
+    p.add_argument("--factor-history", help="your factor levels (risk.FACTOR_HISTORY_COLUMNS)")
+    p.add_argument("--adv", help="your average daily volumes (stress.ADV_COLUMNS)")
+    p.add_argument("--seniority", help="seniority by ISIN")
+    p.add_argument("--scenarios", help="your scenario table, extending the shipped one")
+    p.add_argument("--costs", help="your cost table, overriding the defaults")
+    p.add_argument("--cash-buffer-pct", type=float, default=1.0,
+                   help="cash a purchase must leave for its fill and costs, percent of it (UNVERIFIED 1)")
+    _layer_files(p)
+    p.add_argument("--out-dir", required=True)
+    p.set_defaults(func=_pre_trade)
+
+    p = sub.add_parser("allocate", help="capital weights across strategy books: fixed, inverse volatility, equal risk "
+                                        "contribution on volatility or ES, or DV01/CS01/VaR budgets (docs/risk.md)")
+    p.add_argument("--nav", required=True, help="nav.csv of cr-strat returns (the books' daily NAV and flows)")
+    p.add_argument("--strategy-books", help="book to strategy map (default: each book its own strategy)")
+    p.add_argument("--method", required=True, choices=("fixed", "inverse_vol", "erc_vol", "erc_es", "budget"))
+    p.add_argument("--as-of", required=True, help="YYYY-MM-DD (20:00) or a time: returns and rows used up to then")
+    p.add_argument("--access", required=True, choices=sorted(return_engine.ACCESS_PRESETS),
+                   help="the fund's access preset: strategies it forbids get weight 0")
+    p.add_argument("--fixed", help="fixed weights (strategy, weight, effective_from, approved_by)")
+    p.add_argument("--budgets", help="budgets (strategy, metric, budget, unit, effective_from)")
+    p.add_argument("--budget-metric", choices=("dv01", "cs01", "var", "es"), help="the budgets' metric to scale on")
+    p.add_argument("--risk-dir", help="cr-strat risk's outputs of the day: each strategy's current DV01, CS01 or VaR")
+    p.add_argument("--allow-scale-up", action="store_true", help="scales may exceed 1")
+    p.add_argument("--bounds", help="weight bounds (strategy, min_weight, max_weight)")
+    p.add_argument("--algorithm", choices=("ccd", "newton"), default="ccd", help="the ERC solver")
+    p.add_argument("--cov-method", choices=("ewma", "sample"), default="ewma")
+    p.add_argument("--correlation", help="also write the strategies' covariance and correlation here")
+    p.add_argument("--out", required=True)
+    p.set_defaults(func=_allocate)
+
+    p = sub.add_parser("daily-report", help="the daily paper process: replay the paper book, risk, limits, the "
+                                            "pre-trade check of tomorrow's orders, the VaR back-test and a report "
+                                            "(docs/risk.md, The daily process)")
+    p.add_argument("--config", required=True, help="the paper fund's TOML configuration (daily.DailyConfig)")
+    p.add_argument("--date", required=True, help="the day, YYYY-MM-DD (a Mumbai business day)")
+    p.add_argument("--orders", help="tomorrow's proposed orders (limits.ORDER_COLUMNS)")
+    p.add_argument("--out-dir", required=True, help="the paper fund's directory: writes <out-dir>/<date>/")
+    p.set_defaults(func=_daily_report)
 
     p = sub.add_parser("rbi-releases", help="auctions, liquidity operations, money-market rates and calendars from "
                                             "saved RBI pages and RSS feeds")

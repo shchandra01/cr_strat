@@ -195,7 +195,10 @@ UNVERIFIED_RULES = (
     "the borrowing a book needs: purchases to settle less sales to settle less its net cash",
     "owned fund, Tier 1 and capital taken as NAV; OIS counterparty risk not risk-weighted",
     "a holding known only by its rating bucket takes the bucket's worst notch",
-    "the OIS hedge effect: the larger of the swaps' effect on parametric VaR and on the sum of absolute KRDs",
+    "the OIS hedge effect: the larger of the swaps' effect on parametric VaR and on the sum of absolute KRDs (each "
+    "tenor's G-sec and OIS KRDs netted)",
+    "the gate: VaR and ES parametric (EWMA) on the post-trade sensitivities; queued orders count as filled; a purchase "
+    "under a preset that cannot borrow keeps 1% of its consideration in cash for the fill and costs",
 )
 
 
@@ -1272,13 +1275,14 @@ def _gate_var(view: MetricInputs, st: str, sc: str, what: str, horizon: int, alp
 
 
 def _abs_krd_sum(sens: pd.DataFrame) -> float:
+    """The sum over key tenors of the absolute zero-rate KRD, each tenor's G-sec and OIS (and any other curve's)
+    KRDs netted (UNVERIFIED: the basis between the curves is left to the VaR half of the hedge-effect test), so that a
+    swap at the bond's own tenor reduces it and one at another tenor raises it (T26)."""
     use = sens[(sens["basis"].astype(str) == "zero")] if len(sens) else sens
-    sums: dict[tuple[str, float], float] = {}
-    for curve, tenor, value in zip(use["curve"].astype(str), pd.to_numeric(use["tenor"]),
-                                   pd.to_numeric(use["sensitivity"])):
+    sums: dict[float, float] = {}
+    for tenor, value in zip(pd.to_numeric(use["tenor"]), pd.to_numeric(use["sensitivity"])):
         if math.isfinite(float(tenor)):
-            key = (curve, float(tenor))
-            sums[key] = sums.get(key, 0.0) + float(value)
+            sums[float(tenor)] = sums.get(float(tenor), 0.0) + float(value)
     return _fsum(abs(v) for v in sums.values())
 
 
@@ -1907,3 +1911,937 @@ def write_limits(metrics: pd.DataFrame, checks: pd.DataFrame, breaches: pd.DataF
         frame.to_csv(path, index=False, date_format="%Y-%m-%d")
         paths.append(path)
     return paths
+
+
+# ---------------------------------------------------------------- the pre-trade gate (L5.6)
+
+
+ORDER_COLUMNS = ("order_id", "book", "isin", "side", "face", "months", "venue", "limit", "purpose", "special_repo_pct",
+                 "auction_date")
+CASH_BUFFER_PCT = 1.0  # UNVERIFIED: a purchase must leave this share of its consideration in cash (fill and costs)
+_DEFAULT_SCENARIOS = None
+
+
+@dataclass(eq=False)
+class PortfolioState:
+    """The book at a decision (L5.6 step 1): the risk layer's book as of ``as_of`` (``risk.RiskBook``: positions,
+    swaps and the NAV by scope), each book's net cash and borrowing, the engine's NAV history (drawdowns, the
+    stop-loss), the queued orders (counted as filled, UNVERIFIED and conservative: ``queued`` holds them as risked
+    items), the factor history (``FACTOR_CHANGE_COLUMNS``, for the parametric VaR), the stress scenarios in force, the
+    marks public by ``as_of`` (``date, isin, source, price, yield_pct, public_from``) and, in a back-test, the
+    ``returns.Snapshot`` the instruments come from."""
+
+    as_of: datetime
+    day: date
+    book: rk.RiskBook
+    ctx: rk.RiskContext
+    balance: dict[str, dict[str, float]]
+    nav_history: pd.DataFrame | None = None
+    open_orders: pd.DataFrame | None = None
+    changes: pd.DataFrame | None = None
+    scenarios: Sequence[Any] = ()
+    marks: pd.DataFrame | None = None
+    snapshot: Any = None
+    engine_positions: pd.DataFrame | None = None
+    funding: pd.DataFrame | None = None
+    board_resolution: date | None = None
+    queued: list = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+
+    @property
+    def access(self) -> rt.AccessPolicy:
+        return self.ctx.settings.access
+
+    @property
+    def strategies(self) -> dict[str, str]:
+        return dict(self.book.strategies)
+
+    def strategy_of(self, book: str) -> str:
+        return self.book.strategies.get(book, book)
+
+
+@dataclass(frozen=True, eq=False)
+class OrderRisk:
+    """An order as risk sees it (L5.6 steps 2-3): its price at its standard settlement and where the price came from,
+    the item it adds to the book (a pending ``risk.RiskPosition`` with every sensitivity of R1, or a
+    ``risk.RiskSwap``), its signed consideration, the rating notch of a credit purchase, and why it cannot be risked
+    (``refusal``, else blank)."""
+
+    order: rt.Order
+    seq: int
+    order_id: str
+    strategy: str
+    item: Any = None
+    price_source: str = ""
+    price: float = math.nan
+    settlement: date | None = None
+    consideration: float = 0.0
+    notch: float = math.nan
+    kind: str = ""
+    refusal: str = ""
+    flags: tuple[str, ...] = ()
+
+    @property
+    def isin(self) -> str:
+        return self.item.isin if self.item is not None else (self.order.isin.strip().upper() or "OIS")
+
+
+def _empty_book(ctx: rk.RiskContext, day: date, nav: Mapping, strategies: Mapping[str, str]) -> rk.RiskBook:
+    return rk.RiskBook(date=day, as_of=ctx.as_of, positions=(), swaps=(), nav=dict(nav), ois_curve=None, notes=(),
+                       curves={}, settings=ctx.risk, calendar=ctx.calendar, strategies=dict(strategies),
+                       access=ctx.settings.access.name)
+
+
+def _marks_frame(ctx: rk.RiskContext, day: date) -> pd.DataFrame:
+    """The market data's marks dated on or before ``day`` and public by ``ctx.as_of`` (a row without a time from the
+    marks' default time on its date), as ``Snapshot.marks`` shows them."""
+    cols = ["date", "isin", "source", "price", "yield_pct", "public_from"]
+    marks = ctx.market.marks
+    if marks is None or not len(marks):
+        return pd.DataFrame(columns=cols)
+    frame = rk._frame(marks, "the marks")
+    default = ctx.default_time
+    rows = []
+    for _, rec in rk._lines(frame):
+        d = rk._date(rec.get("date"), "the marks' date")
+        if d > day:
+            continue
+        public = rk.public_time(rec.get("public_from"), "the marks' public_from") if not _blank(
+            rec.get("public_from")) else (datetime.combine(d, default) if default is not None else None)
+        if public is None or public > ctx.as_of:
+            continue
+        source = _text(rec.get("source")).lower() or "traded"
+        vwap, last, clean = (_float(rec.get(k)) for k in ("vwap", "last_price", "clean_price"))
+        price = (vwap if _finite(vwap) else last if _finite(last) else clean) if source == "traded" else clean
+        rows.append({"date": d, "isin": _text(rec.get("isin")).upper(), "source": source,
+                     "price": price if _finite(price) else math.nan, "yield_pct": _float(rec.get("yield_pct")),
+                     "public_from": public})
+    return pd.DataFrame(rows, columns=cols)
+
+
+def _scenario_rows(ctx: rk.RiskContext, scenarios):
+    from cr_strat import stress as st
+    if scenarios is None:
+        return st.read_scenarios(as_of=ctx.as_of)
+    if isinstance(scenarios, (list, tuple)) and all(isinstance(r, st.ScenarioRow) for r in scenarios):
+        day = ctx.as_of.date()
+        return [r for r in scenarios if (r.available_from is None or r.available_from <= day)
+                and (r.effective_from is None or r.effective_from <= day)]
+    return st.read_scenarios(scenarios, as_of=ctx.as_of)
+
+
+def with_cost_table(ctx: rk.RiskContext) -> rk.RiskContext:
+    """``ctx`` with its engine settings' cost table parsed once (``costs.CostTable``: the same rows), so that the
+    stress and liquidity code does not read and check the cost file for every position and scenario."""
+    from dataclasses import replace
+    from cr_strat import costs as cost_rules
+    c = ctx.settings.costs
+    if isinstance(c, cost_rules.CostTable):
+        return ctx
+    table = cost_rules._as_table(cost_rules.DEFAULT_COSTS_CSV if c is None else c)
+    return replace(ctx, settings=replace(ctx.settings, costs=table))
+
+
+def _changes(ctx: rk.RiskContext) -> pd.DataFrame | None:
+    try:
+        history = rk.factor_history(ctx, None)
+    except ValueError:
+        return None
+    frame = history.frame()
+    return frame if len(frame) else None
+
+
+def state_from_snapshot(snapshot: rt.Snapshot, ctx: rk.RiskContext, *, scenarios=None, nav_history=None,
+                        board_resolution_date=None) -> PortfolioState:
+    """The state of a back-test's ``Snapshot`` at its decision (``risk.book_from_snapshot``: positions, swaps,
+    instruments as known, the NAV by book), as of the snapshot's ``as_of``: each book's net cash taken as its NAV less
+    its positions' values (receivables counted as cash, UNVERIFIED), the engine's queue (``Snapshot.open_orders``)
+    counted as filled, the factor history and marks public then. Reads the snapshot only through its accessors."""
+    from dataclasses import replace
+    c = with_cost_table(replace(ctx, as_of=snapshot.as_of))
+    book = rk.book_from_snapshot(snapshot, c)
+    positions = snapshot.positions
+    balance = {}
+    for name, nav in sorted(snapshot.nav.items()):
+        mine = positions[positions["book"] == name] if len(positions) else positions
+        value = _fsum(pd.to_numeric(mine["value"], errors="coerce").fillna(0.0)) if len(mine) else 0.0
+        balance[name] = {"net_cash": float(nav) - value, "borrowed": 0.0}
+    marks = snapshot.marks()
+    marks = marks.assign(isin=marks["isin"].astype(str).str.upper()) if len(marks) else marks
+    state = PortfolioState(as_of=snapshot.as_of, day=snapshot.day, book=book, ctx=c, balance=balance,
+                           nav_history=nav_history, open_orders=snapshot.open_orders(), changes=_changes(c),
+                           scenarios=_scenario_rows(c, scenarios), marks=marks, snapshot=snapshot,
+                           engine_positions=positions,
+                           board_resolution=rk._opt_date(board_resolution_date, "board_resolution_date")
+                           if board_resolution_date is not None else None)
+    _queue(state)
+    return state
+
+
+def state_from_result(engine, day, ctx: rk.RiskContext, *, orders=None, risk=None, scenarios=None,
+                      board_resolution_date=None) -> PortfolioState:
+    """The state of an engine run's day (``returns.BookResult``, a mapping of its frames or a ``cr-strat returns``
+    directory) as of ``ctx.as_of``: the risk book of the day's positions (``risk.risk_book``, or ``risk.book`` of a
+    ``RiskResult`` already run), each book's cash from the NAV row, the queued ``orders`` (``ORDER_COLUMNS``, orders
+    decided but not yet booked) counted as filled."""
+    d = rk.as_date(day)
+    ctx = with_cost_table(ctx)
+    ef = _frames_of(engine, ENGINE_FRAMES, "the engine's")
+    positions = ef["positions"] if ef["positions"] is not None else pd.DataFrame(columns=list(rt.POSITION_COLUMNS))
+    mine = positions[[rk._date(v, "date") == d for v in positions["date"]]] if len(positions) else positions
+    nav_rows = [r for r in ef["nav"].to_dict("records") if rk._date(r["date"], "date") == d] \
+        if ef["nav"] is not None and len(ef["nav"]) else []
+    books = sorted({_text(r.get("book")) for r in nav_rows if _text(r.get("book")) != "fund"}
+                   | {_text(b) for b in mine["book"]} if len(mine) else
+                   {_text(r.get("book")) for r in nav_rows if _text(r.get("book")) != "fund"})
+    strategies = rk._strategy_map(ctx.strategy_books, books, d)
+    nav = rk._nav_map(pd.DataFrame(nav_rows), d, books, strategies) if nav_rows else {}
+    if risk is not None and getattr(risk, "book", None) is not None:
+        book = risk.book
+    elif len(mine):
+        from dataclasses import replace
+        book = rk.risk_book(mine, replace(ctx, nav=ef["nav"], funding=ef["funding"]) if ctx.nav is None else ctx,
+                            day=d)
+    else:
+        book = _empty_book(ctx, d, nav, strategies)
+    changes = risk.history.frame() if risk is not None and getattr(risk, "history", None) is not None else \
+        _changes(ctx)
+    funding = ef["funding"]
+    if funding is not None and len(funding):
+        funding = funding[[rk._date(v, "date") == d for v in funding["date"]]]
+    state = PortfolioState(as_of=ctx.as_of, day=d, book=book, ctx=ctx, balance=_balance_from_nav(nav_rows),
+                           nav_history=ef["nav"], open_orders=read_orders(orders) if orders is not None else None,
+                           changes=changes if changes is not None and len(changes) else None,
+                           scenarios=_scenario_rows(ctx, scenarios), marks=_marks_frame(ctx, d),
+                           engine_positions=mine, funding=funding,
+                           board_resolution=rk._opt_date(board_resolution_date, "board_resolution_date")
+                           if board_resolution_date is not None else None)
+    _queue(state)
+    return state
+
+
+def read_orders(table) -> pd.DataFrame:
+    """Orders (``ORDER_COLUMNS``, the fields of ``returns.Order``): ``book``, ``side`` (buy or sell a bond; pay or
+    receive fixed for an OIS, ``isin`` blank) and ``face`` (rupees, positive) required; checked line by line."""
+    frame = rk._frame(table, "the orders")
+    rk._check_columns(frame, ("book", "side", "face"), ORDER_COLUMNS, "the orders")
+    unknown = [c for c in frame.columns if c not in ORDER_COLUMNS]
+    if unknown:
+        raise ValueError(f"the orders have unknown columns {unknown}{_closest(unknown[0], ORDER_COLUMNS)}")
+    rows = []
+    for n, rec in rk._lines(frame):
+        where = f"the orders line {n}"
+        side = _text(rec.get("side")).lower()
+        isin = _text(rec.get("isin")).upper()
+        if isin and side not in ("buy", "sell"):
+            raise ValueError(f"{where}: a bond order's side is buy or sell, not {rec.get('side')!r}")
+        if not isin and side not in ("pay", "receive"):
+            raise ValueError(f"{where}: an OIS order (isin blank) is pay or receive fixed, not {rec.get('side')!r}")
+        face = rk._num(rec.get("face"), f"{where}: face")
+        if not face > 0:
+            raise ValueError(f"{where}: face must be a positive number of rupees, not {rec.get('face')!r}")
+        months = rk._num(rec.get("months"), f"{where}: months", blank=math.nan)
+        if not isin and not (months >= 1 and months == int(months)):
+            raise ValueError(f"{where}: an OIS order needs months (a whole number of at least 1)")
+        if not _text(rec.get("book")):
+            raise ValueError(f"{where}: book is blank")
+        rows.append({"order_id": _text(rec.get("order_id")), "book": _text(rec.get("book")), "isin": isin,
+                     "side": side, "face": face, "months": int(months) if math.isfinite(months) else None,
+                     "venue": _text(rec.get("venue")).lower() or "ndsom",
+                     "limit": rk._num(rec.get("limit"), f"{where}: limit", blank=math.nan),
+                     "purpose": _text(rec.get("purpose")).lower() or "hedge",
+                     "special_repo_pct": rk._num(rec.get("special_repo_pct"), f"{where}: special_repo_pct",
+                                                 blank=math.nan),
+                     "auction_date": rk._opt_date(rec.get("auction_date"), f"{where}: auction_date")})
+    return pd.DataFrame(rows, columns=list(ORDER_COLUMNS))
+
+
+def orders_from_frame(table) -> list[rt.Order]:
+    """``returns.Order`` objects from an orders table (``read_orders``), in its row order."""
+    out = []
+    for rec in read_orders(table).to_dict("records"):
+        out.append(rt.Order(book=rec["book"], side=rec["side"], face=float(rec["face"]), isin=rec["isin"],
+                            months=rec["months"], venue=rec["venue"],
+                            limit=None if not _finite(rec["limit"]) else float(rec["limit"]), purpose=rec["purpose"],
+                            special_repo_pct=None if not _finite(rec["special_repo_pct"])
+                            else float(rec["special_repo_pct"]),
+                            auction_date=rec["auction_date"], order_id=rec["order_id"]))
+    return out
+
+
+def _queue(state: PortfolioState) -> None:
+    """The queued orders as risked items (counted as filled)."""
+    table = state.open_orders
+    if table is None or not len(table):
+        return
+    for k, rec in enumerate(table.to_dict("records"), start=1):
+        months = rec.get("months")
+        order = rt.Order(book=_text(rec.get("book")), side=_text(rec.get("side")), face=float(rec.get("face")),
+                         isin=_text(rec.get("isin")), months=None if _blank(months) else int(float(months)),
+                         venue=_text(rec.get("venue")) or "ndsom", purpose=_text(rec.get("purpose")) or "hedge",
+                         order_id=_text(rec.get("order_id")) or f"Q{k:06d}",
+                         auction_date=rk._opt_date(rec.get("auction_date"), "auction_date")
+                         if not _blank(rec.get("auction_date")) else None)
+        risked = order_risk(state, order, seq=-k)
+        if risked.refusal:
+            state.notes.append(f"queued order {risked.order_id} not counted: {risked.refusal}")
+        else:
+            state.queued.append(risked)
+
+
+def _instrument(state: PortfolioState, isin: str):
+    if state.snapshot is not None:
+        return state.snapshot.instrument(isin)
+    ctx = state.ctx
+    return rt.instruments_as_known(ctx.market, ctx.settings, [isin], ctx.as_of, terms=ctx.terms)[isin]
+
+
+def _price_for(inst, y: float, s: date) -> tuple[float, float]:
+    """(clean, dirty) of the bond at yield ``y`` for settlement ``s``."""
+    bond = inst.bond
+    from cr_strat.bonds import DiscountInstrument
+    if isinstance(bond, DiscountInstrument):
+        p = bond.price(y, s, rounded=False)
+        return p, p
+    return bond.clean_price(y, s), bond.dirty_price(y, s)
+
+
+def _yield_of(inst, clean: float, s: date) -> float:
+    from cr_strat.bonds import DiscountInstrument
+    bond = inst.bond
+    if isinstance(bond, DiscountInstrument):
+        return bond.yield_from_price(clean, s)
+    return bond.yield_from_price(clean, s)
+
+
+def _mark_yield(state: PortfolioState, inst) -> tuple[float, str, date] | None:
+    """(yield, source, mark date) of the latest traded or valuation mark of ``inst`` public by ``as_of``, restated
+    from its standard settlement (a security not yet issued: its issue date), or None."""
+    marks = state.marks
+    if marks is None or not len(marks):
+        return None
+    rows = marks[marks["isin"] == inst.isin]
+    if not len(rows):
+        return None
+    rows = rows.assign(_o=rows["source"].map({"traded": 0, "valuation": 1}).fillna(2))
+    rows = rows.sort_values(["date", "_o"], ascending=[False, True], kind="mergesort")
+    cal = state.ctx.calendar.lenient()
+    for rec in rows.to_dict("records"):
+        if rec["source"] not in ("traded", "valuation"):
+            continue
+        d = rec["date"] if isinstance(rec["date"], date) else rk._date(rec["date"], "the marks' date")
+        s_m = cal.settlement_date(d, inst.lag)
+        if inst.issue_date is not None and s_m < inst.issue_date:
+            s_m = inst.issue_date
+        try:
+            if _finite(rec.get("price")):
+                return _yield_of(inst, float(rec["price"]), s_m), rec["source"], d
+            if _finite(rec.get("yield_pct")):
+                return float(rec["yield_pct"]), rec["source"], d
+        except ValueError:
+            continue
+    return None
+
+
+def _model_yield(state: PortfolioState, inst, s: date) -> tuple[float, str] | None:
+    """The model yield of ``inst`` for settlement ``s`` (its reference curve of the day public by ``as_of``, plus its
+    last residual public then, from the residual history), or None."""
+    ctx = state.ctx
+    name = rk._reference_name(inst.kind, ctx)
+    if name is None or ctx.market.residual_history is None:
+        return None
+    table = ctx.market.ois_curves if name == "ois" else (ctx.market.curves or {}).get(name)
+    curve, _, _ = rk._curve_of_day(table, state.day, ctx.as_of, ctx.default_time)
+    if curve is None or rk.as_date(curve.valuation_date) > s:
+        return None
+    frame = rk._frame(ctx.market.residual_history, "the residual history")
+    if not {"date", "isin", "resid_yield_bp"} <= set(frame.columns):
+        return None
+    best = None
+    cal = ctx.calendar.lenient()
+    for rec in frame.to_dict("records"):
+        if _text(rec.get("isin")).upper() != inst.isin or _blank(rec.get("resid_yield_bp")):
+            continue
+        settle = rk._date(rec.get("date"), "the residual history's date")
+        public = rk.public_time(rec.get("public_from"), "public_from") if not _blank(rec.get("public_from")) else (
+            datetime.combine(cal.add_business_days(settle, -1), ctx.default_time) if ctx.default_time else None)
+        if public is None or public > ctx.as_of or settle > s:
+            continue
+        if best is None or settle > best[0]:
+            best = (settle, float(rec["resid_yield_bp"]) / 100)
+    if best is None:
+        return None
+    try:
+        m = rt.model_yield(rt.seen_from(curve, s), inst.bond, s)
+    except ValueError:
+        return None
+    return m + best[1], f"model (curve {name} plus the residual of {best[0]})"
+
+
+def _liquidity_of(ctx: rk.RiskContext, inst, day: date) -> str:
+    table = ctx.market.liquidity
+    best = None
+    if table is not None and len(table):
+        frame = rk._frame(table, "the liquidity classes")
+        for rec in frame.to_dict("records"):
+            if _text(rec.get("isin")).upper() != inst.isin:
+                continue
+            when = rk._date(rec.get("effective_date"), "the liquidity classes' effective_date")
+            if when <= day and (best is None or when > best[0]):
+                best = (when, _text(rec.get("liquidity")).lower().replace("-", "_"))
+    return best[1] if best is not None else (inst.liquidity or "")
+
+
+def _assembled(state: PortfolioState, bond_rows: list, swap_rows: list, insts: Mapping, terms: Mapping):
+    return rk._assemble(state.day, state.ctx, bond_rows, swap_rows, insts, terms, state.book.strategies,
+                        state.book.nav)
+
+
+def order_risk(state: PortfolioState, order: rt.Order, *, seq: int = 0) -> OrderRisk:
+    """The order as risk sees it at the decision (L5.6 steps 2-3): a bond order priced at its standard settlement
+    (the business day after the decision day, then the bond's settlement lag; an auction order the auction's
+    settlement) at the yield of its latest traded or valuation mark public by ``as_of``, else at the model yield (the
+    day's reference curve plus its last public residual, flagged), else refused (no public price); an OIS at the par
+    rate of the day's OIS curve public by ``as_of``. The order becomes a pending position (or a swap) of its book
+    with every sensitivity of the risk layer (``risk._assemble``, the code the end-of-day run uses)."""
+    if not isinstance(order, rt.Order):
+        raise TypeError(f"an order must be a returns.Order, not {type(order).__name__}")
+    ctx = state.ctx
+    oid = order.order_id or ""
+    strategy = state.strategy_of(order.book)
+    side = order.side.strip().lower()
+    base = {"order": order, "seq": seq, "order_id": oid, "strategy": strategy}
+    if not (isinstance(order.face, (int, float)) and math.isfinite(order.face) and order.face > 0):
+        return OrderRisk(**base, refusal=f"face must be a positive number of rupees, not {order.face!r}")
+    cal = ctx.calendar.lenient()
+    fill_day = cal.add_business_days(state.day, 1)
+    if not order.isin:
+        return _swap_order(state, order, base, side, fill_day)
+    isin = order.isin.strip().upper()
+    if side not in ("buy", "sell"):
+        return OrderRisk(**base, refusal=f"a bond order's side is buy or sell, not {order.side!r}")
+    try:
+        inst = _instrument(state, isin)
+    except (ValueError, TypeError, KeyError) as exc:
+        return OrderRisk(**base, refusal=f"{isin} cannot be risked as known at {ctx.as_of:%Y-%m-%d %H:%M}: {exc}")
+    sign = 1 if side == "buy" else -1
+    if order.venue in ("auction", "auction_nc"):
+        settle = _auction_settlement(ctx, isin, order.auction_date)
+        if settle is None:
+            return OrderRisk(**base, kind=inst.kind, refusal=f"no auction of {isin} on {order.auction_date} in the "
+                                                             "market data's auction table")
+    else:
+        settle = cal.settlement_date(fill_day, inst.lag)
+        if inst.issue_date is not None and settle < inst.issue_date:
+            settle = inst.issue_date
+    if settle >= inst.maturity:
+        return OrderRisk(**base, kind=inst.kind, refusal=f"{isin} matures on {inst.maturity}: nothing settles on "
+                                                         f"{settle}")
+    flags: list[str] = []
+    found = _mark_yield(state, inst)
+    if found is not None:
+        y, source, mark_day = found
+        age = max(len(cal.business_days(mark_day, state.day)) - 1, 0)
+        if age:
+            flags.append(f"mark_age_{age}d")
+    else:
+        model = _model_yield(state, inst, settle)
+        if model is None:
+            return OrderRisk(**base, kind=inst.kind, refusal=f"no public price for {isin} by "
+                                                             f"{ctx.as_of:%Y-%m-%d %H:%M} (no traded or valuation mark, "
+                                                             "and no model price: curve and residual)")
+        y, source = model
+        age = 0
+        flags.append("model_price")
+    try:
+        clean, dirty = _price_for(inst, y, settle)
+    except ValueError as exc:
+        return OrderRisk(**base, kind=inst.kind, refusal=f"{isin} cannot be priced for {settle}: {exc}")
+    face = sign * float(order.face)
+    units = face / 100
+    from cr_strat.floating import GoiFloatingRateBond, index_dv01
+    dv01 = units * (index_dv01(inst.bond, settle, 0.0, index_pct=y) if isinstance(inst.bond, GoiFloatingRateBond)
+                    else inst.bond.dv01(y, settle))
+    rec = {"date": state.day, "book": order.book, "isin": isin, "kind": inst.kind, "state": "pending", "face": face,
+           "settlement_date": settle, "clean_mark": clean, "mark_source": source.split(" ")[0], "mark_age_days": age,
+           "yield_pct": y, "accrued": 0.0, "value": 0.0, "dv01": dv01, "bucket": "",
+           "liquidity": _liquidity_of(ctx, inst, state.day), "haircut_pct": "", "funded": "", "stale_warning": False,
+           "extrapolated": False, "calendar_projected": False, "notes": f"order {oid or seq}"}
+    try:
+        item = _assembled(state, [rec], [], {isin: inst}, {}).positions[0]
+    except ValueError as exc:
+        return OrderRisk(**base, kind=inst.kind, refusal=f"{isin} cannot be risked: {exc}")
+    notch = math.nan
+    if inst.kind in rk.CREDIT_KINDS:
+        notch, _ = _notch_of(_rating_view(state), {"isin": isin, "issuer_id": item.issuer_id,
+                                                   "rating_bucket": item.rating_bucket or ""})
+    return OrderRisk(**base, item=item, price_source=source, price=clean, settlement=settle,
+                     consideration=units * dirty, notch=notch, kind=inst.kind, flags=tuple(flags))
+
+
+def _rating_view(state: PortfolioState) -> MetricInputs:
+    return MetricInputs(day=state.day, as_of=state.as_of, access=state.access, positions=pd.DataFrame(),
+                        nav={}, strategies={}, ratings=rk._ratings_frame(state.ctx.market.ratings))
+
+
+def _auction_settlement(ctx: rk.RiskContext, isin: str, day) -> date | None:
+    table = ctx.market.auctions
+    if table is None or not len(table) or day is None:
+        return None
+    for rec in table.to_dict("records"):
+        if _text(rec.get("isin")).upper() == isin and rk._opt_date(rec.get("auction_date"), "auction_date") == \
+                rk.as_date(day):
+            return rk._opt_date(rec.get("settlement_date"), "settlement_date")
+    return None
+
+
+def _swap_order(state: PortfolioState, order: rt.Order, base: dict, side: str, fill_day: date) -> OrderRisk:
+    from cr_strat.ois import MIBOR_OIS, OisSwap, effective_date, ois_npv, ois_par_rate
+    ctx = state.ctx
+    if side not in ("pay", "receive"):
+        return OrderRisk(**base, kind="ois", refusal=f"an OIS order's side is pay or receive fixed, not "
+                                                     f"{order.side!r}")
+    if not order.months or int(order.months) < 1:
+        return OrderRisk(**base, kind="ois", refusal="an OIS order needs months (its tenor)")
+    curve, day, _ = rk._curve_of_day(ctx.market.ois_curves, state.day, ctx.as_of, ctx.default_time)
+    if curve is None:
+        return OrderRisk(**base, kind="ois", refusal=f"no OIS curve of {state.day} or before public by "
+                                                     f"{ctx.as_of:%Y-%m-%d %H:%M} to price the swap")
+    if day is not None and day < state.day:
+        curve = rt.rolled(curve, state.day)
+    cal = ctx.calendar
+    effective = effective_date(fill_day, MIBOR_OIS, cal.lenient())
+    try:
+        rate = ois_par_rate(curve, effective, int(order.months), MIBOR_OIS, cal.lenient())
+    except ValueError as exc:
+        return OrderRisk(**base, kind="ois", refusal=f"the OIS curve cannot price a {order.months}-month swap: {exc}")
+    pay = side == "pay"
+    tid = base["order_id"] or f"G{abs(base['seq']):06d}"
+    swap = OisSwap(effective=effective, months=int(order.months), fixed_rate_pct=rate, notional=float(order.face),
+                   pay_fixed=pay)
+    val = ois_npv(rk._plain(curve), swap, fixings=rk._fixings_as_of(ctx), calendar=cal)
+    rec = {"date": state.day, "book": order.book, "isin": f"OIS:{tid}", "kind": "ois", "state": "ois",
+           "face": -float(order.face) if pay else float(order.face), "settlement_date": effective,
+           "clean_mark": rate, "mark_source": "par_rate", "mark_age_days": 0, "yield_pct": rate, "accrued": 0.0,
+           "value": val.npv, "dv01": val.dv01}
+    terms = {tid: {"trade_id": tid, "months": int(order.months), "pay_fixed": pay,
+                   "purpose": (order.purpose or "hedge").lower()}}
+    try:
+        item = _assembled(state, [], [rec], {}, terms).swaps[0]
+    except ValueError as exc:
+        return OrderRisk(**base, kind="ois", refusal=f"the swap cannot be risked: {exc}")
+    return OrderRisk(**base, item=item, price_source="par_rate", price=rate, settlement=effective,
+                     consideration=0.0, kind="ois", flags=("priced_at_the_decision_day_par_rate",))
+
+
+def _book_with(book: rk.RiskBook, items: Sequence[OrderRisk]) -> rk.RiskBook:
+    from dataclasses import replace
+    positions = [*book.positions, *(o.item for o in items if isinstance(o.item, rk.RiskPosition))]
+    swaps = [*book.swaps, *(o.item for o in items if isinstance(o.item, rk.RiskSwap))]
+    positions.sort(key=lambda p: (p.book, p.isin, p.state, p.settlement))
+    swaps.sort(key=lambda s: (s.book, s.isin))
+    curves = dict(book.curves)
+    for o in items:
+        if isinstance(o.item, rk.RiskPosition) and o.item.reference and o.item.reference not in curves:
+            curves[o.item.reference] = o.item.curve
+    return replace(book, positions=tuple(positions), swaps=tuple(swaps), curves=curves)
+
+
+def _stress_rows(state: PortfolioState, book: rk.RiskBook) -> pd.DataFrame:
+    from cr_strat import stress as st
+    sctx = st.StressContext(risk=state.ctx)
+    rows = []
+    for _, srows in st.scenarios_by_id(state.scenarios).items():
+        rows.extend(st.apply_scenario(book, srows, sctx))
+    return pd.DataFrame(rows, columns=list(st.STRESS_POSITION_COLUMNS))
+
+
+def _view(state: PortfolioState, items: Sequence[OrderRisk], cache: dict) -> MetricInputs:
+    """The ``MetricInputs`` of the state with ``items`` (queued and approved orders, and the one being checked)
+    added: every table recomputed on the book with them, the stress P&L of the state revalued in full once and each
+    order's added in full, VaR and ES by the parametric method (the gate's approximation)."""
+    from cr_strat import stress as st
+    book = _book_with(state.book, items)
+    if "stress" not in cache:
+        cache["stress"] = _stress_rows(state, state.book)
+    extra = [o for o in items if o.item is not None]
+    stress_parts = [cache["stress"]]
+    for o in extra:
+        key = ("stress", id(o))
+        if key not in cache:
+            mini = rk.RiskBook(date=state.day, as_of=state.as_of,
+                               positions=(o.item,) if isinstance(o.item, rk.RiskPosition) else (),
+                               swaps=(o.item,) if isinstance(o.item, rk.RiskSwap) else (), nav=state.book.nav,
+                               ois_curve=state.book.ois_curve, notes=(), curves=book.curves,
+                               settings=state.ctx.risk, calendar=state.book.calendar,
+                               strategies=state.book.strategies, access=state.book.access)
+            cache[key] = _stress_rows(state, mini)
+        stress_parts.append(cache[key])
+    stress_frame = pd.concat([p for p in stress_parts if len(p)], ignore_index=True) if any(
+        len(p) for p in stress_parts) else stress_parts[0]
+    liquidity, _ = st.liquidity(book, state.ctx)
+    funding_liq = st.funding_liquidity(state.funding, None, book, state.ctx, state.scenarios) \
+        if state.access.repo or state.access.treps else None
+    return MetricInputs(
+        day=state.day, as_of=state.as_of, access=state.access, positions=rk.position_risk(book),
+        nav=dict(book.nav), strategies=dict(book.strategies), sensitivities=rk.sensitivities(book),
+        key_rates=rk.key_rate_table(book), var=None, stress_positions=stress_frame,
+        scenarios=_scenario_map(None, state.scenarios), liquidity=liquidity, funding_liquidity=funding_liq,
+        nav_history=state.nav_history, balance=state.balance, engine_positions=state.engine_positions,
+        ratings=rk._ratings_frame(state.ctx.market.ratings),
+        stock=rk._frame(state.ctx.market.stock, "the stock table") if state.ctx.market.stock is not None else None,
+        issue_dates=_issue_dates(state.ctx), notified=_notified(state.ctx, state.day),
+        risk_weights=read_risk_weights(), board_resolution=state.board_resolution, changes=state.changes,
+        risk_settings=state.ctx.risk, var_method="parametric")
+
+
+def _cached_values(view: MetricInputs, cache: dict, metric: str, st: str, sc: str, selector: str, unit: str
+                   ) -> dict[str, tuple[float, bool, str]]:
+    key = (id(view), metric, st, sc, selector, unit)
+    if key not in cache:
+        cache[key] = {k: (v, ok, d) for k, v, ok, d in metric_values(view, metric, st, sc, selector, unit)}
+    return cache[key]
+
+
+def _gate_row(state: PortfolioState, risked: OrderRisk, decision: str, **extra) -> dict:
+    o = risked.order
+    return {"decision_date": state.day, "as_of": rk._iso(state.as_of), "seq": risked.seq, "order_id": risked.order_id,
+            "book": o.book, "strategy": risked.strategy, "isin": risked.isin, "side": o.side.strip().lower(),
+            "face": float(o.face) if isinstance(o.face, (int, float)) else math.nan,
+            "months": o.months if o.months is not None else math.nan, "venue": o.venue,
+            "price_source": risked.price_source, "decision": decision, "limit_id": "", "metric": "", "scope": "",
+            "pre_value": math.nan, "post_value": math.nan, "warning_level": math.nan, "hard_level": math.nan,
+            "reason": "", **extra}
+
+
+class PreTradeGate:
+    """The pre-trade gate (L5.6): ``check(state, orders)`` decides each order in the strategy's order, against the
+    state plus the orders already approved in the same decision, and returns ``(approved orders, GATE_COLUMNS
+    rows)``: the approved orders are the same objects in the same order.
+
+    First the legal form's own rules (the access preset; they refuse whatever the limits say): a sale that would leave
+    a book short under a preset without short sales (Short Sale Directions 2018 para 3), or of a kind it may not short;
+    an OIS under a preset with none, or a ``view`` under ``hedge_only`` (Rupee IRD Directions 2025 para 5.4(i)); a
+    purchase that would need borrowing under a preset that cannot borrow (no repo or TREPS; RBI counts any outside
+    liability as public funds), keeping ``cash_buffer_pct`` of its consideration for the fill and costs (UNVERIFIED,
+    1%); a when-issued position past the preset's share of the notified amount (When Issued Directions 2018 para 6).
+    Then every limit in force at ``as_of`` for the preset (the fund's table and the legal-form rows of its preset,
+    added always): an order is ``refused`` when, for a hard level of an enforced limit (``APPROVED``; ``EXAMPLE``
+    only with ``allow_example_limits``, else the gate refuses to run on them) and any key, its post-trade value is past
+    the level and worse than before it (a deeper or a new breach; an order leaving a passive breach unchanged or
+    smaller passes, and keys it does not change never block it); ``approved_with_warning`` when only a warning level
+    fails, a ``DRAFT`` limit fails, or a metric is incomplete (UNVERIFIED: missing data warns, it never blocks); a
+    rating floor ``of=purchases`` reads each credit purchase's own rating; a ``halt`` limit in breach refuses every
+    order in its scope; ``report`` limits have no gate effect. ``scales`` (``{(scope_type, scope): scale}``, the
+    drawdown de-risking of P6.4) multiply the levels of DV01, KRD, CS01, VaR and ES maxima. VaR and ES are parametric
+    on the post-trade sensitivities (EWMA, as of ``as_of``); stresses revalue the state in full once and each order in
+    full (more exact than the second-order approximation the specification allows)."""
+
+    def __init__(self, limits, ctx: rk.RiskContext, *, allow_example_limits: bool = False, scales=None,
+                 cash_buffer_pct: float = CASH_BUFFER_PCT, legal_form_rows: bool = True):
+        table = limit_table(limits) if limits is not None else pd.DataFrame(columns=[*LIMIT_COLUMNS, "origin",
+                                                                                       "line"])
+        if legal_form_rows:
+            extra = legal_form_limits(ctx.settings.access)
+            extra = extra[~extra["limit_id"].isin(set(table["limit_id"]))]
+            table = pd.concat([table, extra], ignore_index=True) if len(table) else extra.reset_index(drop=True)
+        examples = table[table["policy_status"] == "EXAMPLE"]
+        if len(examples) and not allow_example_limits:
+            raise ValueError(f"the pre-trade gate refuses to run on EXAMPLE limits ({', '.join(examples['limit_id'])}"
+                             "): they are not the fund's policy. Give the fund's approved table, or pass "
+                             "allow_example_limits=True to test with them")
+        if not (_finite(cash_buffer_pct) and cash_buffer_pct >= 0):
+            raise ValueError(f"cash_buffer_pct must be zero or more, not {cash_buffer_pct}")
+        self.limits = table
+        self.ctx = ctx
+        self.allow_example_limits = allow_example_limits
+        self.scales = dict(scales or {})
+        self.cash_buffer_pct = float(cash_buffer_pct)
+
+    def _enforced(self, rec: Mapping) -> bool:
+        if rec["policy_status"] == "APPROVED":
+            return True
+        return rec["policy_status"] == "EXAMPLE" and self.allow_example_limits
+
+    @staticmethod
+    def _preset_first(state: PortfolioState, o: rt.Order) -> dict | None:
+        """The preset's OIS rules, checked before an OIS order is priced: none allowed, or a view under
+        ``hedge_only``."""
+        access = state.access
+        if o.isin:
+            return None
+        if access.ois == "none":
+            return {"limit_id": "preset:ois", "reason": f"the access preset {access.name!r} allows no OIS"}
+        if access.ois == "hedge_only" and (o.purpose or "hedge").strip().lower() != "hedge":
+            return {"limit_id": "preset:ois_purpose",
+                    "reason": f"the access preset {access.name!r} allows OIS for hedging only (Rupee IRD Directions "
+                              f"2025 para 5.4(i)); this order says purpose {o.purpose!r}"}
+        return None
+
+    def _legal(self, state: PortfolioState, pre: MetricInputs, post: MetricInputs, risked: OrderRisk) -> list[dict]:
+        """The access preset's own rules (L5.6 step 6) as refusal reasons."""
+        access = state.access
+        o = risked.order
+        out = []
+        if risked.kind == "ois":
+            early = self._preset_first(state, o)
+            return [early] if early else []
+        item = risked.item
+        if o.side.strip().lower() == "sell" and not _when_issued_item(post, item):
+            net = _fsum(r["face"] for r in post.rows() if r["book"] == o.book and _text(r.get("isin")) == item.isin
+                        and not r["is_swap"])
+            if net < -1e-6:
+                if not access.short_sale:
+                    out.append({"limit_id": "preset:short_sale",
+                                "reason": f"selling {o.face:,.0f} of {item.isin} would leave book {o.book} short "
+                                          f"{-net:,.0f}; the access preset {access.name!r} allows no short sales "
+                                          "(Short Sale Directions 2018 para 3)"})
+                elif item.kind not in access.short_kinds:
+                    out.append({"limit_id": "preset:short_kind",
+                                "reason": f"{item.isin} is a {item.kind}; short sales are allowed only in "
+                                          f"{access.short_kinds} (Short Sale Directions 2018 para 1(b))"})
+        if not (access.repo or access.treps) and o.side.strip().lower() == "buy":
+            buffer = abs(risked.consideration) * self.cash_buffer_pct / 100
+            net, _, buys, sells = _book_cash(post, o.book)
+            need = buys + buffer - sells - (net if _finite(net) else 0.0)
+            pre_net, _, pre_buys, pre_sells = _book_cash(pre, o.book)
+            pre_need = pre_buys - pre_sells - (pre_net if _finite(pre_net) else 0.0)
+            if need > 1e-6 and need > pre_need:
+                out.append({"limit_id": "preset:no_borrowing",
+                            "reason": f"the purchase would need Rs {need:,.2f} of borrowing in book {o.book} (net cash "
+                                      f"Rs {net:,.2f}, purchases to settle Rs {buys:,.2f} with a "
+                                      f"{self.cash_buffer_pct:g}% buffer on this one, sales Rs {sells:,.2f}); the "
+                                      f"access preset {access.name!r} cannot borrow (no repo or TREPS: Repo "
+                                      "Directions 2025 para 4(1); RBI counts any outside liability as public funds)"})
+        if _when_issued_item(post, item):
+            notified = post.notified.get(item.isin)
+            if notified is None:
+                out.append({"limit_id": "preset:when_issued",
+                            "reason": f"a when-issued order in {item.isin} needs the auction's notified amount (the "
+                                      "market data's auction table) to check the When Issued Directions' limits"})
+            else:
+                net = _fsum(r["face"] for r in post.rows() if _text(r.get("isin")) == item.isin and
+                            _when_issued(post, r))
+                cap = (access.when_issued_long_pct if net > 0 else access.when_issued_short_pct) / 100 * notified * 1e7
+                if abs(net) > cap + 1e-6:
+                    out.append({"limit_id": "preset:when_issued",
+                                "reason": f"a when-issued position of Rs {net / 1e7:,.2f} crore in {item.isin} exceeds "
+                                          f"Rs {cap / 1e7:,.2f} crore (When Issued Directions 2018 para 6)"})
+        return out
+
+    def check(self, state: PortfolioState, orders: Sequence[rt.Order], *, scales=None
+              ) -> tuple[list[rt.Order], list[dict]]:
+        """``(approved orders, GATE_COLUMNS rows)`` of a decision (see the class)."""
+        scale_of = {**self.scales, **(scales or {})}
+        live = limits_in_force(self.limits, as_of=state.as_of, legal_form=state.access.name)
+        live = live[live["action"] != "report"].to_dict("records")
+        cache: dict = {}
+        approved: list[rt.Order] = []
+        accepted: list[OrderRisk] = list(state.queued)
+        rows: list[dict] = []
+        pre = _view(state, accepted, cache)
+        for seq, order in enumerate(orders, start=1):
+            if not isinstance(order, rt.Order):
+                raise TypeError(f"a strategy must return returns.Order objects, not {type(order).__name__}")
+            early = self._preset_first(state, order)
+            if early:
+                risked = OrderRisk(order=order, seq=seq, order_id=order.order_id or "",
+                                   strategy=state.strategy_of(order.book), kind="ois")
+                rows.append(_gate_row(state, risked, "refused", limit_id=early["limit_id"], reason=early["reason"]))
+                continue
+            risked = order_risk(state, order, seq=seq)
+            if risked.refusal:
+                rows.append(_gate_row(state, risked, "refused", limit_id="order", reason=risked.refusal))
+                continue
+            post = _view(state, [*accepted, risked], cache)
+            failures = [{**f, "hard": True} for f in self._legal(state, pre, post, risked)]
+            if not failures:
+                failures = self._limit_failures(state, live, pre, post, risked, scale_of, cache)
+            hard = [f for f in failures if f["hard"]]
+            decision = "refused" if hard else ("approved_with_warning" if failures else "approved")
+            if not failures:
+                rows.append(_gate_row(state, risked, decision))
+            for f in failures:
+                rows.append(_gate_row(state, risked, decision, limit_id=f.get("limit_id", ""),
+                                      metric=f.get("metric", ""), scope=f.get("scope", ""),
+                                      pre_value=f.get("pre", math.nan), post_value=f.get("post", math.nan),
+                                      warning_level=f.get("warning", math.nan), hard_level=f.get("hard_level",
+                                                                                                 math.nan),
+                                      reason=f["reason"]))
+            if not hard:
+                approved.append(order)
+                accepted.append(risked)
+                pre = post
+        return approved, rows
+
+    def _limit_failures(self, state: PortfolioState, live: list[dict], pre: MetricInputs, post: MetricInputs,
+                        risked: OrderRisk, scales: Mapping, cache: dict) -> list[dict]:
+        o = risked.order
+        touched = {("fund", "fund"), ("book", o.book), ("strategy", risked.strategy)}
+        out = []
+        for rec in live:
+            scopes = [s for s in touched if s[0] == rec["scope_type"] and (rec["scope"] in ("*", s[1]))]
+            if not scopes:
+                continue
+            enforced = self._enforced(rec)
+            tag = "" if enforced else f"{rec['policy_status']} (not enforced): "
+            for st, sc in sorted(scopes):
+                hard = _scaled(rec["hard_level"], rec, st, sc, scales)
+                warning = _scaled(rec["warning_level"], rec, st, sc, scales)
+                label = f"limit {rec['limit_id']} {rec['metric']} ({st} {sc})" if st != "fund" else \
+                    f"limit {rec['limit_id']} {rec['metric']} (fund)"
+                common = {"limit_id": rec["limit_id"], "metric": rec["metric"], "scope": f"{st} {sc}",
+                          "warning": warning, "hard_level": hard}
+                if rec["action"] == "halt":
+                    now = _cached_values(pre, cache, rec["metric"], st, sc, rec["selector"], rec["unit"])
+                    if any(ok and past(v, hard, rec["direction"]) for v, ok, _ in now.values()):
+                        out.append({**common, "hard": enforced, "reason": f"{tag}{label} is in breach and halts "
+                                                                          "every new order in its scope"})
+                        continue
+                if "of=purchases" in rec["selector"] and rec["metric"] == "rating_floor":
+                    if o.side.strip().lower() != "buy" or risked.kind not in rk.CREDIT_KINDS:
+                        continue
+                    notch = risked.notch
+                    if not _finite(notch):
+                        out.append({**common, "hard": False, "post": notch,
+                                    "reason": f"{tag}{label}: {risked.isin} has no rating as known at "
+                                              f"{state.as_of:%Y-%m-%d %H:%M}: the floor cannot be checked "
+                                              "(incomplete: a warning)"})
+                    elif past(notch, hard, rec["direction"]):
+                        out.append({**common, "hard": enforced, "post": notch,
+                                    "reason": f"{tag}{label}: the purchase is rated {_fmt(notch, 'notch')}, past the "
+                                              f"hard floor {_fmt(hard, 'notch')}"})
+                    elif past(notch, warning, rec["direction"]):
+                        out.append({**common, "hard": False, "post": notch,
+                                    "reason": f"{tag}{label}: the purchase is rated {_fmt(notch, 'notch')}, past the "
+                                              f"warning floor {_fmt(warning, 'notch')}"})
+                    continue
+                before = _cached_values(pre, cache, rec["metric"], st, sc, rec["selector"], rec["unit"])
+                after = _cached_values(post, cache, rec["metric"], st, sc, rec["selector"], rec["unit"])
+                for key, (value, ok, detail) in sorted(after.items()):
+                    if detail.startswith("not_applicable"):
+                        continue
+                    old = before.get(key)
+                    where = label + (f" [{key}]" if key else "")
+                    item = {**common, "pre": old[0] if old else math.nan, "post": value,
+                            "scope": f"{st} {sc}" + (f" [{key}]" if key else "")}
+                    if not ok:
+                        if old is not None and not old[1] and _same(old[0], value):
+                            continue  # incomplete before and unchanged: reported by the daily checks
+                        out.append({**item, "hard": False, "reason": f"{tag}{where}: incomplete ({detail}): a "
+                                                                     "warning, never a block"})
+                        continue
+                    if old is not None and old[1] and _same(old[0], value):
+                        continue  # the order does not change this key
+                    worse = old is None or not old[1] or (value > old[0] if rec["direction"] == "max"
+                                                          else value < old[0])
+                    if not worse:
+                        continue
+                    pre_text = f" (pre-trade {_fmt(old[0], rec['unit'])})" if old is not None and old[1] else \
+                        " (none before)"
+                    side = "above" if rec["direction"] == "max" else "below"
+                    if past(value, hard, rec["direction"]):
+                        out.append({**item, "hard": enforced,
+                                    "reason": f"{tag}{where}: post-trade {_fmt(value, rec['unit'])} {side} the hard "
+                                              f"{_fmt(hard, rec['unit'])}{pre_text}"})
+                    elif past(value, warning, rec["direction"]):
+                        out.append({**item, "hard": False,
+                                    "reason": f"{tag}{where}: post-trade {_fmt(value, rec['unit'])} {side} the "
+                                              f"warning {_fmt(warning, rec['unit'])}{pre_text}"})
+        return out
+
+
+def _same(a: float, b: float) -> bool:
+    if isinstance(a, float) and isinstance(b, float) and math.isnan(a) and math.isnan(b):
+        return True
+    return a == b
+
+
+def _when_issued_item(view: MetricInputs, item) -> bool:
+    if item is None or isinstance(item, rk.RiskSwap):
+        return False
+    issue = view.issue_dates.get(item.isin)
+    return issue is not None and issue > view.day
+
+
+def gate_frame(rows: Sequence[Mapping]) -> pd.DataFrame:
+    """The gate's rows as a ``GATE_COLUMNS`` frame, in decision order."""
+    return pd.DataFrame(list(rows), columns=list(GATE_COLUMNS))
+
+
+class GatedStrategy:
+    """A ``returns.Strategy`` whose orders pass a ``PreTradeGate`` before the engine sees them (D7.3): ``decide``
+    calls the inner strategy, gives its orders to the gate on the snapshot's state (``state_from_snapshot``) and
+    returns the approved ones, the same objects in the same order, so a gate that approves everything leaves every
+    engine output byte-identical. ``log`` holds every decision (``GATE_COLUMNS`` rows keyed by ``decision_date`` and
+    ``seq``, the order's place in the strategy's list that day; ``order_id`` is the strategy's own when it set one),
+    ``records`` the rows of an optional ``recorder(snapshot)`` (the day's risk, say). It reads the snapshot only
+    through its public accessors and keeps its own NAV history for the drawdown and stop-loss limits (a back-test's
+    only flow is its starting capital, UNVERIFIED reading: the first NAV seen is taken as capital). A state that
+    cannot be built refuses every order of the day, saying why; the run goes on."""
+
+    def __init__(self, inner, gate: PreTradeGate, *, recorder: Callable | None = None, board_resolution_date=None,
+                 scales_fn: Callable | None = None):
+        if not hasattr(inner, "decide"):
+            raise TypeError("inner must be a returns.Strategy (an object with decide(snapshot))")
+        self.inner = inner
+        self.gate = gate
+        self.recorder = recorder
+        self.board_resolution_date = board_resolution_date
+        self.scales_fn = scales_fn
+        self.log: list[dict] = []
+        self.records: list = []
+        self._navs: list[dict] = []
+        self._last: dict[str, float] = {}
+
+    def _record_nav(self, snapshot) -> None:
+        for name, nav in sorted(snapshot.nav.items()):
+            prev = self._last.get(name)
+            flow = float(nav) if prev is None else 0.0
+            pnl = 0.0 if prev is None else float(nav) - prev
+            self._navs.append({"date": snapshot.day, "book": name, "nav": float(nav), "flow": flow, "pnl": pnl})
+            self._last[name] = float(nav)
+
+    def decide(self, snapshot) -> list:
+        orders = list(self.inner.decide(snapshot) or [])
+        if self.recorder is not None:
+            self.records.extend(self.recorder(snapshot) or [])
+        self._record_nav(snapshot)
+        if not orders:
+            return []
+        nav_history = pd.DataFrame(self._navs, columns=["date", "book", "nav", "flow", "pnl"])
+        try:
+            state = state_from_snapshot(snapshot, self.gate.ctx, nav_history=nav_history,
+                                        board_resolution_date=self.board_resolution_date)
+        except (ValueError, TypeError, KeyError) as exc:
+            reason = f"the book cannot be risked at {snapshot.as_of:%Y-%m-%d %H:%M}: {exc}"
+            for seq, order in enumerate(orders, start=1):
+                strategy = order.book
+                self.log.append({"decision_date": snapshot.day, "as_of": rk._iso(snapshot.as_of), "seq": seq,
+                                 "order_id": order.order_id, "book": order.book, "strategy": strategy,
+                                 "isin": order.isin or "OIS", "side": order.side, "face": float(order.face),
+                                 "months": order.months if order.months is not None else math.nan,
+                                 "venue": order.venue, "price_source": "", "decision": "refused", "limit_id": "state",
+                                 "metric": "", "scope": "", "pre_value": math.nan, "post_value": math.nan,
+                                 "warning_level": math.nan, "hard_level": math.nan, "reason": reason})
+            return []
+        scales = self.scales_fn(snapshot) if self.scales_fn is not None else None
+        approved, rows = self.gate.check(state, orders, scales=scales)
+        self.log.extend(rows)
+        return approved
+
+    def log_frame(self) -> pd.DataFrame:
+        """Every decision so far (``GATE_COLUMNS``)."""
+        return gate_frame(self.log)
+
+
+def risk_recorder(ctx: rk.RiskContext) -> Callable:
+    """A ``GatedStrategy`` recorder that risks the snapshot's book each evening (``risk.book_from_snapshot``) and
+    records the fund's and each book's yield DV01, CS01 and JTD (``date, scope_type, scope, dv01, cs01, jtd``)."""
+    def record(snapshot) -> list[dict]:
+        book = rk.book_from_snapshot(snapshot, ctx)
+        summary = rk.summary_table(book)
+        total = summary[summary["dimension"] == "total"]
+        return [{"date": snapshot.day, "scope_type": r["scope_type"], "scope": r["scope"], "dv01": r["dv01_yield"],
+                 "cs01": r["cs01"], "jtd": r["jtd"]} for r in total.to_dict("records")]
+    return record
