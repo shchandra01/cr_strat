@@ -299,8 +299,11 @@ def test_refuse_only_when_worse_than_before_and_keys_not_touched_never_block():
     gate = _gate([lf.approved(hard_level=str(dv01 - 1e4), warning_level=str(dv01 - 2e4)),  # in breach already
                   lf.approved(limit_id="X2", metric="dv01", scope_type="book", scope="c", hard_level="1e12",
                               warning_level="1")], ctx)
+    # the sale of Rs 1 crore (DV01 about Rs 6,400 per bp) leaves the fund past the hard level, Rs 10,000 per bp
+    # below its DV01: a Rs 5 crore sale (about Rs 32,000) would cure the breach, and the third order would then only
+    # warn (the gate's cache once read a freed view's values and refused it all the same)
     orders = [rt.Order(book="b", side="buy", face=5e7, isin="GS2036"),   # deeper: refused
-              rt.Order(book="b", side="sell", face=5e7, isin="GS2036"),  # smaller: allowed
+              rt.Order(book="b", side="sell", face=1e7, isin="GS2036"),  # smaller, still in breach: allowed
               rt.Order(book="c", side="buy", face=5e7, isin="GS2031")]   # deeper again; and warns on X2
     approved, rows = gate.check(st, orders)
     decisions, frame = _decisions(rows)

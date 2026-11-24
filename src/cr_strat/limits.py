@@ -592,6 +592,7 @@ class MetricInputs:
     notes: tuple[str, ...] = ()
     _rows: list | None = None
     _wide: Any = None
+    _values: dict = field(default_factory=dict)  # the gate's metric values of this view, kept on the view itself
 
     @property
     def borrows(self) -> bool:
@@ -2492,7 +2493,7 @@ def _view(state: PortfolioState, items: Sequence[OrderRisk], cache: dict) -> Met
     extra = [o for o in items if o.item is not None]
     stress_parts = [cache["stress"]]
     for o in extra:
-        key = ("stress", id(o))
+        key = ("stress", o)  # the order itself (hashed by identity and kept alive by the cache), never its id
         if key not in cache:
             mini = rk.RiskBook(date=state.day, as_of=state.as_of,
                                positions=(o.item,) if isinstance(o.item, rk.RiskPosition) else (),
@@ -2522,10 +2523,12 @@ def _view(state: PortfolioState, items: Sequence[OrderRisk], cache: dict) -> Met
 
 def _cached_values(view: MetricInputs, cache: dict, metric: str, st: str, sc: str, selector: str, unit: str
                    ) -> dict[str, tuple[float, bool, str]]:
-    key = (id(view), metric, st, sc, selector, unit)
-    if key not in cache:
-        cache[key] = {k: (v, ok, d) for k, v, ok, d in metric_values(view, metric, st, sc, selector, unit)}
-    return cache[key]
+    """A metric's values on a view, computed once per view: kept on the view itself, never keyed by ``id(view)``
+    (a freed view's id is reused by the next one, which would then read the dead view's values)."""
+    key = (metric, st, sc, selector, unit)
+    if key not in view._values:
+        view._values[key] = {k: (v, ok, d) for k, v, ok, d in metric_values(view, metric, st, sc, selector, unit)}
+    return view._values[key]
 
 
 def _gate_row(state: PortfolioState, risked: OrderRisk, decision: str, **extra) -> dict:

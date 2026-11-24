@@ -100,7 +100,7 @@ from cr_strat.corporates import CorporateBond, public_time
 from cr_strat.floating import GoiFloatingRateBond, index_dv01, next_reset, price_from_dm, spread_dv01
 from cr_strat.issuance import tenor_bucket
 from cr_strat.ois import OisCurve, OisSwap, as_time, ois_npv, ois_schedule
-from cr_strat.rating_scale import parse_rating, rating_bucket
+from cr_strat.rating_scale import LT_NOTCH, parse_rating, rating_bucket
 
 # ---------------------------------------------------------------- conventions (each UNVERIFIED unless said)
 
@@ -132,12 +132,19 @@ SPREAD_CLASSES = ("sdl_spread", "corp", "cd", "frb_dm", "tbill182", "resid")
 CREDIT_KINDS = frozenset({"corporate", "cp", "cd"})  # kinds with a credit spread factor, CS01 and JTD
 GOI_KINDS = frozenset({"gsec", "green", "special", "tbill", "cmb", "strips", "frb"})
 # the market lines of positions held from the previous close: the hypothetical P&L of a back-test (MAR32.18; this
-# engine's reading UNVERIFIED); every other line (trades, costs, funding, the cash benchmark, memo lines) is left out
-HYPOTHETICAL_LINES = ("accrual", "pull_to_par", "coupon_reset", "roll_down", "rich_cheap", "convexity",
-                      "price_unattributed", "unexplained", "ois_carry", "ois_roll_down", "ois_settlement_rounding")
+# engine's reading UNVERIFIED); every other line (trades, costs, funding, the cash benchmark, memo lines) is left out.
+# The time effects (accrual, pull to par, roll-down, OIS carry and roll-down) are left out too by default
+# (time_effects="exclude"): the VaR moves market factors only, and MAR10.32 and MAR32.27 (verified) ask that time
+# effects be treated alike in the hypothetical P&L and the risk model's P&L
+HYPOTHETICAL_LINES = ("coupon_reset", "rich_cheap", "convexity", "price_unattributed", "unexplained",
+                      "ois_settlement_rounding")
+TIME_EFFECT_LINES = ("accrual", "pull_to_par", "roll_down", "ois_carry", "ois_roll_down")
+TIME_EFFECTS = ("exclude", "include")
 HYPOTHETICAL_PREFIXES = ("curve_", "krd_", "ois_curve_", "ois_krd_")
-# liquidity horizons of MAR33.12 Table 2 (verified) mapped to the factor classes here (UNVERIFIED mapping)
-LIQUIDITY_HORIZONS = {"gsec": 10, "sdl": 10, "ois": 10, "sdl_spread": 10, "tbill182": 10, "resid": 10, "frb_dm": 20,
+# liquidity horizons of MAR33.12 Table 2 (verified) mapped to the factor classes here (UNVERIFIED mapping): INR key
+# rates (the domestic currency) 10 days; SDL spreads, a G-sec's residual to its curve and FRB margins as sovereign IG
+# credit spreads, 20; corporate and CD spreads 40 (IG) and 60 (below BBB-)
+LIQUIDITY_HORIZONS = {"gsec": 10, "sdl": 10, "ois": 10, "sdl_spread": 20, "tbill182": 10, "resid": 20, "frb_dm": 20,
                       "cd": 40, "corp": 40, "corp_hy": 60}
 LH_STEPS = (10, 20, 40, 60, 120)  # MAR33.12 (verified)
 MAR32_MULTIPLIERS = {0: 1.50, 1: 1.50, 2: 1.50, 3: 1.50, 4: 1.50, 5: 1.70, 6: 1.76, 7: 1.83, 8: 1.88, 9: 1.92}
@@ -145,6 +152,27 @@ MAR32_RED_MULTIPLIER = 2.00  # 10 or more exceptions at 250 observations (MAR32.
 GREEN_LIMIT, AMBER_LIMIT = 0.95, 0.9999  # MAR99.17 (verified): zones from the cumulative binomial probability
 IG_BUCKETS = ("AAA", "AA+", "AA", "AA-", "A+", "A", "A-", "BBB")  # national scale AAA to BBB- read as IG (U)
 DEFAULT_TIME = time(18, 0)  # a curve or factor row without a public time counts from 18:00 on its date (the engine's)
+# a short-term grade read as the worst long-term grade the agencies pair it with (UNVERIFIED, partly from a search
+# summary of ICRA's long-term/short-term linkage: AAA to AA- always A1+, A+ either A1+ or A1), used only when neither
+# the ISIN's nor the issuer's rows give a long-term grade; flagged rating_from_short_term
+ST_TO_LT = {"A1+": "A+", "A1": "A-", "A2+": "BBB+", "A2": "BBB", "A3+": "BBB-", "A3": "BBB-", "A4+": "BB", "A4": "C",
+            "D": "D"}
+# FRTB's credit-spread buckets (MAR21.51 Table 3, verified) by the names the issuer table's frtb_sector takes; a fund's
+# own sector names read as FRTB's (UNVERIFIED); any other is FRTB's 'other' bucket
+FRTB_SECTORS = ("sovereign", "local_government", "financials", "basic_materials_energy_industrials",
+                "consumer_transport", "technology_telecoms", "health_care_utilities", "covered")
+SECTOR_FRTB = {"bank": "financials", "psu_bank": "financials", "nbfc": "financials", "hfc": "financials",
+               "pfi": "financials", "insurance": "financials"}
+# what the VaR leaves out (R2.7), written to every run's notes and the daily report
+VAR_LEAVES_OUT = (
+    "carry and funding: the VaR moves market factors only (the back-test's hypothetical P&L leaves time effects out "
+    "to match)",
+    "default: jump to default is reported apart (jtd.csv), never in the VaR",
+    "exit costs: the liquidity-adjusted VaR adds the stressed exit cost (liquidity_summary.csv lvar)",
+    "the option value of callable bonds: valued to maturity (flagged callable_to_maturity)",
+    "bond-specific basis: a G-sec's or SDL's rich/cheap to its curve unless residual factors are on (resid:, "
+    "flagged no_residual_factor), and an issuer's spread beyond its rating and tenor bucket",
+)
 
 # ---------------------------------------------------------------- layouts
 
@@ -183,7 +211,7 @@ BACKTEST_SUMMARY_COLUMNS = ("end", "scope_type", "scope", "method", "alpha", "ob
                             "cumulative_probability", "zone", "multiplier", "notes")
 # tables kept by the user (data/README.md)
 ISSUER_COLUMNS = ("issuer_id", "name", "group_id", "group_name", "sector", "seniority", "effective_from",
-                  "effective_to", "source")
+                  "effective_to", "source", "isin_prefix", "frtb_sector")
 STRATEGY_BOOK_COLUMNS = ("book", "strategy", "effective_from")
 PROXY_COLUMNS = ("factor", "proxy", "scale", "source")
 SENIORITY_COLUMNS = ("isin", "seniority", "source")
@@ -460,9 +488,13 @@ def _check_columns(frame: pd.DataFrame, required: Sequence[str], columns: Sequen
 
 def read_issuers(table) -> pd.DataFrame:
     """The issuer table (``ISSUER_COLUMNS``): each row with ``issuer_id`` and ``effective_from`` (blank: always), an
-    optional ``effective_to`` (excluded), ``group_id`` (blank: the issuer is its own group), ``sector`` and
-    ``seniority`` (the default rank of its bonds: senior, subordinated or covered). Two rows of an issuer in force on
-    one day are refused, as are unknown seniorities, naming the line."""
+    optional ``effective_to`` (excluded), ``group_id`` (blank: the issuer is its own group), ``sector`` (the fund's own
+    names, free: ``psu_bank`` sets the NBFC risk weight of a public sector bank's bonds), ``seniority`` (the default
+    rank of its bonds: senior, subordinated or covered), ``isin_prefix`` (optional: the ISINs whose first characters
+    these are belong to the issuer, so that its CP and CD, which carry no terms row, join its bonds: ``INE000A`` for
+    ``INE000A14ZZ9``; several prefixes joined by ``|``) and ``frtb_sector`` (optional: FRTB's credit-spread bucket,
+    one of ``FRTB_SECTORS``; blank: read from ``sector``). Two rows of an issuer in force on one day, a prefix given
+    to two issuers in force on one day, unknown seniorities and FRTB sectors are refused, naming the line."""
     frame = _frame(table, "the issuer table")
     _check_columns(frame, ("issuer_id",), ISSUER_COLUMNS, "the issuer table")
     rows = []
@@ -478,16 +510,31 @@ def read_issuers(table) -> pd.DataFrame:
         seniority = _text(rec.get("seniority")).lower()
         if seniority and seniority not in SENIORITIES:
             raise ValueError(f"{where}: seniority {rec.get('seniority')!r} is not one of {SENIORITIES}")
+        prefixes = tuple(p.strip().upper() for p in _text(rec.get("isin_prefix")).split("|") if p.strip())
+        bad = [p for p in prefixes if not (2 <= len(p) <= 11 and p.isalnum())]
+        if bad:
+            raise ValueError(f"{where}: isin_prefix {bad[0]!r} is not the first 2 to 11 letters or digits of an ISIN")
+        frtb = _text(rec.get("frtb_sector")).lower()
+        if frtb and frtb not in (*FRTB_SECTORS, "other"):
+            raise ValueError(f"{where}: frtb_sector {rec.get('frtb_sector')!r} is not one of FRTB's buckets "
+                             f"{(*FRTB_SECTORS, 'other')}")
         rows.append({"issuer_id": issuer, "name": _text(rec.get("name")), "group_id": _text(rec.get("group_id")),
                      "group_name": _text(rec.get("group_name")), "sector": _text(rec.get("sector")).lower(),
                      "seniority": seniority, "effective_from": start, "effective_to": end,
-                     "source": _text(rec.get("source")), "line": n})
+                     "source": _text(rec.get("source")), "isin_prefix": "|".join(prefixes), "frtb_sector": frtb,
+                     "line": n})
     out = pd.DataFrame(rows, columns=[*ISSUER_COLUMNS, "line"])
     for issuer, group in out.groupby("issuer_id", sort=True):
         spans = sorted(zip(group["effective_from"], group["effective_to"], group["line"]))
         for (a0, a1, la), (b0, _, lb) in zip(spans, spans[1:]):
             if b0 < a1:
                 raise ValueError(f"the issuer table gives {issuer} two rows in force from {b0} (lines {la} and {lb})")
+    claims = sorted((p, r["effective_from"], r["effective_to"], r["line"], r["issuer_id"])
+                    for r in out.to_dict("records") for p in r["isin_prefix"].split("|") if p)
+    for (p0, a0, a1, la, ia), (p1, b0, _, lb, ib) in zip(claims, claims[1:]):
+        if p0 == p1 and ia != ib and b0 < a1:
+            raise ValueError(f"the issuer table gives the ISIN prefix {p0} to {ia} (line {la}) and to {ib} (line {lb}) "
+                             f"from {b0}")
     return out.sort_values(["issuer_id", "effective_from"], kind="mergesort").reset_index(drop=True)
 
 
@@ -573,6 +620,23 @@ def _issuer_rows(table, d: date) -> dict[str, dict]:
     return {r["issuer_id"]: r for r in live.to_dict("records")}
 
 
+def issuer_prefixes(issuers: Mapping[str, Mapping], corp_terms: Mapping[str, Mapping]
+                    ) -> tuple[dict[str, str], dict[str, str], tuple[str, ...]]:
+    """``(given, inferred, ambiguous)`` ISIN prefixes of issuers: ``given`` from the issuer table's ``isin_prefix``
+    (rows in force), ``inferred`` from the corporate terms (an Indian corporate ISIN's first seven characters, ``INE``
+    and the issuer's code, mapped to its row's ``issuer_id``: UNVERIFIED reading of the ISIN, flagged where used), and
+    the inferred prefixes two terms rows give to different issuers (not used)."""
+    given = {p: issuer for issuer, rec in sorted(issuers.items())
+             for p in _text(rec.get("isin_prefix")).split("|") if p}
+    seen: dict[str, set[str]] = {}
+    for isin, rec in sorted(corp_terms.items()):
+        issuer = _text(rec.get("issuer_id"))
+        if issuer and isin.startswith("INE") and len(isin) == 12:
+            seen.setdefault(isin[:7], set()).add(issuer)
+    inferred = {p: next(iter(ids)) for p, ids in sorted(seen.items()) if len(ids) == 1}
+    return given, inferred, tuple(sorted(p for p, ids in seen.items() if len(ids) > 1))
+
+
 # ---------------------------------------------------------------- curves and ratings as known at a time
 
 
@@ -622,34 +686,68 @@ def _ratings_frame(ratings) -> pd.DataFrame | None:
     return frame
 
 
-def rating_as_known(ratings: pd.DataFrame | None, isin: str, issuer_id: str, as_of: datetime
-                    ) -> tuple[str | None, int | None]:
-    """(bucket, notch) of the worst of each agency's latest long-term rating public by ``as_of``: rows of the ISIN, else
-    of its issuer (the engine's rule); a rating known only by its date counts from 23:59:59 that day (UNVERIFIED,
-    ``corporates.public_time``). ``(None, None)`` without one."""
-    if ratings is None or not len(ratings):
-        return None, None
-    frame = ratings
-    rows = frame.iloc[0:0]
-    if "isin" in frame:
-        rows = frame[frame["isin"].map(_text).str.upper() == isin]
-    if not len(rows) and issuer_id and "issuer_id" in frame:
-        rows = frame[frame["issuer_id"].map(_text) == issuer_id]
-    latest: dict[str, tuple[datetime, int]] = {}
+def _latest_by_agency(rows: pd.DataFrame, as_of: datetime, scale: str) -> dict[str, tuple[datetime, int, str]]:
+    """Each agency's latest action of the ``scale`` (``LT`` or ``ST``) public by ``as_of``: (time, notch, grade)."""
+    latest: dict[str, tuple[datetime, int, str]] = {}
     for rec in rows.to_dict("records"):
         when = public_time(rec.get("public_from"), "ratings public_from")
         if when is None or when > as_of:
             continue
         parsed = parse_rating(rec.get("rating"))
-        if parsed.scale != "LT" or parsed.notch is None:
+        if parsed.scale != scale or parsed.notch is None:
             continue
         agency = _text(rec.get("agency")).upper()
         if agency not in latest or when >= latest[agency][0]:
-            latest[agency] = (when, parsed.notch)
-    if not latest:
-        return None, None
-    notch = max(n for _, n in latest.values())
-    return rating_bucket(notch), notch
+            latest[agency] = (when, parsed.notch, _text(parsed.grade))
+    return latest
+
+
+def rating_detail(ratings: pd.DataFrame | None, isin: str, issuer_id: str, as_of: datetime
+                  ) -> tuple[str | None, int | None, str]:
+    """(bucket, notch, how) of a credit position's rating as known at ``as_of``: the worse of the worst of each agency's
+    latest long-term rating on the ISIN's rows and on its issuer's rows (``how`` ``isin``, ``issuer`` or ``both``),
+    so that an issuer's later downgrade is never masked by an older rating of the instrument (UNVERIFIED,
+    conservative: a credit enhancement on the ISIN is not credited above its issuer); with no long-term grade on
+    either, the worst short-term one read through ``ST_TO_LT`` (the worst long-term grade it is paired with;
+    ``how`` ``short_term:<grade>``). A rating known only by its date counts from 23:59:59 that day (UNVERIFIED,
+    ``corporates.public_time``). ``(None, None, "")`` without one."""
+    if ratings is None or not len(ratings):
+        return None, None, ""
+    frame = ratings
+    isins = frame["isin"].map(_text).str.upper() if "isin" in frame else pd.Series("", index=frame.index)
+    own = frame[isins == isin]
+    of_issuer = frame[frame["issuer_id"].map(_text) == issuer_id] if issuer_id and "issuer_id" in frame else \
+        frame.iloc[0:0]
+    issuer = of_issuer[isins.loc[of_issuer.index] == ""]  # the issuer's own rows (no ISIN)
+    others = of_issuer[~isins.loc[of_issuer.index].isin(("", isin))]  # the issuer's other instruments
+    long_own, long_issuer = _latest_by_agency(own, as_of, "LT"), _latest_by_agency(issuer, as_of, "LT")
+    notches = {"isin": max((n for _, n, _ in long_own.values()), default=None),
+               "issuer": max((n for _, n, _ in long_issuer.values()), default=None)}
+    known = {k: v for k, v in notches.items() if v is not None}
+    if known:
+        notch = max(known.values())
+        how = "both" if len(known) == 2 and notches["isin"] == notches["issuer"] else \
+            max(known, key=lambda k: (known[k], k == "isin"))
+        return rating_bucket(notch), notch, how
+    long_others = _latest_by_agency(others, as_of, "LT")  # neither rated: the issuer's other instruments (the
+    if long_others:  # engine's rule of ISIN rows, else the issuer's)
+        notch = max(n for _, n, _ in long_others.values())
+        return rating_bucket(notch), notch, "issuer"
+    short = {**_latest_by_agency(issuer, as_of, "ST"), **{f"{a}|isin": v for a, v in
+                                                          _latest_by_agency(own, as_of, "ST").items()}}
+    mapped = [(LT_NOTCH[ST_TO_LT[g]], g) for _, _, g in short.values() if g in ST_TO_LT]
+    if not mapped:
+        return None, None, ""
+    notch, grade = max(mapped)
+    return rating_bucket(notch), notch, f"short_term:{grade}"
+
+
+def rating_as_known(ratings: pd.DataFrame | None, isin: str, issuer_id: str, as_of: datetime
+                    ) -> tuple[str | None, int | None]:
+    """(bucket, notch) of ``rating_detail``: the worse of the ISIN's and its issuer's latest long-term ratings public by
+    ``as_of``, else a short-term grade read through ``ST_TO_LT``; ``(None, None)`` without one."""
+    bucket, notch, _ = rating_detail(ratings, isin, issuer_id, as_of)
+    return bucket, notch
 
 
 # ---------------------------------------------------------------- the book
@@ -720,6 +818,7 @@ class RiskPosition:
     funded: float = math.nan
     macaulay: float = math.nan
     sens: tuple[Sensitivity, ...] = ()
+    frtb_sector: str = ""  # FRTB's credit-spread bucket (the issuer table's frtb_sector, else read from sector)
 
     @property
     def key(self) -> tuple[str, str, str, date]:
@@ -896,11 +995,14 @@ def _reference_name(kind: str, ctx: RiskContext) -> str | None:
     return ctx.settings.attribution.reference_map.get(kind)
 
 
-def _issuer_of(kind: str, isin: str, terms_row: Mapping | None, master_row: Mapping | None
+def _issuer_of(kind: str, isin: str, terms_row: Mapping | None, master_row: Mapping | None,
+               prefixes: tuple[Mapping[str, str], Mapping[str, str], Sequence[str]] | None = None
                ) -> tuple[str, tuple[str, ...]]:
     """The issuer of a position: GoI for its securities, the state of an SDL (the master's ``state_code``, else the
-    ISIN's two state digits), the corporate terms' ``issuer_id``, else the first seven characters of an Indian
-    corporate ISIN (``INE`` and the issuer's code: UNVERIFIED reading, flagged), else the ISIN itself (flagged)."""
+    ISIN's two state digits), the corporate terms' ``issuer_id``, else the issuer whose ``isin_prefix`` in the issuer
+    table the ISIN starts with (the longest), else the issuer whose bonds' terms share the ISIN's first seven
+    characters (``issuer_from_prefix``: a company's CP and CD join its NCDs), else those seven characters themselves
+    (``INE`` and the issuer's code: UNVERIFIED reading, flagged ``issuer_from_isin``), else the ISIN (flagged)."""
     if kind in GOI_KINDS:
         return "GOI", ()
     if kind == "sdl":
@@ -909,8 +1011,14 @@ def _issuer_of(kind: str, isin: str, terms_row: Mapping | None, master_row: Mapp
     issuer = _text((terms_row or {}).get("issuer_id"))
     if issuer:
         return issuer, ()
+    given, inferred, ambiguous = prefixes if prefixes is not None else ({}, {}, ())
+    hits = sorted((p for p in given if isin.startswith(p)), key=len, reverse=True)
+    if hits:
+        return given[hits[0]], ()
     if isin.startswith("INE") and len(isin) == 12:
-        return isin[:7], ("issuer_from_isin",)
+        if isin[:7] in inferred:
+            return inferred[isin[:7]], ("issuer_from_prefix",)
+        return isin[:7], ("issuer_from_isin",) + (("issuer_prefix_ambiguous",) if isin[:7] in ambiguous else ())
     return isin, ("no_issuer",)
 
 
@@ -958,7 +1066,7 @@ def _position(rec: Mapping, inst: rt.Instrument, ctx: RiskContext, d: date, stra
     kind = inst.kind
     issuers, ratings, seniority, master = (statics[k] for k in ("issuers", "ratings", "seniority", "master"))
     terms_row = statics["corp_terms"].get(inst.isin) if kind == "corporate" else None
-    issuer_id, issuer_flags = _issuer_of(kind, inst.isin, terms_row, master.get(inst.isin))
+    issuer_id, issuer_flags = _issuer_of(kind, inst.isin, terms_row, master.get(inst.isin), statics.get("prefixes"))
     flags.extend(issuer_flags)
     issuer = issuers.get(issuer_id, {})
     group_id = _text(issuer.get("group_id"))
@@ -972,18 +1080,30 @@ def _position(rec: Mapping, inst: rt.Instrument, ctx: RiskContext, d: date, stra
         sector = sector or "sovereign"
     elif kind == "sdl":
         sector = sector or "local_government"
+    frtb = _text(issuer.get("frtb_sector")) or (sector if sector in FRTB_SECTORS else SECTOR_FRTB.get(sector, "other"))
     rating, rating_source = None, ""
     if kind in GOI_KINDS or kind == "sdl":
         rating_source = "sovereign"
     else:
-        rating, _ = rating_as_known(ratings, inst.isin, issuer_id, ctx.as_of)
+        rating, _, how = rating_detail(ratings, inst.isin, issuer_id, ctx.as_of)
         if rating is not None:
             rating_source = "ratings"
+            if how.startswith("short_term:"):
+                flags.append("rating_from_short_term")
         elif inst.rating_bucket:
             rating, rating_source = inst.rating_bucket, "static"
             flags.append("static_rating")
         else:
             rating_source = "unrated"
+    if isinstance(bond, CorporateBond):
+        calls = [w for w in bond.workouts(s, as_of=ctx.as_of) if w[0] == "call"]
+        if calls:
+            flags.append("callable_to_maturity")  # valued to maturity: no option model (R1.3)
+            try:
+                if bond.clean_price(y, s) > calls[0][2] + 1e-9:
+                    flags.append("callable_in_the_money")  # priced above its next call: likely called
+            except ValueError:
+                pass
     tier = _text(getattr(bond, "tier", "")).lower()
     if kind in GOI_KINDS or (kind == "sdl" and not settings.jtd_states):
         rank = ""  # no default risk modelled for GoI securities and SDLs (R1.7)
@@ -1054,6 +1174,13 @@ def _position(rec: Mapping, inst: rt.Instrument, ctx: RiskContext, d: date, stra
             w = key_weights([mac], tenors)[:, 0]
             sens.extend(_curve_sens(name or "gsec", tenors, dv01_yield * w, "yield_proxy", "yield"))
             dv01_curve = dv01_yield
+            spread = _spread_factor(kind, rating, bucket, None, inst.isin, settings)
+            if kind in CREDIT_KINDS and spread is not None:
+                # without its curve a credit position's spread moves its yield one for one: its CS01 is taken as its
+                # yield DV01 (UNVERIFIED proxy, flagged), so that CS01 limits and the credit VaR still see it
+                cs01 = dv01_yield
+                flags.append("cs01_from_yield")
+                sens.append(Sensitivity(spread[0], spread[1], "", math.nan, cs01, "yield_spread", "spread"))
         else:
             pv = cf * disc * np.exp(-z * t)
             tenors = _curve_tenors(name, curve_s, settings)
@@ -1087,7 +1214,7 @@ def _position(rec: Mapping, inst: rt.Instrument, ctx: RiskContext, d: date, stra
         lgd=lgd, jtd=jtd, engine_dv01=engine_dv01, funded=_num(rec.get("funded"), f"{where}: funded",
                                                                    blank=math.nan),
         macaulay=_macaulay(bond, y, s) if not isinstance(bond, GoiFloatingRateBond) else math.nan,
-        sens=tuple(sens))
+        sens=tuple(sens), frtb_sector=frtb)
 
 
 def _corporate_rows(ctx: RiskContext) -> dict[str, dict]:
@@ -1266,10 +1393,12 @@ def _nav_map(nav, d: date, books: Iterable[str], strategies: Mapping[str, str]) 
             out[("book", book)] = value
     book_values = {b: v for b, v in by_book.items() if b != "fund"}
     out[("fund", "fund")] = by_book.get("fund", _fsum(book_values.values()) if book_values else math.nan)
-    for book in set(books) | set(book_values):
-        strategy = strategies.get(book, book)
+    members: dict[str, list[float]] = {}
+    for book in sorted(set(books) | set(book_values)):  # sorted and fsum: the same bytes whatever the hash seed
         if book in book_values:
-            out[("strategy", strategy)] = out.get(("strategy", strategy), 0.0) + book_values[book]
+            members.setdefault(strategies.get(book, book), []).append(book_values[book])
+    for strategy, values in members.items():
+        out[("strategy", strategy)] = _fsum(values)
     return out
 
 
@@ -1330,9 +1459,11 @@ def book_from_snapshot(snapshot: rt.Snapshot, ctx: RiskContext) -> RiskBook:
     terms = {_text(r["trade_id"]): r for r in snapshot.swaps().to_dict("records")}
     nav = {("book", b): float(v) for b, v in snapshot.nav.items()}
     nav[("fund", "fund")] = _fsum(snapshot.nav.values()) if snapshot.nav else math.nan
-    for b, v in snapshot.nav.items():
-        key = ("strategy", strategies.get(b, b))
-        nav[key] = nav.get(key, 0.0) + float(v)
+    members: dict[str, list[float]] = {}
+    for b, v in sorted(snapshot.nav.items()):
+        members.setdefault(strategies.get(b, b), []).append(float(v))
+    for strategy, values in members.items():
+        nav[("strategy", strategy)] = _fsum(values)
     return _assemble(d, ctx, bond_rows, swap_rows, insts, terms, strategies, nav)
 
 
@@ -1363,11 +1494,13 @@ def _assemble(d: date, ctx: RiskContext, bond_rows: list, swap_rows: list, insts
         frame = _frame(ctx.factor_history, "the factor history")
         if "factor" in frame:
             table_factors = {_text(f) for f in frame["factor"]}
-    statics = {"table_factors": table_factors, "issuers": _issuer_rows(ctx.issuers, d),
-               "ratings": _ratings_frame(ctx.market.ratings),
+    issuers = _issuer_rows(ctx.issuers, d)
+    corp_terms = _corporate_rows(ctx)
+    statics = {"table_factors": table_factors, "issuers": issuers, "ratings": _ratings_frame(ctx.market.ratings),
                "seniority": {} if ctx.seniority is None else dict(zip(*(read_seniority(ctx.seniority)[c]
                                                                         for c in ("isin", "seniority")))),
-               "master": _master_rows(ctx), "corp_terms": _corporate_rows(ctx),
+               "master": _master_rows(ctx), "corp_terms": corp_terms,
+               "prefixes": issuer_prefixes(issuers, corp_terms),
                "frb_index": _frb_indices(ctx, [i for i, inst in insts.items() if inst.kind == "frb"])}
     positions = []
     for rec in bond_rows:
@@ -1518,7 +1651,9 @@ def credit_table(book: RiskBook) -> pd.DataFrame:
                              "positions": len(members),
                              "flags": _flags(*(f for p in members for f in p.flags
                                                if f in ("static_rating", "no_group", "no_curve", "issuer_from_isin",
-                                                        "no_issuer", "stale_mark")))})
+                                                        "issuer_from_prefix", "issuer_prefix_ambiguous", "no_issuer",
+                                                        "stale_mark", "rating_from_short_term", "cs01_from_yield",
+                                                        "callable_to_maturity", "callable_in_the_money")))})
     return pd.DataFrame(rows, columns=list(CREDIT_COLUMNS))
 
 
@@ -1583,7 +1718,9 @@ def summary_table(book: RiskBook) -> pd.DataFrame:
                              "jtd": total("jtd"),
                              "flags": _flags(*(f for m in members for f in m.flags
                                                if f in ("no_curve", "stale_curve", "stale_mark", "extrapolated",
-                                                        "default_time", "dv01_differs", "value_differs")))})
+                                                        "default_time", "dv01_differs", "value_differs",
+                                                        "callable_to_maturity", "callable_in_the_money",
+                                                        "cs01_from_yield")))})
     return pd.DataFrame(rows, columns=list(SUMMARY_COLUMNS))
 
 
@@ -2088,7 +2225,13 @@ def _var_factors(item) -> dict[str, float]:
 
 
 def _plan(book: RiskBook, history: FactorHistory, scope_type: str, scope: str, proxies=None,
-          *, min_obs_hard: int, end: date | None = None) -> _Plan:
+          *, min_obs_hard: int, end: date | None = None, stale_days: int | None = None) -> _Plan:
+    """The scope's VaR inputs. A factor is used when it has at least ``min_obs_hard`` changes up to the book's day
+    (``end``) and, with ``stale_days`` (the VaR's ``max_gap_days``), its last change is at most that many business
+    days before the day: a series that stopped (or a long hole at its end) would otherwise drag the window of every
+    factor back to when it last had changes. A factor that fails either test is left out (coverage below one,
+    flagged ``short_factor:`` or ``stale_factor:``) unless the proxy table maps it to one that passes (``proxied``);
+    a window ending more than ``stale_days`` business days before the day is flagged ``stale_window:<end>``."""
     items = tuple(i for i in book.items if book.in_scope(i, scope_type, scope))
     proxy = {}
     if proxies is not None:
@@ -2097,6 +2240,17 @@ def _plan(book: RiskBook, history: FactorHistory, scope_type: str, scope: str, p
     last = end if end is not None else book.date
     upto = np.array([d <= last for d in history.dates], dtype=bool)
     counts = {f: int(np.isfinite(history.changes[upto, j]).sum()) for j, f in enumerate(history.factors)}
+    cal = book.calendar if book.calendar is not None else mumbai_settlement_calendar()
+    stale: set[str] = set()
+    if stale_days is not None:
+        for j, f in enumerate(history.factors):
+            seen = np.flatnonzero(upto & np.isfinite(history.changes[:, j]))
+            if seen.size and _gap_days(cal, history.dates[seen[-1]], last) > stale_days:
+                stale.add(f)
+
+    def usable(f: str) -> bool:
+        return counts.get(f, 0) >= min_obs_hard and f not in stale
+
     flags: list[str] = []
     uncovered: dict[str, float] = {}
     total = covered = 0.0
@@ -2107,12 +2261,14 @@ def _plan(book: RiskBook, history: FactorHistory, scope_type: str, scope: str, p
         for factor, value in _var_factors(item).items():
             total += abs(value)
             target, scale = factor, 1.0
-            if counts.get(factor, 0) < min_obs_hard and factor in proxy:
+            if not usable(factor) and factor in proxy:
                 target, scale = proxy[factor]
                 flags.append("proxied")
-            if counts.get(target, 0) < min_obs_hard:
+            if not usable(target):
                 uncovered[_factor_class(factor)] = uncovered.get(_factor_class(factor), 0.0) + abs(value)
-                if counts.get(target, 0):
+                if target in stale and counts.get(target, 0):
+                    flags.append(f"stale_factor:{target}")
+                elif counts.get(target, 0):
                     flags.append(f"short_factor:{target}")
                 continue
             covered += abs(value)
@@ -2131,6 +2287,8 @@ def _plan(book: RiskBook, history: FactorHistory, scope_type: str, scope: str, p
         rows = np.flatnonzero(upto & np.all(np.isfinite(block), axis=1))
     else:
         rows = np.flatnonzero(upto)
+    if stale_days is not None and len(rows) and _gap_days(cal, history.dates[rows[-1]], last) > stale_days:
+        flags.append(f"stale_window:{history.dates[rows[-1]].isoformat()}")
     return _Plan(items=items, factors=factors, cols=cols, S=S, rows=rows, total_abs=total, covered_abs=covered,
                  uncovered=uncovered, flags=tuple(dict.fromkeys(flags)), item_factor_map=tuple(maps))
 
@@ -2257,6 +2415,9 @@ def _full_pnl_item(item, moves: Mapping[str, np.ndarray], n: int, settings: Risk
             return np.zeros(n)
         all_tenors = _curve_tenors(name, None, settings)
         dy = _curve_shift(all_tenors, name, moves, np.array([item.macaulay]), n)[:, 0] * 100  # percent
+        for sn in item.sens:  # its spread factor (a credit position's yield proxy) and residual move its yield too
+            if sn.basis in ("spread", "yield") and sn.method != "yield_proxy" and sn.factor in moves:
+                dy = dy + moves[sn.factor] / 100
         base = _dirty(bond, item.yield_pct, item.settlement)
         return np.array([units * (_dirty(bond, item.yield_pct + dy[s], item.settlement) - base) if dy[s] else 0.0
                          for s in range(n)])
@@ -2372,8 +2533,8 @@ class VarResult:
 def _status(n_obs: int, coverage: float, settings: RiskSettings, flags: list[str]) -> str:
     if n_obs < settings.min_obs:
         flags.append(f"short_history:{n_obs}<{settings.min_obs}")
-    if coverage < 1 - 1e-12:
-        return "incomplete"
+    if coverage < 1 - 1e-12 or any(f.startswith("stale_window:") for f in flags):
+        return "incomplete"  # a factor left out, or a window that ends well before the book's day
     return "short_history" if n_obs < settings.min_obs else "ok"
 
 
@@ -2394,6 +2555,9 @@ def _plan_flags(plan: _Plan, history: FactorHistory) -> list[str]:
         flags.append(f"uncovered_{cls}={value:.2f}")
     if _coarse(history, plan):
         flags.append("coarse")
+    if any(isinstance(i, RiskPosition) and i.kind not in CREDIT_KINDS and i.kind != "frb"
+           and not any(sn.factor_class == "resid" for sn in i.sens) for i in plan.items):
+        flags.append("no_residual_factor")  # a G-sec's or SDL's rich/cheap to its curve is not in the VaR (R2.7)
     return flags
 
 
@@ -2406,7 +2570,7 @@ def historical_var(book: RiskBook, history: FactorHistory, settings: RiskSetting
     the count) below ``min_obs_hard`` observations; flagged ``short_history`` below ``min_obs``; ``incomplete`` when a
     factor of the scope has no history (coverage below one)."""
     st = settings if settings is not None else book.settings
-    plan = _plan(book, history, *scope, proxies, min_obs_hard=st.min_obs_hard)
+    plan = _plan(book, history, *scope, proxies, min_obs_hard=st.min_obs_hard, stale_days=st.max_gap_days)
     use = _window_rows(plan, st) if rows is None else rows
     n_days = len(use)
     flags = _plan_flags(plan, history)
@@ -2459,7 +2623,7 @@ def parametric_var(book: RiskBook, history: FactorHistory, settings: RiskSetting
     factor sensitivities and ``Sigma`` the EWMA (or sample) covariance as of ``as_of``; ``VaR = z_a sigma_p sqrt(h)``,
     ``ES = sigma_p sqrt(h) phi(z_a) / (1 - a)`` (the square root of time for any horizon)."""
     st = settings if settings is not None else book.settings
-    plan = _plan(book, history, *scope, proxies, min_obs_hard=st.min_obs_hard)
+    plan = _plan(book, history, *scope, proxies, min_obs_hard=st.min_obs_hard, stale_days=st.max_gap_days)
     cov, rows, n = _covariance(plan, history, st)
     flags = _plan_flags(plan, history)
     if n < st.min_obs_hard:
@@ -2519,21 +2683,26 @@ def stressed_window(book: RiskBook, history: FactorHistory, settings: RiskSettin
     step of ``stressed_step`` observations, ties to the earliest start; by the sensitivity method (U: the search is
     fast; the stressed ES itself is then computed by each method asked)."""
     st = settings if settings is not None else book.settings
-    plan = _plan(book, history, *scope, proxies, min_obs_hard=st.min_obs_hard)
+    plan = _plan(book, history, *scope, proxies, min_obs_hard=st.min_obs_hard, stale_days=st.max_gap_days)
     reduced = _restricted(plan, history, _reduced_factors(plan, history), book.date)
     rows = reduced.rows
     if len(rows) < st.window:
         return None, None, math.nan
     x = history.changes[np.ix_(rows, reduced.cols)] if len(reduced.cols) else np.zeros((len(rows), 0))
     daily = -(x @ reduced.S.sum(axis=0)) if reduced.S.size else np.zeros(len(rows))
+    overlapping = horizon_days > 1 and st.horizon_rule == "overlapping"
+    if overlapping:
+        # each run of ``horizon_days`` days summed on its own, so that the same days give the same bits in every window
+        # (a running sum's rounding would depend on the window's start, and exact ties would no longer go to the
+        # earliest start)
+        runs = np.lib.stride_tricks.sliding_window_view(daily, horizon_days).sum(axis=1) if \
+            len(daily) >= horizon_days else np.zeros(0)
     best = (-math.inf, None)
     for start in range(0, len(rows) - st.window + 1, st.stressed_step):
-        block = daily[start:start + st.window]
-        if horizon_days > 1 and st.horizon_rule == "overlapping":
-            c = np.concatenate([[0.0], np.cumsum(block)])
-            scen = c[horizon_days:] - c[:-horizon_days]
+        if overlapping:
+            scen = runs[start:start + st.window - horizon_days + 1]
         else:
-            scen = block * (math.sqrt(horizon_days) if horizon_days > 1 else 1.0)
+            scen = daily[start:start + st.window] * (math.sqrt(horizon_days) if horizon_days > 1 else 1.0)
         if not scen.size:
             continue
         es = hs_es(scen, st.es_alpha)
@@ -2551,7 +2720,7 @@ def stressed_es(book: RiskBook, history: FactorHistory, settings: RiskSettings |
     stressed window (``stressed_window``), C the current one; ``var`` is the stressed window's VaR on the reduced set,
     unscaled (flagged)."""
     st = settings if settings is not None else book.settings
-    plan = _plan(book, history, *scope, proxies, min_obs_hard=st.min_obs_hard)
+    plan = _plan(book, history, *scope, proxies, min_obs_hard=st.min_obs_hard, stale_days=st.max_gap_days)
     reduced_names = _reduced_factors(plan, history)
     reduced = _restricted(plan, history, reduced_names, book.date)
     start, end, _ = stressed_window(book, history, st, horizon_days=horizon_days, scope=scope, proxies=proxies)
@@ -2598,7 +2767,7 @@ def liquidity_horizon_es(book: RiskBook, history: FactorHistory, settings: RiskS
     at least ``LH_j`` moved (``LIQUIDITY_HORIZONS``: rates 10, FRB margins 20, IG corporate spreads 40, high yield 60;
     the INR mapping UNVERIFIED)."""
     st = settings if settings is not None else book.settings
-    plan = _plan(book, history, *scope, proxies, min_obs_hard=st.min_obs_hard)
+    plan = _plan(book, history, *scope, proxies, min_obs_hard=st.min_obs_hard, stale_days=st.max_gap_days)
     rows = _window_rows(plan, st)
     if len(rows) < st.min_obs_hard:
         raise ValueError(f"{scope[0]} {scope[1]}: {len(rows)} observation(s), below min_obs_hard: refused")
@@ -2702,16 +2871,29 @@ def var_table(book: RiskBook, history: FactorHistory, settings: RiskSettings | N
 
 
 def _item_name(item) -> str:
-    return f"{item.book}|{item.isin}|{'ois' if isinstance(item, RiskSwap) else item.state}"
+    """A position's component name, its full key ``book|isin|state|settlement`` (two pending rows of one ISIN in one
+    book, settling on different days, are two components; a swap's settlement is its effective date)."""
+    book, isin, state, settlement = item.key
+    return f"{book}|{isin}|{state}|{settlement.isoformat()}"
+
+
+def _by_name(pairs: Iterable[tuple[str, tuple[float, float]]]) -> dict[str, tuple[float, float]]:
+    """Components summed by name (a name repeated, which the book's unique keys rule out, adds rather than
+    overwrites, so that the components still sum to the figure)."""
+    out: dict[str, list[tuple[float, float]]] = {}
+    for name, value in pairs:
+        out.setdefault(name, []).append(value)
+    return {k: (_fsum(v[0] for v in vals), _fsum(v[1] for v in vals)) for k, vals in out.items()}
 
 
 def var_components(book: RiskBook, history: FactorHistory, settings: RiskSettings | None = None, *, proxies=None,
                    results: Sequence[VarResult] | None = None) -> pd.DataFrame:
-    """Euler contributions (``VAR_COMPONENT_COLUMNS``) of each position (``book|isin|state``), book, strategy and, for
-    the sensitivity and parametric methods, factor class to each current-window VaR and ES: parametric ``x_i (Sigma
-    x)_i z / sigma_p`` (summing to the VaR exactly); historical ES ``-sum_s a_s PnL_{s,i} / m`` with the
-    Acerbi-Tasche tail weights (summing to the ES exactly; ties to the earliest scenario); historical VaR the mean of
-    a band of 5 scenarios around the VaR's, rescaled to sum to the VaR (U)."""
+    """Euler contributions (``VAR_COMPONENT_COLUMNS``) of each position (named by its key,
+    ``book|isin|state|settlement``), book, strategy and, for the sensitivity and parametric methods, factor class to
+    each current-window VaR and ES: parametric ``x_i (Sigma x)_i z / sigma_p`` (summing to the VaR exactly);
+    historical ES ``-sum_s a_s PnL_{s,i} / m`` with the Acerbi-Tasche tail weights (summing to the ES exactly; ties to
+    the earliest scenario); historical VaR the mean of a band of 5 scenarios around the VaR's, rescaled to sum to the
+    VaR (U)."""
     st = settings if settings is not None else book.settings
     res = list(results) if results is not None else var_results(book, history, st, proxies=proxies)
     rows = []
@@ -2720,7 +2902,9 @@ def var_components(book: RiskBook, history: FactorHistory, settings: RiskSetting
             continue
         base = {"date": book.date, "as_of": _iso(book.as_of), "scope_type": r.scope_type, "scope": r.scope,
                 "method": r.method, "horizon_days": r.horizon_days}
-        plan = _plan(book, history, r.scope_type, r.scope, proxies, min_obs_hard=st.min_obs_hard)
+        plan = _plan(book, history, r.scope_type, r.scope, proxies, min_obs_hard=st.min_obs_hard,
+                     stale_days=st.max_gap_days)
+        parts: dict[str, dict[str, tuple[float, float]]] = {}
         if r.method == "parametric":
             cov, _, _ = _covariance(plan, history, st)
             s = plan.S.sum(axis=0)
@@ -2732,7 +2916,7 @@ def var_components(book: RiskBook, history: FactorHistory, settings: RiskSetting
             k_es = root * _N.pdf(_N.inv_cdf(st.es_alpha)) / (1 - st.es_alpha) / sigma
             marginal = cov @ s
             by_item = plan.S @ marginal
-            parts = {"position": {_item_name(i): (v * k_var, v * k_es) for i, v in zip(plan.items, by_item)}}
+            pairs = [(i, (v * k_var, v * k_es)) for i, v in zip(plan.items, by_item)]
             cls: dict[str, tuple[float, float]] = {}
             for j, f in enumerate(plan.factors):
                 c = _factor_class(f)
@@ -2751,7 +2935,7 @@ def var_components(book: RiskBook, history: FactorHistory, settings: RiskSetting
             band_total = -total[band].mean()
             var_items = (-pnl[band].mean(axis=0) * r.var / band_total) if band_total else np.full(pnl.shape[1],
                                                                                                     math.nan)
-            parts = {"position": {_item_name(i): (v, e) for i, v, e in zip(r.items, var_items, es_items)}}
+            pairs = [(i, (v, e)) for i, v, e in zip(r.items, var_items, es_items)]
             if r.method == "hs_sensitivity":
                 use = _window_rows(plan, st)
                 x = history.changes[np.ix_(use, plan.cols)]
@@ -2765,15 +2949,10 @@ def var_components(book: RiskBook, history: FactorHistory, settings: RiskSetting
                     v = -p_c[band].mean() * r.var / band_total if band_total else math.nan
                     cls[c] = (v, -(w @ p_c) / m)
                 parts["factor_class"] = cls
-        books: dict[str, list] = {}
-        strategies: dict[str, list] = {}
-        for item, (name, value) in zip(plan.items if r.method == "parametric" else r.items,
-                                       parts["position"].items()):
-            books.setdefault(item.book, []).append(value)
-            strategies.setdefault(item.strategy, []).append(value)
-        parts["book"] = {k: (_fsum(v[0] for v in vals), _fsum(v[1] for v in vals)) for k, vals in books.items()}
-        parts["strategy"] = {k: (_fsum(v[0] for v in vals), _fsum(v[1] for v in vals))
-                             for k, vals in strategies.items()}
+        # built from (item, value) pairs, never by zipping items with a dict of names
+        parts["position"] = _by_name((_item_name(item), value) for item, value in pairs)
+        parts["book"] = _by_name((item.book, value) for item, value in pairs)
+        parts["strategy"] = _by_name((item.strategy, value) for item, value in pairs)
         for ctype in ("position", "book", "strategy", "factor_class"):
             for name, (v, e) in sorted(parts.get(ctype, {}).items()):
                 rows.append({**base, "component_type": ctype, "component": name, "var_contribution": float(v),
@@ -2853,18 +3032,22 @@ def traffic_light(x: int, T: int = 250, p: float = 0.01) -> tuple[str, float, fl
     return zone, multiplier, c
 
 
-def hypothetical_pnl(attribution) -> pd.DataFrame:
+def hypothetical_pnl(attribution, *, time_effects: str = "exclude") -> pd.DataFrame:
     """``date, book, pnl_hypothetical`` from the engine's attribution (``ATTRIBUTION_COLUMNS``): the market lines of
     the positions held from the previous close (``HYPOTHETICAL_LINES`` and the curve-factor lines ``curve_*``,
-    ``krd_*``, ``ois_curve_*``, ``ois_krd_*``); trades, costs, funding, the benchmark and memo lines are left out. A
-    ``fund`` row sums the books each day."""
+    ``krd_*``, ``ois_curve_*``, ``ois_krd_*``), with the time effects (``TIME_EFFECT_LINES``: accrual, pull to par,
+    roll-down, OIS carry and roll-down) left out by default, as the VaR has none (``time_effects="include"`` keeps
+    them); trades, costs, funding, the benchmark and memo lines are left out. A ``fund`` row sums the books each
+    day."""
+    _choice(time_effects, TIME_EFFECTS, "time_effects")
     frame = _frame(attribution, "the attribution")
     _check_columns(frame, ("date", "book", "line", "amount"), rt.ATTRIBUTION_COLUMNS, "the attribution")
+    lines = HYPOTHETICAL_LINES + (TIME_EFFECT_LINES if time_effects == "include" else ())
     keep = []
     for rec in frame.to_dict("records"):
         line = _text(rec.get("line"))
         memo = str(rec.get("memo")).strip().lower() in ("true", "1")
-        keep.append(not memo and (line in HYPOTHETICAL_LINES or line.startswith(HYPOTHETICAL_PREFIXES)))
+        keep.append(not memo and (line in lines or line.startswith(HYPOTHETICAL_PREFIXES)))
     kept = frame[keep].copy()
     kept["date"] = [_date(v, "the attribution's date") for v in kept["date"]]
     kept["amount"] = [_num(v, "the attribution's amount") for v in kept["amount"]]
@@ -2881,11 +3064,21 @@ def hypothetical_pnl(attribution) -> pd.DataFrame:
     return out.sort_values(["date", "book"], kind="mergesort").reset_index(drop=True)
 
 
+_HISTORY_KEY = ("date", "scope_type", "scope", "method", "horizon_days", "alpha_var")
+
+
+def _history_key(rec: Mapping) -> tuple:
+    return (_date(rec.get("date"), "the VaR history's date").isoformat(), _text(rec.get("scope_type")),
+            _text(rec.get("scope")), _text(rec.get("method")), int(_num(rec.get("horizon_days"), "horizon_days")),
+            repr(float(_num(rec.get("alpha_var"), "alpha_var"))))
+
+
 def append_var_history(table, var_rows: pd.DataFrame) -> pd.DataFrame:
     """The VaR history (``VAR_HISTORY_COLUMNS``; a frame, a CSV path that may not exist yet, or None) with the day's
     ``VAR_COLUMNS`` rows of the current window (both levels: VaR at ``var_alpha`` and at ``es_alpha``, which the
-    back-test picks by its ``alpha``) replacing any rows of the same date, sorted by date, scope, method, horizon and
-    level."""
+    back-test picks by its ``alpha``), each replacing only an old row of the same date, scope type, scope, method,
+    horizon and level (runs of one day for different books or strategies add to the history; rerunning a scope
+    replaces its rows), sorted by date, scope, method, horizon and level."""
     if table is None or (not isinstance(table, pd.DataFrame) and not Path(table).exists()):
         old = pd.DataFrame(columns=list(VAR_HISTORY_COLUMNS))
     else:
@@ -2893,75 +3086,145 @@ def append_var_history(table, var_rows: pd.DataFrame) -> pd.DataFrame:
         _check_columns(old, VAR_HISTORY_COLUMNS, VAR_HISTORY_COLUMNS, "the VaR history")
     new = var_rows[(var_rows["window"] == "current") & (var_rows["horizon_rule"] != "liquidity_horizons")]
     new = new.loc[:, list(VAR_HISTORY_COLUMNS)].copy()
-    days = {str(d) for d in new["date"]}
-    old = old[~old["date"].astype(str).isin(days)].loc[:, list(VAR_HISTORY_COLUMNS)]
+    keys = {_history_key(r) for r in new.to_dict("records")}
+    if len(old):
+        old = old[[_history_key(r) not in keys for r in old.to_dict("records")]]
+    old = old.loc[:, list(VAR_HISTORY_COLUMNS)]
     out = pd.concat([old.astype(str), new.astype(str)], ignore_index=True)
     return out.sort_values(["date", "scope_type", "scope", "method", "horizon_days", "alpha_var"],
                            kind="mergesort").reset_index(drop=True)
 
 
-def backtest(var_history, nav, attribution=None, *, alpha: float = VAR_ALPHA, window: int = WINDOW,
-             method: str | None = None, calendar: BusinessCalendar | None = None, end=None
-             ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Back-test the one-day VaR at ``alpha`` (R2.8): the VaR of business day ``d`` against the P&L of the next
-    business day ``d+1``, actual (the engine's ``pnl``, ``nav.csv``) and hypothetical (``hypothetical_pnl`` of the
-    attribution), counted apart, the larger count used (MAR32.18); an exception when ``PnL < -VaR`` strictly; a day
-    whose VaR or P&L is missing counts as an exception. Over the last ``window`` pairs ending at ``end`` (default the
-    last VaR with a next business day): Kupiec, Christoffersen (on the sequence of the larger count) and the traffic
-    light. Returns ``(BACKTEST_COLUMNS, BACKTEST_SUMMARY_COLUMNS)``; a strategy scope's P&L is the sum of its books'
-    (the VaR history's ``scope`` of type ``strategy`` needs every book of it in the NAV table under that strategy
-    name: give the books' sums yourself otherwise)."""
-    cal = calendar if calendar is not None else mumbai_settlement_calendar().lenient()
-    hist = _frame(var_history, "the VaR history")
-    _check_columns(hist, ("date", "scope_type", "scope", "method", "horizon_days", "alpha_var", "var"),
-                   VAR_HISTORY_COLUMNS, "the VaR history")
-    hist = hist[[_num(h, "horizon_days") == 1 and abs(_num(a, "alpha_var") - alpha) < 1e-12
-                 for h, a in zip(hist["horizon_days"], hist["alpha_var"])]]
-    if method is not None:
-        hist = hist[hist["method"] == method]
-    navf = _frame(nav, "the NAV table")
-    _check_columns(navf, ("date", "book", "pnl"), rt.NAV_COLUMNS, "the NAV table")
-    actual = {(_date(r["date"], "the NAV date"), _text(r["book"])): _num(r["pnl"], "pnl", blank=math.nan)
-              for r in navf.to_dict("records")}
-    books = sorted({b for _, b in actual})
-    if "fund" not in books:
-        for day in sorted({d for d, _ in actual}):
-            actual[(day, "fund")] = _fsum(actual[(day, b)] for b in books if (day, b) in actual)
-    hypo = {}
-    if attribution is not None:
-        for rec in hypothetical_pnl(attribution).to_dict("records"):
-            hypo[(rec["date"], rec["book"])] = rec["pnl_hypothetical"]
+DESK_RULE = {0.99: 12, 0.975: 30}  # MAR32.19 (verified): more exceptions in 12 months: the standardised approach
+
+
+def _pairs(hist: pd.DataFrame, actual: Mapping, hypo: Mapping | None, members, cal: BusinessCalendar,
+           last: date | None) -> list[dict]:
+    """One row per VaR of ``hist``: the VaR of ``d`` against the P&L of the next business day, actual and (with
+    ``hypo``) hypothetical, each series' exception counted on its own: a missing VaR, or a missing P&L of that series,
+    is an exception of it."""
     rows = []
-    last = as_date(end) if end is not None else None
     for rec in hist.to_dict("records"):
         d = _date(rec["date"], "the VaR history's date")
         nxt = cal.add_business_days(d, 1)
         if last is not None and nxt > last:
             continue
         scope_type, scope = _text(rec["scope_type"]), _text(rec["scope"])
-        key = "fund" if scope_type == "fund" else scope
+        books = members(scope_type, scope, d)
         var = _num(rec["var"], "var", blank=math.nan)
-        pa = actual.get((nxt, key), math.nan)
-        ph = hypo.get((nxt, key), math.nan) if attribution is not None else math.nan
-        missing = not math.isfinite(var) or not math.isfinite(pa) or (attribution is not None
-                                                                       and not math.isfinite(ph))
-        ex_a = missing or pa < -var
-        ex_h = (missing or ph < -var) if attribution is not None else False
+        pa = _scope_pnl(actual, nxt, books)
+        ph = _scope_pnl(hypo, nxt, books) if hypo is not None else math.nan
+        missing_v, missing_a = not math.isfinite(var), not math.isfinite(pa)
+        missing_h = hypo is not None and not math.isfinite(ph)
+        ex_a = missing_v or missing_a or pa < -var
+        ex_h = (missing_v or missing_h or ph < -var) if hypo is not None else False
         rows.append({"var_date": d, "pnl_date": nxt, "scope_type": scope_type, "scope": scope,
                      "method": _text(rec["method"]), "var": var, "pnl_actual": pa, "pnl_hypothetical": ph,
-                     "exception_actual": bool(ex_a), "exception_hypothetical": bool(ex_h), "missing": bool(missing)})
-    detail = pd.DataFrame(rows, columns=list(BACKTEST_COLUMNS))
+                     "exception_actual": bool(ex_a), "exception_hypothetical": bool(ex_h),
+                     "missing": bool(missing_v or missing_a or missing_h)})
+    return rows
+
+
+def _scope_pnl(series: Mapping, day: date, books: Sequence[str]) -> float:
+    """The P&L of ``day`` summed over the scope's ``books`` (NaN when one of them has none, or the scope none)."""
+    values = [series.get((day, b), math.nan) for b in books]
+    if not values or not all(math.isfinite(v) for v in values):
+        return math.nan
+    return _fsum(values)
+
+
+def backtest(var_history, nav, attribution=None, *, alpha: float = VAR_ALPHA, window: int = WINDOW,
+             method: str | None = None, calendar: BusinessCalendar | None = None, end=None, strategy_books=None,
+             time_effects: str = "exclude") -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Back-test the one-day VaR at ``alpha`` (R2.8): the VaR of business day ``d`` against the P&L of the next
+    business day ``d+1``, actual (the engine's ``pnl``, ``nav.csv``) and hypothetical (``hypothetical_pnl`` of the
+    attribution, time effects left out unless ``time_effects="include"``), counted apart, the larger count used
+    (MAR32.18); an exception when ``PnL < -VaR`` strictly; a missing VaR counts as an exception of both series, a
+    missing P&L as one of its own series. A book with an actual P&L but no market line on a day the attribution
+    covers held nothing from the previous close: its hypothetical P&L is 0. A strategy's P&L is the sum of its books'
+    (``strategy_books``, ``STRATEGY_BOOK_COLUMNS``, as mapped on the VaR's day; default each book its own strategy);
+    a scope with no P&L at all is reported as not back-tested, never as exceptions. Over the last ``window`` pairs
+    ending at ``end`` (default the last VaR with a next business day): Kupiec, Christoffersen (on the sequence of the
+    larger count), the traffic light and, at 99%, MAR32.19's desk rule (reported in the notes, not enforced: more
+    than 12 exceptions at 99% or 30 at 97.5% in the last 250 pairs). Returns ``(BACKTEST_COLUMNS,
+    BACKTEST_SUMMARY_COLUMNS)``."""
+    _choice(time_effects, TIME_EFFECTS, "time_effects")
+    cal = calendar if calendar is not None else mumbai_settlement_calendar().lenient()
+    hist_all = _frame(var_history, "the VaR history")
+    _check_columns(hist_all, ("date", "scope_type", "scope", "method", "horizon_days", "alpha_var", "var"),
+                   VAR_HISTORY_COLUMNS, "the VaR history")
+    one_day = hist_all[[_num(h, "horizon_days") == 1 for h in hist_all["horizon_days"]]]
+    if method is not None:
+        one_day = one_day[one_day["method"] == method]
+    hist = one_day[[abs(_num(a, "alpha_var") - alpha) < 1e-12 for a in one_day["alpha_var"]]]
+    navf = _frame(nav, "the NAV table")
+    _check_columns(navf, ("date", "book", "pnl"), rt.NAV_COLUMNS, "the NAV table")
+    actual = {(_date(r["date"], "the NAV date"), _text(r["book"])): _num(r["pnl"], "pnl", blank=math.nan)
+              for r in navf.to_dict("records")}
+    books = sorted({b for _, b in actual if b != "fund"})
+    if "fund" not in {b for _, b in actual}:
+        for day in sorted({d for d, _ in actual}):
+            actual[(day, "fund")] = _fsum(actual[(day, b)] for b in books if (day, b) in actual)
+    hypo = None
+    if attribution is not None:
+        hypo = {(r["date"], r["book"]): r["pnl_hypothetical"]
+                for r in hypothetical_pnl(attribution, time_effects=time_effects).to_dict("records")}
+        frame = _frame(attribution, "the attribution")
+        covered = {_date(v, "the attribution's date") for v in frame["date"]} if len(frame) else set()
+        for key in actual:  # a book with a P&L but no market line that day held nothing from the previous close
+            if key not in hypo and key[0] in covered:
+                hypo[key] = 0.0
+    mapping = read_strategy_books(strategy_books) if strategy_books is not None else None
+
+    def members(scope_type: str, scope: str, d: date) -> list[str]:
+        if scope_type == "fund":
+            return ["fund"]
+        if scope_type == "book":
+            return [scope]
+        if mapping is None:
+            return [b for b in books if b == scope]
+        out = []
+        for b in books:
+            live = mapping[(mapping["book"] == b) & (mapping["effective_from"] <= d)]
+            if (str(live["strategy"].iloc[-1]) if len(live) else b) == scope:
+                out.append(b)
+        return out
+
+    last = as_date(end) if end is not None else None
+    detail = pd.DataFrame(_pairs(hist, actual, hypo, members, cal, last), columns=list(BACKTEST_COLUMNS))
+    known = set(actual) | set(hypo or {})
+    latest = max(d for d, _ in known) if known else None
     if len(detail):
-        known = set(actual) | set(hypo)
-        latest = max(d for d, _ in known) if known else None
         if latest is not None and last is None:
             detail = detail[detail["pnl_date"] <= latest]
         detail = detail.sort_values(["scope_type", "scope", "method", "var_date"], kind="mergesort")
         detail = detail.reset_index(drop=True)
+    other = None  # the hypothetical count with the time effects the other way, for the notes
+    if attribution is not None and len(detail):
+        flip = "include" if time_effects == "exclude" else "exclude"
+        hypo2 = {(r["date"], r["book"]): r["pnl_hypothetical"]
+                 for r in hypothetical_pnl(attribution, time_effects=flip).to_dict("records")}
+        for key in actual:
+            if key not in hypo2 and key[0] in covered:
+                hypo2[key] = 0.0
+        other = pd.DataFrame(_pairs(hist, actual, hypo2, members, cal, last), columns=list(BACKTEST_COLUMNS))
+    desk = None
+    if abs(alpha - 0.99) < 1e-12:
+        lower = one_day[[abs(_num(a, "alpha_var") - 0.975) < 1e-12 for a in one_day["alpha_var"]]]
+        desk = pd.DataFrame(_pairs(lower, actual, hypo, members, cal, last), columns=list(BACKTEST_COLUMNS))
+        if len(desk) and latest is not None and last is None:
+            desk = desk[desk["pnl_date"] <= latest]
     summary = []
     p = 1 - alpha
     for (scope_type, scope, method_), group in detail.groupby(["scope_type", "scope", "method"], sort=True):
         g = group.tail(window)
+        if not (g["pnl_actual"].notna().any() or g["pnl_hypothetical"].notna().any()):
+            summary.append({"end": g["var_date"].iloc[-1], "scope_type": scope_type, "scope": scope,
+                            "method": method_, "alpha": alpha, "observations": 0, "exceptions_actual": 0,
+                            "exceptions_hypothetical": 0, "exceptions": 0, "expected": 0.0, "zone": "",
+                            "notes": f"not back-tested: no P&L for this {scope_type} in the NAV table"
+                                     + (" (map its books with strategy_books)" if scope_type == "strategy" else "")})
+            continue
         T = len(g)
         xa, xh = int(g["exception_actual"].sum()), int(g["exception_hypothetical"].sum())
         use = g["exception_hypothetical"] if xh > xa else g["exception_actual"]
@@ -2975,8 +3238,25 @@ def backtest(var_history, nav, attribution=None, *, alpha: float = VAR_ALPHA, wi
             notes.append(f"{T} of {window} observations")
         if attribution is None:
             notes.append("no attribution: hypothetical P&L not counted")
+        else:
+            notes.append(f"hypothetical P&L with time effects {'left out' if time_effects == 'exclude' else 'kept'}"
+                         " (MAR32.27)")
+            if other is not None:
+                o = other[(other["scope_type"] == scope_type) & (other["scope"] == scope)
+                          & (other["method"] == method_)].tail(window)
+                notes.append(f"{int(o['exception_hypothetical'].sum())} hypothetical exception(s) with time effects "
+                             f"{'kept' if time_effects == 'exclude' else 'left out'}")
         if int(g["missing"].sum()):
             notes.append(f"{int(g['missing'].sum())} day(s) with a missing VaR or P&L counted as exceptions")
+        if desk is not None:
+            d97 = desk[(desk["scope_type"] == scope_type) & (desk["scope"] == scope)
+                       & (desk["method"] == method_)].tail(window)
+            x97 = max(int(d97["exception_actual"].sum()), int(d97["exception_hypothetical"].sum())) if len(d97) \
+                else None
+            past = x > DESK_RULE[0.99] or (x97 is not None and x97 > DESK_RULE[0.975])
+            notes.append(f"desk rule (MAR32.19, reported, not enforced): {x} exception(s) at 99%"
+                         + (f" and {x97} at 97.5%" if x97 is not None else ", no 97.5% VaR rows")
+                         + f" in the last {T} pair(s): {'past' if past else 'within'} 12 and 30")
         summary.append({"end": g["var_date"].iloc[-1], "scope_type": scope_type, "scope": scope, "method": method_,
                         "alpha": alpha, "observations": T, "exceptions_actual": xa, "exceptions_hypothetical": xh,
                         "exceptions": x, "expected": T * p, "kupiec_lr": lr, "kupiec_p": pv, "n00": ch["n00"],
@@ -3003,13 +3283,25 @@ UNVERIFIED_RULES = (
     "gaps of 2-5 business days scaled by 1/sqrt(g), longer gaps break a series; a tenor outside a fit's range "
     "takes the nearest in-range change; 60 observations the least for a VaR",
     "the window: the latest dates on which every factor of the scope with at least min_obs_hard observations has "
-    "a change (fewer: left out, coverage below one)",
+    "a change; a factor with fewer, or whose last change is more than max_gap_days business days before the book's "
+    "day, is left out (coverage below one) unless proxied, and a window ending earlier than that is incomplete",
     "EWMA lambda 0.94 over up to 550 observations, the weights normalised; the sample covariance with ddof 1",
     "the stressed window searched by the sensitivity method on the factors whose history starts within 30 days of "
     "the earliest",
     "liquidity: 20% participation, ADV of 20 business days of the marks' volumes, else the user's table, else "
     "example proxies; stressed spreads 3 times; LVaR = VaR + stressed cost",
     "every scenario size marked U in stress_scenarios.csv (examples to be replaced by the fund's policy)",
+    "a shocked zero rate floored at 0% (floor_pct: the standard leaves the floor to national discretion)",
+    "liquidity horizons (MAR33.12 Table 2) by factor class: INR key rates and the T-bill factor 10 days; SDL spreads, "
+    "a G-sec's residual and FRB margins 20 (sovereign IG credit spread); corporate and CD spreads 40 (IG), 60 below",
+    "national ratings AAA to BBB- read as investment grade (FRTB buckets, liquidity horizons, FRTB_CSR)",
+    "a credit position's rating: the worse of the ISIN's and its issuer's latest long-term ratings; a short-term "
+    "grade read as the worst long-term grade it is paired with (A1+ as A+); an issuer from the issuer table's "
+    "isin_prefix, else from the ISIN prefix of its bonds' terms (a company's CP and CD join its NCDs)",
+    "a credit position without its curve: CS01 taken as its yield DV01 (cs01_from_yield)",
+    "back-test: no exception below six observations is green; the hypothetical P&L is the attribution's market "
+    "lines with time effects (accrual, pull to par, roll-down, OIS carry and roll-down) left out, as the VaR has none "
+    "(MAR32.27); a book with a P&L but no market line that day has a hypothetical P&L of 0",
 )
 
 
@@ -3074,6 +3366,7 @@ def _notes(book: RiskBook, history: FactorHistory, results: Sequence[VarResult],
                      "fitted curves, licensed)")
     if not (ctx.settings.access.repo or ctx.settings.access.treps):
         notes.append(f"funding stress and ALM: not_applicable under {ctx.settings.access.name} (it does not borrow)")
+    notes.extend(f"the VaR leaves out {item}" for item in VAR_LEAVES_OUT)
     notes.extend(f"UNVERIFIED: {rule}" for rule in UNVERIFIED_RULES)
     return notes
 

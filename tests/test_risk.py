@@ -792,11 +792,15 @@ def test_backtest_pairs_each_var_with_the_next_days_pnl_and_counts_strictly():
     assert not d.loc[days[1], "exception_actual"]  # -100 is not below -100: strict
     assert d.loc[days[2], "exception_actual"] and d.loc[days[4], "exception_actual"]
     assert d.loc[days[6], "missing"] and d.loc[days[6], "exception_actual"]  # a missing P&L counts
-    assert d.loc[days[2], "pnl_hypothetical"] == pytest.approx(-99.01)  # trades and funding left out
+    # trades, funding and (by default, MAR32.27) the time effects left out: the accrual of 1.0 is not counted
+    assert d.loc[days[2], "pnl_hypothetical"] == pytest.approx(-100.01)
+    kept = rk.backtest(hist, nav, att, time_effects="include")[0].set_index("pnl_date")
+    assert kept.loc[days[2], "pnl_hypothetical"] == pytest.approx(-99.01)
     s = summary.iloc[0]
     assert s["observations"] == len(days) - 1 and s["exceptions_actual"] == 3
     assert s["exceptions"] == max(s["exceptions_actual"], s["exceptions_hypothetical"])
-    assert "of 250 observations" in s["notes"]
+    assert "of 250 observations" in s["notes"] and "time effects left out" in s["notes"]
+    assert "hypothetical exception(s) with time effects kept" in s["notes"]
 
 
 def test_hypothetical_pnl_keeps_only_market_lines_and_var_history_replaces_a_day():
@@ -806,8 +810,10 @@ def test_hypothetical_pnl_keeps_only_market_lines_and_var_history_replaces_a_day
                                                           ("fees", False), ("memo_haircut_cost", True),
                                                           ("cash_benchmark", False), ("unexplained", False))])
     h = rk.hypothetical_pnl(att)
-    assert h[h["book"] == "b"]["pnl_hypothetical"].iloc[0] == 4.0
+    assert h[h["book"] == "b"]["pnl_hypothetical"].iloc[0] == 3.0  # the accrual (a time effect) left out
     assert set(h["book"]) == {"b", "fund"}
+    h = rk.hypothetical_pnl(att, time_effects="include")
+    assert h[h["book"] == "b"]["pnl_hypothetical"].iloc[0] == 4.0
     var = pd.DataFrame([{"date": date(2026, 11, 13), "as_of": "x", "scope_type": "fund", "scope": "fund",
                          "method": "parametric", "horizon_days": 1, "horizon_rule": "", "window": "current",
                          "alpha_var": 0.99, "var": 1.0, "alpha_es": 0.975, "es": 2.0, "n_obs": 250,
