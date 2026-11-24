@@ -50,7 +50,8 @@ pipeline, [`docs/rates_data_sources.md`](docs/rates_data_sources.md) for the rat
 and credit strategies. Day counts, calendars and price-yield rules for G-secs,
 SDLs, STRIPS, T-bills, CP and CD, listed corporate bonds (NCDs) and floating-rate
 bonds, with their sources: [`docs/conventions.md`](docs/conventions.md). Risk of the return engine's books
-(sensitivities, VaR and ES, stress tests, liquidity): [`docs/risk.md`](docs/risk.md).
+(sensitivities, VaR and ES, stress tests, liquidity), the limits, the pre-trade gate, capital allocation and the
+daily paper-trading report: [`docs/risk.md`](docs/risk.md).
 
 ## Quickstart
 
@@ -112,6 +113,16 @@ cr-strat risk --positions data/out/returns/positions.csv --nav data/out/returns/
     --out-dir data/out/risk_20261214     # key rates, CS01, JTD, VaR and ES, stress, liquidity (docs/risk.md)
 cr-strat var-backtest --var-history data/out/var_history.csv --nav data/out/returns/nav.csv \
     --attribution data/out/returns/attribution.csv --out-dir data/out/backtest   # Kupiec, Christoffersen, zones
+cr-strat limits --risk-dir data/out/risk_20261214 --engine-dir data/out/returns --date 2026-12-14 \
+    --limits data/raw/limits.csv --access nbfc_non_pd --marks data/raw/marks.csv \
+    --nss-params data/out/nss_params.csv --out-dir data/out/limits_20261214   # --limits example: EXAMPLE rows only
+cr-strat pre-trade --orders data/raw/orders_20261215.csv --engine-dir data/out/returns --date 2026-12-14 \
+    --limits data/raw/limits.csv --access nbfc_non_pd --marks data/raw/marks.csv \
+    --nss-params data/out/nss_params.csv --out-dir data/out/gate_20261214   # approved and refused, with reasons
+cr-strat allocate --nav data/out/returns/nav.csv --method erc_vol --as-of 2026-12-14 --access nbfc_non_pd \
+    --out data/out/allocation_20261214.csv     # fixed, inverse_vol, erc_vol, erc_es or budget weights by strategy
+cr-strat daily-report --config paper/fund/config.toml --date 2026-12-14 \
+    --orders paper/fund/orders_20261215.csv --out-dir paper/fund   # the paper fund's day: report.md, manifest.json
 
 cr-strat rbi-releases data/raw/rbi/releases/*.html data/raw/rbi/feeds/*.xml --out-dir data/out/rbi
 cr-strat rbi-store-poll --store data/rbi_store            # one request at most; run it from cron (data/README.md)
@@ -162,6 +173,9 @@ the pressure variable and the price response for each event.
 | `returns` | The return engine for the instruments `bonds`, `corporates` and `floating` price (G-secs, SDLs, bills, STRIPS, CP, CD, corporate bonds and GoI FRBs; corporate bonds with the exchange's settlement, record dates and ex-interest accrual, amortisation, calls and puts once their exercise is public, rating steps and `frb_corp` fixings only from when public; FRB coupons only as public, a `coupon_reset` line when a coupon becomes known after it began to accrue): books of bond and OIS trades held from settlement (forwards before it, when-issued trades to the issue date, partial closes, shorts where the access policy allows, redemptions on holidays), valued daily from marks used only from when they were public (stale and model fall-backs flagged), funded overnight in TREPS, market repo or (corporate bonds) corporate bond repo at the RBI store's rates within haircuts, CCIL's caps and the TREPS margin, charged `costs`, with each day's NAV change split into accrual, pull to par, roll-down, curve factors, rich/cheap, convexity, trading, costs, funding and OIS lines that sum to it exactly (an explicit unexplained line); performance and risk; a back-test loop deciding at 20:00 on a snapshot of what was public then (marks, curves, funding, fixings, and through its accessors the event ledger, auctions, the RBI store's tables, macro series, the MPC calendar, the residual history and the master's securities and fixed terms, each cut at that time), with auction bids within RBI's limits; access presets for the fund's legal form, the when-issued and hedging-only rules checked every day; `cr-strat returns` ([`docs/analytics.md`](docs/analytics.md)) |
 | `risk` | Risk of one day's positions of the return engine as known at a time: yield and curve DV01, key-rate DV01s on the fitted G-sec curve (and OIS zero rates and par quotes for swaps) summing to the parallel figure, CS01 on the z-spread, GoI FRB index and margin DV01s, convexity, jump to default with Basel's LGDs, each by position and summed by book, strategy, kind, tenor bucket, key rate, issuer, group, sector and rating bucket; factor histories from the NSS fits and the user's spread levels cut at their public times; historical (sensitivity and full revaluation) and parametric EWMA VaR and ES at 99% and 97.5%, one and ten days, refused or flagged on short or gappy histories, with the stressed ES, the liquidity-horizon ES and Euler components; back-tests against the next day's actual and hypothetical P&L (Kupiec, Christoffersen, the Basel traffic light); `cr-strat risk`, `cr-strat var-backtest` ([`docs/risk.md`](docs/risk.md)) |
 | `stress` | Stress scenarios revalued in full: a shipped table of 37 scenarios with each row's source and status (BCBS's six IRRBB shocks for INR, FRTB's credit spread weights, rating ladders and migrations, FRB index and margin shocks, funding and bid-offer shocks, the 2013, 2018, 2020 and 2022 Indian episodes, each usable only from its end) extended or replaced by the user's; P&L by rates, spread, FRB, funding and liquidity with their interaction; days to liquidate and exit costs, normal and stressed, shares of NAV saleable in 1, 5 and 20 days; funding liquidity and the ALM ratios for a preset that borrows, not applicable for one that cannot ([`docs/risk.md`](docs/risk.md)) |
+| `limits` | Risk limits from a dated table (scope, metric, warning and hard levels, effective and approval dates, policy status, action), refused for unknown metrics, overlapping dates or bad levels; 33 metrics measured from the risk run and the engine (DV01, key rates, CS01, VaR, ES, stress, exposures, ISIN shares, ratings, liquidity, drawdown, leverage and the legal forms' own measures); daily checks with utilisation, warnings, breaches and a breach log (new, continuing, escalated, cured; active or passive); a shipped example table (every row EXAMPLE) and the legal forms' rules for counsel to confirm (`unregulated_company`, `nbfc_non_pd`); the pre-trade gate (the preset's rules, then the limits on the post-trade book, each refusal with its reasons) and a gated strategy wrapper for back-tests (`cr-strat limits`, `cr-strat pre-trade`) |
+| `portfolio` | Capital allocation across strategy books (numpy only): fixed weights, inverse volatility, equal risk contribution on volatility (coordinate descent, checked by Newton) or on ES, DV01, CS01, VaR or ES budgets, bounds, the strategies a preset forbids; pairwise EWMA covariance shrunk to positive definite and correlation; rebalancing rules and costs; drawdown de-risking and a strategy stop-loss; sizing to a DV01, CS01 or volatility target with lots; DV01-neutral hedges with OIS or G-secs and key-rate hedges by least squares or non-negative least squares; Euler contributions to parametric VaR and historical VaR and ES (`cr-strat allocate`) |
+| `daily` | The daily process of paper trading: a TOML configuration, the paper book replayed from inception, the day's risk, the limit checks with the breach log carried, the pre-trade check of the next day's orders, the VaR back-test, a reconciliation with the previous report, `report.md` (EXAMPLE limits in its first line while any is in force) and `manifest.json` (every input's sha256) (`cr-strat daily-report`) |
 | `policy_path` | MPC meeting dates shipped as package data (FY2026-27 with the day each became public, years declared complete, the calendar as known on any day, projection on request), a step model of overnight MIBOR as repo plus a spread, the repo-rate level after each meeting decided after the trade date backed out of one day's OIS quotes, starting from the rate known that day, with what the quotes identify; the MIBOR-repo spread from public rates, repo-rate changes matched to decisions; `cr-strat policy-path` |
 | `htmlparse` | Tables, text and links from saved HTML pages with the standard library: nested tables kept apart, colspan and rowspan expanded; strict number and date cells; firewall-page detection |
 | `rbi_releases` | RBI press releases from saved pages and the RSS feed: GoI, T-bill and SDL auction results, underwriting and switch results, auction announcements. A registry of release types; checks that refuse a release rather than misread it |
@@ -355,8 +369,15 @@ the pressure variable and the price response for each event.
   credit VaR needs spread histories the fund keeps, else it is incomplete. The scenario sizes marked U (most but
   BCBS's IRRBB shocks and FRTB's weights) are examples for the fund's own policy, and the conventions marked
   UNVERIFIED (key tenors, the quantile rule, gap scaling, liquidity participation and spreads, the 0% floor) are
-  listed in every run's `notes.txt`. Callable bonds are valued to maturity; JTD is not netted. Not built: limits,
-  pre-trade checks, allocation, the daily report ([`docs/risk.md`](docs/risk.md)).
+  listed in every run's `notes.txt`. Callable bonds are valued to maturity; JTD is not netted.
+- **The limits are examples, and the legal form is open.** Every level in `limits_example.csv` is an EXAMPLE to be
+  replaced by the fund's approved risk policy (the gate refuses to run on EXAMPLE rows unless told it is a test, and
+  every report and check says EXAMPLE); the legal-form rows read RBI's directions for counsel to confirm, and the
+  DRAFT ones warn without blocking. Owned fund, Tier 1 and capital are taken as NAV, settlement payables as outside
+  liabilities, an incomplete metric as a warning, and the gate's VaR is parametric (all UNVERIFIED). The limits, the
+  gate, the allocator and the daily process are tested on synthetic books only; no strategy has a real history yet,
+  so every covariance and drawdown is of back-tests or paper trading. Not built: official records, intraday checks,
+  an approval workflow for refused orders ([`docs/risk.md`](docs/risk.md)).
 - **The event ledger has seen no price.** Its supply, metrics and windows run on the free auction files and the RBI
   store's four days of Nov 2026; concessions, residual moves and event paths need a licensed price panel and are tested
   on synthetic ones only. It inherits the issuance ledger's gaps (below): no G-sec auctions from 17 Feb 2024 to 3 Apr

@@ -18,7 +18,9 @@ and ``approved_swaps.csv``, which the operator appends to the paper book: never 
 rerun is idempotent); (6) the day's VaR appended to the history and back-tested (``risk.backtest``); (7) the replay's
 positions and NAV of the previous report day compared with the stored ones (a revised mark or curve changes the past:
 each difference above ``1e-6`` relative is listed, never absorbed); (8) ``report.md`` and ``manifest.json`` (every
-input's path, sha256 and rows, the settings, ``as_of``, the package version, the rows of each output).
+input's path, sha256 and rows, the settings, ``as_of``, the package version, the rows of each output). Steps (4) and
+(5) read the ``engine/`` and ``risk/`` files just written (the CSVs round the last digits), so ``cr-strat limits`` and
+``cr-strat pre-trade`` on a report's own directories reproduce its limit and gate files byte for byte.
 
 **Files** (D7.2): ``<out_dir>/<YYYY-MM-DD>/`` with ``engine/`` (``returns.RESULT_FILES``), ``risk/``
 (``risk.RESULT_FILES`` and ``notes.txt``), ``limits/`` (``metrics``, ``limit_checks``, ``breaches``, ``breach_log``),

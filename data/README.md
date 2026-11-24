@@ -161,6 +161,29 @@ each number means: [`docs/risk.md`](../docs/risk.md).
 Spread and curve histories come from licensed prices (the exchanges, agency valuations, CCIL's NDS-OM data): keep
 them under their terms; the free auction table is only a coarse stand-in ([`docs/risk.md`](../docs/risk.md)).
 
+## Limits, orders and allocation tables: `cr-strat limits`, `pre-trade`, `allocate` and `daily-report`
+
+The fund's own tables for the limits layer ([`docs/risk.md`](../docs/risk.md): Limits, The pre-trade gate, Allocation
+and sizing, The daily process). The dated tables are read as of the run's `as_of` (a row effective or approved later
+is not used); every table is refused, naming the line, for an unknown column, metric or key.
+
+| File (kept by you) | Read by | Columns |
+|---|---|---|
+| Limit table | `limits --limits`, `pre-trade --limits`, the daily configuration's `limits` | `limits.LIMIT_COLUMNS`: `limit_id`, `name`, `metric`, `scope_type` (`fund`, `book`, `strategy`), `scope` (or `*`), `selector` (`key=value;...`, alternatives `a\|b`, `*` for each value), `unit`, `direction`, `warning_level`, `hard_level`, `legal_form` (`any` or a preset), `effective_from`, `effective_to`, `approved_by`, `approval_date`, `approval_ref`, `cure_business_days`, `action` (`block_increase`, `derisk`, `report`, `halt`), `policy_status` (`EXAMPLE`, `DRAFT`, `APPROVED`), `source`, `status` (V, P, U), `counsel` (yes, no), `notes`; start from a copy of `src/cr_strat/data/limits_example.csv` and replace every level and status by the fund's approved policy |
+| Proposed orders | `pre-trade --orders`, `daily-report --orders` | `limits.ORDER_COLUMNS`: `order_id` (optional; kept as the paper trade's id), **`book`**, `isin` (blank for an OIS), **`side`** (`buy` or `sell` a bond; `pay` or `receive` fixed for an OIS), **`face`** (rupees, positive; an OIS's notional), `months` (an OIS's tenor, required for one), `venue` (default `ndsom`; `auction` or `auction_nc` with `auction_date`), `limit`, `purpose` (an OIS's: `hedge` by default, or `view`), `special_repo_pct` (a short's), `auction_date` |
+| Queued orders | `pre-trade --queued` | the same columns: orders decided earlier and not yet booked, counted as filled |
+| Book to strategy | `allocate --strategy-books`, the daily inputs' `strategy_books` | `book`, `strategy`, `effective_from` (as for `risk --strategy-books`); a strategy named `S1`... `S10` (`S7_policy`) takes that strategy's legal-form rules |
+| Fixed weights | `allocate --fixed` | `portfolio.FIXED_WEIGHT_COLUMNS`: `strategy`, `weight` (0 to 1, summing to one), `effective_from`, `approved_by` |
+| Risk budgets | `allocate --budgets` (with `--risk-dir`) | `portfolio.BUDGET_COLUMNS`: `strategy`, `metric` (`dv01`, `cs01`, `var`, `es`), `budget` (positive), `unit` (default `rs_per_bp` for DV01 and CS01, `rs` otherwise), `effective_from` |
+| Weight bounds | `allocate --bounds` | `portfolio.BOUNDS_COLUMNS`: `strategy`, `min_weight`, `max_weight` (`0 <= min <= max <= 1`), each strategy once |
+| The paper fund's configuration | `daily-report --config` | a TOML file: `fund`, **`access`**, **`inception`**, `board_resolution_date`, `allow_example_limits` (true or false), `limits` (`example` or a path), `project_calendar`, `decision_time` (HH:MM); `[inputs]` (paths relative to the file) `marks`, `nss_params`, `ois_quotes`, `fixings`, `store`, `haircuts`, `master`, `liquidity`, `residual_history`, the corporate and FRB tables, `ratings`, `tbills`, `issuers`, `stock`, `strategy_books`, `factor_history`, `adv`, `seniority`, `proxies`, `scenarios`, `costs`, `auctions`, `flows`, `trades`, `swaps`; `[risk]` `methods`, `horizons`, `window`, `min_obs`, `min_obs_hard`, `stressed`, `var_alpha`, `es_alpha`, `cov_method`, `ewma_lambda`, `participation`, `stress_multiplier`; `[gate]` `cash_buffer_pct` |
+| The paper book | the daily inputs' `trades` and `swaps` | `returns.TRADE_COLUMNS` and `SWAP_TRADE_COLUMNS`: each day's `orders/approved_trades.csv` and `approved_swaps.csv` appended by you (prices and fixed rates blank: filled by the engine) |
+
+Shipped with the package (`src/cr_strat/data/`): `limits_example.csv` (E01-E30, **every row an EXAMPLE**, not a
+policy), `legal_form_limits.csv` (L01-L24: the legal forms' rules as read from RBI's directions, each row for counsel
+to confirm, always added to the fund's table) and `nbfc_risk_weights.csv` (the middle layer's risk weights by kind and
+sector). The daily process writes its own files under `<out-dir>/<date>/` and never changes its inputs.
+
 ## Corporate bond and FRB terms: `cr-strat corp-price`, `frb-price` and the commands that use them
 
 Typed in by you from term sheets or, for listed ISINs from 18 Aug 2025,

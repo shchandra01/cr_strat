@@ -1,14 +1,22 @@
-# Risk: sensitivities, VaR and ES, stress tests and liquidity
+# Risk: sensitivities, VaR and ES, stress tests, liquidity, limits, allocation and the daily report
 
 What [`risk.py`](../src/cr_strat/risk.py) and [`stress.py`](../src/cr_strat/stress.py) measure for the books the
 return engine runs ([`analytics.md`](analytics.md), The return engine and costs), with `cr-strat risk` and
 `cr-strat var-backtest`, as of 24 Nov 2026. Everything was built and tested on synthetic books and histories with
 known answers and on the free auction table (labelled coarse); no licensed price, curve, OIS quote or spread history
-has been through it. Not built here: risk limits, pre-trade checks, capital allocation and the daily report.
+has been through it. On these numbers, [`limits.py`](../src/cr_strat/limits.py),
+[`portfolio.py`](../src/cr_strat/portfolio.py) and [`daily.py`](../src/cr_strat/daily.py) build the limits, the
+pre-trade gate, capital allocation and the daily paper-trading report (`cr-strat limits`, `pre-trade`, `allocate` and
+`daily-report`), tested the same way; every limit level shipped is an EXAMPLE for the fund's own risk policy to
+replace, and the rules that depend on the fund's legal form (unsettled: a question for counsel) are marked for counsel.
 
 - [Running it](#running-it)
 - [What each number means](#what-each-number-means)
 - [Method](#method): the book, sensitivities, factor histories, VaR and ES, back-tests, stress scenarios, liquidity
+- [Limits](#limits): the table, the metrics, the checks, the breach log, de-risking, what depends on the legal form
+- [The pre-trade gate](#the-pre-trade-gate): the preset's rules, the order's risk, the limits; back-tests through it
+- [Allocation and sizing](#allocation-and-sizing): weights, budgets, rebalancing, sizing, hedges, contributions
+- [The daily process](#the-daily-process): the paper fund's configuration, files, report and daily routine
 - [Look-ahead and determinism](#look-ahead-and-determinism)
 - [Conventions and what the fund must decide](#conventions-and-what-the-fund-must-decide)
 - [Data needed before real use](#data-needed-before-real-use)
@@ -227,6 +235,260 @@ settle; for one that borrows, the night's borrowing against its limit, the hairc
 three structural liquidity ratios of RBI's ALM Directions for NBFCs (cumulative mismatches at most 10%, 10% and 20% of
 cumulative outflows in 1-7, 8-14 and 15-30 days), securities slotted by their days to liquidate.
 
+## Limits
+
+[`limits.py`](../src/cr_strat/limits.py) reads a dated table of limits, measures each limit's metric on a day's book,
+checks it and carries a breach log from one day to the next. The same code runs in `cr-strat limits` (on the
+directories `cr-strat risk` and `cr-strat returns` write), in the daily process and in the pre-trade gate (on the book
+with the proposed orders added).
+
+```bash
+cr-strat limits --risk-dir data/out/risk_20261214 --engine-dir data/out/returns --date 2026-12-14 \
+    --limits data/raw/limits.csv --access nbfc_non_pd --marks data/raw/marks.csv \
+    --nss-params data/out/nss_params.csv --trades data/raw/trades.csv \
+    --breach-log data/out/limits_20261211/breach_log.csv --out-dir data/out/limits_20261214
+    # --limits example: the shipped examples (every row EXAMPLE); --board-resolution-date: L03;
+    # --stock, --auctions, --ratings, --corporate-terms: the concentration and when-issued metrics
+```
+
+It writes `metrics.csv` (`METRIC_COLUMNS`: each metric, scope and key the limits in force ask for, with
+`inputs_complete` and a detail), `limit_checks.csv` (`LIMIT_CHECK_COLUMNS`: one row per limit and key with the value,
+levels, utilisation and status), `breaches.csv` (the day's open and cured episodes) and `breach_log.csv` (the whole
+log: the next day's `--breach-log`). Exit 0 written, 1 no NAV on the date, 2 bad input; with EXAMPLE rows in force the
+first line printed is the EXAMPLE warning.
+
+**The table** (`LIMIT_COLUMNS`; the format is in [data/README.md](../data/README.md), Limits, orders and allocation
+tables). One row per limit: `limit_id` (unique across the tables used together), `metric` (one of the 33 below),
+`scope_type` (`fund`, `book` or `strategy`) and `scope` (a name, or `*` for each scope of the type), `selector`
+(`key=value` pairs joined by `;`, alternatives by `|`, `*` to check each value separately, as in
+`sector=*;kind=corporate|cp`; besides each metric's own keys, `abs=yes` compares absolute values and `min_assets_cr`
+and `max_assets_cr` make a row apply only from, or below, a size of total assets in crore), `unit`, `direction` (`max`
+or `min`), `warning_level` and `hard_level` (a blank warning is the hard level), `legal_form` (`any` or a preset),
+`effective_from`, `effective_to`, `approved_by`, `approval_date`, `approval_ref`, `cure_business_days`, `action`
+(`block_increase`, `derisk`, `report` or `halt`), `policy_status` (`EXAMPLE`, `DRAFT` or `APPROVED`), `source`,
+`status` (V, P or U), `counsel` and `notes`. A table is refused, naming the line, for a duplicate id, an unknown
+metric, unit or selector key (with the closest name), a warning level beyond the hard one, a blank hard level, or two
+rows of one limit (metric, scope, selector, unit, direction and legal form) in force on the same day. A row is in
+force on day `d` when `effective_from <= d < effective_to`, its `approval_date` is on or before `d` and its legal form
+is `any` or the run's preset, so a limit approved later never applies to an earlier day.
+
+**The metrics** (`limits.METRICS` gives each one's keys, units, direction and what it reads):
+
+| Family | Metrics |
+|---|---|
+| Market | `dv01` (Rs per bp or years of NAV, by tenor `bucket`), `krd` (by `curve` and `tenor`), `cs01` (by rating, issuer, group, sector, tenor bucket, kind), `var` and `es` (the risk run's; the gate's parametric), `stress_loss` (a scenario, or the worst of a family), `leverage` (gross bonds or repo over NAV) |
+| Concentration | `exposure` (% of NAV or Rs, by issuer, group, sector, rating, kind or ISIN), `isin_share` (face over the outstanding stock), `rating_floor` (the worst notch held, or the share of NAV below a grade; `of=purchases` reads each credit purchase), `max_tenor`, `jtd` |
+| Liquidity | `liquid_share` (NAV saleable within `days`), `illiquid_share`, `days_to_liquidate` |
+| Performance | `drawdown` (the NAV index below its peak), `loss_window` (P&L over `days` business days over NAV at the start) |
+| Legal form | `borrowing`, `total_assets`, `outside_liabilities`, `nof`, `crar`, `tier1`, `single_party`, `single_group`, `alm_mismatch`, `short_face`, `when_issued`, `ois_hedge_ratio`, `ois_hedge_effect`, `settlement_cover`, `corporate_repo`, `board_resolution` |
+
+Exposures, CS01 and JTD by issuer, group and sector count corporate bonds, CP and CD (GoI and state bonds exempt). A
+purchase still to settle counts at its market value (the trade-date view) and its payable as an outside liability;
+owned fund, Tier 1 and capital are taken as NAV (the accountant's mapping); all UNVERIFIED.
+
+**The checks.** Utilisation is `value / hard` for a maximum and, for a minimum, `hard / value` with a positive level
+or `value / hard` with a negative one (a drawdown), so that 1 is the boundary either way (UNVERIFIED). Status:
+`breach` past the hard level, `warning` past the warning level, `ok`, `incomplete` when the metric's inputs are
+missing (a warning, never a breach: UNVERIFIED), and `not_applicable` for the other legal form's rows (listed, never
+measured, so that the checks show which rules depend on the form) and for the fund's own borrowing limits under a
+preset that cannot borrow. Every row of an `EXAMPLE` limit says `EXAMPLE` in its detail.
+
+**The breach log.** A breach opens an episode (`new`, its cure date `cure_business_days` business days on); still in
+breach the next day it is `continuing`, past its cure date (at once for a legal-form rule) `escalated`, and back
+within the level `cured` (kept in the log). `origin` is `active` when the breach first appears on a day an order in
+its scope filled, `passive` when the market moved. The example cure periods (UNVERIFIED): 30 business days for
+concentration, ratings and tenor, 5 for market risk and liquidity, 1 for drawdown and stop-loss, 0 for legal-form
+rules.
+
+**De-risking.** While a `derisk` row is in force (E24, the drawdown limit of the example table), the fund's drawdown
+scale (`portfolio.drawdown_scale` on its NAV index: 0.5 at -3%, 0.25 at -5%, back to 1 only above -1.5%) times a
+strategy's stop-loss scale (a 20-day P&L at -2% of the fund's NAV halves it) multiplies the hard and warning levels of
+the DV01, KRD, CS01, VaR and ES maxima in its scope (example levels, UNVERIFIED).
+
+**The shipped tables.** `limits_example.csv` (E01-E30) holds **examples only**: every row is `EXAMPLE`, its note
+says to replace it with the fund's approved risk policy before any real use, and no level in it is a recommendation
+(round numbers; SEBI's investment restrictions for mutual funds were a reference for some). `legal_form_limits.csv`
+(L01-L24) is this project's reading of RBI's directions for each legal form, for counsel to confirm: every row says
+`counsel=yes` and gives its paragraph and the claim ids of the verified research notes; it is always added to the
+fund's table. `nbfc_risk_weights.csv` holds the middle layer's risk weights (Central Government securities and SDLs
+0, corporate bonds, CP and CD 100%, bonds of public sector banks 20% when the issuer table gives the sector
+`psu_bank`).
+
+**What depends on the legal form.** The fund's legal form is unsettled and a question for counsel. Everything runs
+under either preset; these rules change with it:
+
+| Rule | `unregulated_company` | `nbfc_non_pd` |
+|---|---|---|
+| Borrowing (repo, TREPS) | none: L01 and the gate's cash rule (V) | allowed; below Rs 1,000 crore of assets, outside liabilities at most 7 times owned fund (L10, V) |
+| Short sales | none (L04, V) | none for a non-PD NBFC (L18, V) |
+| OIS | hedging only: the engine's DV01 test (L05, V) and the swaps must not raise the VaR or the sum of absolute key rates (L06: the definition V, this reading U) | any purpose; OIS views of a base-layer NBFC (L19, DRAFT, P: warns) |
+| Size | assets below Rs 1,000 crore for the exemption (L02, V) | net owned fund at least Rs 10 crore (L09, V); from Rs 1,000 crore of assets CRAR 15%, Tier 1 10%, single party 25% and single group 40% (L11-L14, V) |
+| ALM | not applicable (nothing borrowed) | from Rs 100 crore of assets, negative mismatches at most 10%, 10% and 20% in 1-7, 8-14 and 15-30 days (L15-L17, V) |
+| Settlement payables | leverage at most 1 and purchases covered by cash (L07-L08, DRAFT: warn) | counted as outside liabilities (U) |
+| Corporate bond repo | none | base layer (L20, DRAFT, P: warns) |
+| Board resolution | each financial year (L03, V: reported) | none |
+| When-issued | at most 25% long and 10% short of the notified amount (L21-L22, V) | the same (L23-L24, V) |
+| Strategies (allocation) | S7's OIS views weight 0; S3 and S5 long-only against paid OIS; S1 and S2 unfunded; leverage at most 1 | every strategy, within the base layer's leverage and, from Rs 1,000 crore of assets, CRAR |
+
+DRAFT rows are measured and reported but never block an order; each becomes `APPROVED`, or is deleted, once counsel
+has read it.
+
+## The pre-trade gate
+
+`limits.PreTradeGate(limits, ctx, allow_example_limits=False)` decides proposed orders (`returns.Order`) against the
+book as of the decision time: `limits.state_from_result` builds the state from a day of an engine run or a
+`cr-strat returns` directory, `limits.state_from_snapshot` from a back-test's `Snapshot` (read only through its
+accessors). `check(state, orders)` returns the approved orders, the same objects in the same order, and
+`GATE_COLUMNS` rows: one per order, or one per failed limit. Each order is decided against the state plus the orders
+already approved in the same decision and the queued ones (counted as filled, UNVERIFIED):
+
+1. **The preset's rules first**, refusing whatever the limits say: an OIS under a preset with none, or with
+   `purpose=view` under `hedge_only` (Rupee IRD Directions 2025 para 5.4(i)); a sale that would leave a book short
+   without the right to short (Short Sale Directions 2018 para 3); a when-issued position beyond the preset's share of
+   the notified amount (When Issued Directions 2018 para 6); a purchase that would need borrowing under a preset that
+   cannot borrow, keeping 1% of its consideration in cash for the fill and costs (`cash_buffer_pct`, UNVERIFIED).
+2. **The order's risk**: a pending position priced at the day's traded mark, else the valuation mark, else a model
+   price from the curve and the bond's residual (refused, with the reason, with none); an OIS as a par swap on the
+   day's OIS curve. Every metric is recomputed on the book with it (sensitivities, key rates, CS01, exposures,
+   liquidity and funding liquidity, each book's cash); VaR and ES are parametric (EWMA) on the post-trade
+   sensitivities, the gate's approximation (UNVERIFIED); stresses are revalued in full (the state once, each order
+   once).
+3. **The limits in force**, in `limit_id` order: `refused` when, for the hard level of an enforced limit (`APPROVED`;
+   `EXAMPLE` only with `allow_example_limits`), the post-trade value is past it **and worse than before** (a deeper or
+   a new breach); an order that shrinks a breach passes, and keys it does not change never block it.
+   `approved_with_warning` when only a warning level fails, a `DRAFT` row fails or a metric is incomplete. A `halt`
+   limit in breach refuses every order in its scope; a rating floor `of=purchases` reads each credit purchase's own
+   rating as known then; `report` rows have no effect here.
+
+A failure row names the limit, the metric, the scope, the pre- and post-trade values and the levels, with the reason
+in words, for example `limit E01 dv01 (fund): post-trade 5.34781 years above the hard 4 years (pre-trade 5.28255
+years)`; on a refused order the rows that only warn begin `warning only:`. The gate refuses to run at all on EXAMPLE
+limits unless told they are for testing (`allow_example_limits=True`, `--allow-example-limits`).
+
+```bash
+cr-strat pre-trade --orders data/raw/orders_20261215.csv --engine-dir data/out/returns --date 2026-12-14 \
+    --limits data/raw/limits.csv --access nbfc_non_pd --marks data/raw/marks.csv \
+    --nss-params data/out/nss_params.csv --trades data/raw/trades.csv --out-dir data/out/gate_20261214
+```
+
+writes `gate.csv`, `approved_trades.csv` and `approved_swaps.csv` (the next business day's trades, prices blank) and
+prints each decision; exit 0, or 2 on bad input or EXAMPLE limits without the flag.
+
+**Back-tests through the gate.** `returns.run_backtest(limits.GatedStrategy(strategy, gate,
+recorder=limits.risk_recorder(ctx)), ...)` runs a strategy through the same gate each evening: a refused order never
+reaches the engine and stays in `GatedStrategy.log_frame()`, keyed by `(decision_date, seq)` with its reasons; the
+recorder keeps each evening's risk numbers. The engine did not change: an ungated run is today's code path, and a gate
+that approves everything, with or without the recorder, writes the same bytes as the ungated run.
+
+## Allocation and sizing
+
+[`portfolio.py`](../src/cr_strat/portfolio.py) (numpy only, no random starts) weights strategy books, scales them to
+risk budgets, and sizes and hedges trades; every trade it suggests still goes through the gate.
+
+```bash
+cr-strat allocate --nav data/out/returns/nav.csv --strategy-books data/raw/strategy_books.csv --method erc_vol \
+    --as-of 2026-12-14 --access nbfc_non_pd --out data/out/allocation_20261214.csv --correlation data/out/corr.csv
+    # --method fixed --fixed weights.csv | inverse_vol | erc_es | budget --budgets budgets.csv --risk-dir ...
+    # --bounds bounds.csv; --algorithm newton; --cov-method sample
+```
+
+- **Returns and covariance**: each strategy's daily return from the engine's NAV by book, `(NAV - NAV_prev - flow) /
+  (NAV_prev + flow)`, books mapped to strategies as dated in `strategy_books`; EWMA (lambda 0.94) or sample
+  covariance, pairwise over the days both strategies had capital, refused below 20 joint observations, shrunk towards
+  its diagonal in steps of 0.05 until positive definite (UNVERIFIED).
+- **Methods** (`ALLOCATION_COLUMNS`): `fixed` (a dated table of weights), `inverse_vol`, `erc_vol` (equal risk
+  contributions by cyclical coordinate descent, checked by Newton's method), `erc_es` (equal contributions to
+  historical ES by a damped fixed point, refused with the last error when it does not converge: exact ES parity need
+  not exist), `budget` (each strategy's scale `min(1, budget / |metric|)` for a DV01, CS01, VaR or ES budget, above 1
+  only if asked). Bounds are applied by clipping and re-solving (UNVERIFIED). A strategy the preset forbids gets
+  weight 0, with the reason (S7's OIS views under `unregulated_company`); `cr-strat allocate` prints each
+  strategy's weight, risk share and note.
+- **Rebalancing and de-risking**: `rebalance_due` (the first business day of a month, or a drift of 5 percentage
+  points or 20% of the target, never while a hard breach in scope is open) and `rebalance_cost`; `drawdown_scale` and
+  `stop_loss_scale` as above.
+- **Sizing**: `size_to_dv01` and `size_to_cs01` (`face = target / (sensitivity per 100 / 100)`), `size_to_vol`
+  (capped at 2 times), `round_to_lot` (down to Rs 5 crore, a parameter).
+- **Hedges**: `hedge_ois_notional` (the DV01 over the swap's annuity, the rule of `asset_swaps.hedge_notional`),
+  `hedge_gsec_face`, and `key_rate_hedge` by least squares or, with each hedge in its allowed direction, non-negative
+  least squares (Lawson and Hanson's active-set method, written in numpy).
+- **Correlation and contributions**: `correlation_table`; Euler components of parametric VaR, of historical ES (the
+  Acerbi-Tasche tail weights, summing to the ES exactly) and of historical VaR (a band of 5 scenarios around the
+  VaR's, rescaled to sum to it: UNVERIFIED).
+
+An annuity-sized OIS hedge can fail the engine's 105% DV01 test when the swap is short: in the tests a 1-year payer
+sized by its annuity against 6.94% GS 2036 carries 1.0593 times the bond's DV01 as the engine measures it (a 4-year
+one 1.0251). Size the swap by the engine's DV01 when the hedge must pass that test.
+
+## The daily process
+
+[`daily.py`](../src/cr_strat/daily.py) is paper trading: once a day, after the evening's data is public, it runs the
+code of a back-test with that day as the last, as of 20:00 (the engine's decision time; nothing reads the clock).
+
+```bash
+cr-strat daily-report --config paper/fund/config.toml --date 2026-12-14 --orders paper/fund/orders_20261215.csv \
+    --out-dir paper/fund
+```
+
+It replays the paper book from inception with `returns.run_book`, runs the day's risk, checks the limits (carrying the
+previous report's breach log), gates the proposed orders for the next business day, appends the day's VaR to its
+history and back-tests it, compares the replay of the previous report's day with what that report stored, and writes
+`<out-dir>/<date>/`: `engine/`, `risk/`, `limits/`, `orders/` (`proposed`, `gate`, `approved_trades`,
+`approved_swaps`, `open_orders`), `backtest/`, `reconciliation.csv`, `report.md` and `manifest.json` (every input's
+path, sha256 and rows, the configuration's sha256, the settings, `as_of`, the package version and each output's rows).
+Its limit and gate files are computed from the `engine/` and `risk/` files it has just written, so `cr-strat limits`
+and `cr-strat pre-trade` on those directories reproduce them byte for byte. Exit 0 written, 2 bad input; a weekend or
+holiday, a day before inception, or EXAMPLE limits for the gate without `allow_example_limits` are refused before
+anything is written.
+
+The configuration is a TOML file read with the standard library's `tomllib` (unknown keys refused, naming the
+closest; the full list in [data/README.md](../data/README.md)):
+
+```toml
+fund = "paper"
+access = "nbfc_non_pd"              # required: the legal form is a question for counsel
+inception = "2026-12-01"
+board_resolution_date = "2026-04-02"
+limits = "limits.csv"               # or "example" (every row EXAMPLE: then allow_example_limits = true, tests only)
+
+[inputs]                            # paths relative to this file
+marks = "marks.csv"
+nss_params = "nss_params.csv"       # with public_from
+flows = "flows.csv"                 # the capital
+trades = "trades.csv"               # the paper book: each day's approved_trades.csv appended
+corporate_terms = "corporate_terms.csv"
+
+[risk]
+min_obs_hard = 60
+
+[gate]
+cash_buffer_pct = 1.0
+```
+
+`report.md` carries `(EXAMPLE limits)` in its first line while any EXAMPLE row is in force, then the date, `as_of`,
+the preset and the limits in force by policy status, then escalated and new breaches, NAV and P&L (the day, the month
+and the financial year to date, the attribution by line), DV01 and key rates, credit (CS01 by rating, the five
+largest issuers, groups and sectors with JTD), VaR and ES with coverage, the stress table worst first, liquidity and
+funding liquidity (or why it does not apply), every limit's status, the next day's orders with each refusal's
+reasons, the back-test, the reconciliation, data quality and the UNVERIFIED rules used.
+
+**The daily routine of paper trading:**
+
+1. When the day's prices, curve fit (`cr-strat curve-fit --nss-params ... --public-from`) and other inputs are
+   public, add them to the input files with their `public_from`.
+2. Write the strategy's proposed orders for the next business day (`ORDER_COLUMNS`) and run `cr-strat daily-report`
+   for the day.
+3. Read `report.md`: escalated and new breaches first; then the reconciliation, where any row means an input of an
+   earlier day changed (a revised mark or fit) and is to be understood before going on; then the refused orders and
+   their reasons.
+4. Append the day's `orders/approved_trades.csv` (and `approved_swaps.csv`) to the paper book's trades (and swaps)
+   file; the engine fills them the next day at that day's traded mid plus or minus the half spread (an OIS at the
+   day's par rate). The process never writes its own inputs, so rerunning a day writes the same bytes.
+5. Keep each day's folder: the next day reads its breach log, VaR history and engine files.
+
+Not built: freezing a report as the official record, intraday checks, an approval workflow for refused orders (each
+is listed with its reasons for a person to act on), and a library `Strategy` in the daily command (a strategy object
+runs through `run_backtest(GatedStrategy(...))` instead).
+
 ## Look-ahead and determinism
 
 Every input is cut at `as_of`: curves and factor levels by their `public_from` (a row without one counts from 18:00
@@ -237,6 +499,12 @@ at 19:00 uses the day before's curve (flagged `stale_curve`) and one observation
 `as_of` is not used, a strategy peeking through a snapshot leaves the engine's files unchanged. The same inputs give
 the same bytes in any row order (tested on shuffled positions, NAV, funding and NSS rows, and in the demo); the risk
 modules never read the clock.
+
+The limits apply by their effective and approval dates (a row approved after `as_of` is not in force; tested), the
+ratings, outstanding stock and notified amounts as known at `as_of`, and the gate's prices and factor history as
+public at the decision time. The gate reads its limits in `limit_id` order and writes the same bytes for a shuffled
+table; the daily process writes the same bytes when a day is rerun and for a shuffled limit table (only the
+manifest's hash of the table differs); `limits`, `portfolio` and `daily` never read the clock.
 
 ## Conventions and what the fund must decide
 
@@ -263,6 +531,14 @@ UNVERIFIED (a choice with no source: listed in every run's `notes.txt`, settable
 | Floor of shocked zero rates | 0% | U (national discretion) |
 | Traffic light below six observations | no exception is green | U |
 | Access preset | must be chosen (`unregulated_company` cannot borrow: funding stresses not applicable) | a question for counsel |
+| Limit levels and their warning-to-hard spacing | `limits_example.csv`: EXAMPLE rows, for the fund's approved risk policy to replace | U |
+| Legal-form rows | `legal_form_limits.csv`: a reading of RBI's directions; DRAFT rows warn only | for counsel |
+| Cure periods | 30 business days for concentration, ratings and tenor; 5 market risk and liquidity; 1 drawdown; 0 legal form | U |
+| Incomplete metric | a warning, never a breach | U |
+| Owned fund, Tier 1, capital | NAV; payables of purchases to settle as outside liabilities; purchases at market value | U (the accountant's mapping) |
+| The gate | parametric VaR and ES on post-trade sensitivities; queued orders as filled; 1% cash buffer on purchases without borrowing | U |
+| De-risking | drawdown 0.5 at -3%, 0.25 at -5%, back above -1.5%; a strategy's 20-day loss of 2% of NAV halves it | U |
+| Allocation | 20 joint observations; shrinkage in steps of 0.05; bounds by clipping; rebalancing bands 5 points or 20%; Rs 5 crore lots; volatility scale at most 2 | U |
 
 ## Data needed before real use
 
@@ -276,6 +552,9 @@ UNVERIFIED (a choice with no source: listed in every run's `notes.txt`, settable
 - The **issuer table** (group, sector, seniority), **rating actions** with public times, the **ADV table** or marks
   with volumes, the **haircut** and CCIL class tables, the **NAV** and funding of the engine run.
 - The fund's own **scenario policy** in place of the U examples, and its decisions on the U conventions above.
+- For the limits and the gate: the fund's **approved limit table** in place of every EXAMPLE row, counsel's reading
+  of the legal form and of each DRAFT row, the **board resolution** date, the **strategy-book map**, budgets and
+  fixed weights, and the **outstanding stock** and **auction table** for the ISIN-share and when-issued limits.
 
 ## What was checked, and what was not
 
@@ -297,15 +576,36 @@ bytes as before this layer (compared file by file on a reference run). The free 
 of the specification: Rs 49,88,500 for Rs 100 crore of GS 2036 on the auction table's 154 same-security changes in
 the 9-11-year band (labelled coarse: primary-market cut-offs, pooled, fortnightly).
 
+Checked for the limits, gate, allocation and daily process (tests `test_limits.py`, `test_portfolio.py`,
+`test_daily.py`, `test_cli_limits.py`, on synthetic books): the specification's vectors T26-T32 (ERC weights
+0.3836125063, 0.1918062531, 0.2426178518 and 0.1819633888 by both solvers, coordinate descent in 15 sweeps and Newton
+in 5 at a tolerance of 1e-12, risk contributions equal within 1e-12; the drawdown scales 1, 1, 1, 0.5, 0.5, 0.25,
+0.25, 0.25, 1, 1, 1; Rs 77,78,11,917.83 of face for Rs 5 lakh per bp of GS 2036; the least-squares and non-negative
+key-rate hedges; Euler components Rs 5,31,018.9919, 18,66,262.3991 and 4,15,580.0806 summing to the VaR; ES
+components 5.6 and 0.2 summing to the ES; the hedge-effect VaRs Rs 62,81,140, 68,16,636 and 1,84,648); every refusal
+of the limit table and of the configuration; limits in force by dates, approval and legal form; statuses,
+utilisation and the breach log through new, continuing, escalated and cured; the preset's rules refusing first; the
+worse-than-before rule; EXAMPLE and DRAFT rows; queued orders; a gate with the same bytes in any row order; a gated
+back-test whose refused order is logged and absent from the fills while its pass-all twin writes the same bytes; a
+gated NBFC back-test whose purchases count each book's cash (a regression test); a two-day paper run with its 39
+files, the report's first line and the manifest's hashes, the breach log carried, a revised mark listed in the
+reconciliation, an idempotent rerun and both presets; the four commands' exit codes, and `limits` and `pre-trade`
+writing the same bytes as the daily process on its own directories under both presets. In scratch: the existing
+commands write the same bytes as at commit 80f9e8b (7 runs, 63 files, by sha256), and a pass-all gate around that
+commit's back-test, with and without a risk recorder, writes its 9 files byte for byte.
+
 Not checked: any real book, curve history, spread history or OIS quote; a stressed window on a real stress period;
 the revaluation's speed on a large real book (the demo's six positions with 300 days of history take about 2.3 s
 for every table, 3.6 s with the stressed and liquidity-horizon ES; 300 days for a swap book 0.4 s); FRTB's risk weights against a later revision; RBI's IRRBB guidelines for banks (not read);
 AMFI's stress parameters (not found); Indian recovery rates for the LGDs; the hypothetical P&L against a real
-attribution.
+attribution; any fund's real limit policy, and the legal-form rows against counsel's reading; the gate's speed on a
+large book (about 0.6 s for 7 orders on the test book); the de-risking and allocation parameters against any real
+strategy history (none exists yet).
 
-**Not built**: limits, pre-trade checks, allocation, the daily report (a later layer); an option model for callable
-bonds; reverse stress tests; intraday margin; the mandate-threshold forced selling of S9 beyond a notch downgrade
-with a multiplier; netting of JTD; a VaR of the OIS basis to the G-sec curve beyond the two curves' own key rates.
+**Not built**: an option model for callable bonds; reverse stress tests; intraday margin; the mandate-threshold forced
+selling of S9 beyond a notch downgrade with a multiplier; netting of JTD; a VaR of the OIS basis to the G-sec curve
+beyond the two curves' own key rates; for the limits layer, see [The daily process](#the-daily-process) (official
+records, intraday checks, an approval workflow).
 
 ## Sources
 
@@ -324,3 +624,15 @@ Stated in our own words; nothing is copied.
 - RBI's ALM Directions for NBFCs (the structural liquidity limits), as summarised in the analytics notes
   ([`analytics.md`](analytics.md)); CCIL's TREPS caps through `funding.treps_shares`.
 - The scenario table's `source` column names the source of each row.
+- S. Maillard, T. Roncalli and J. Teiletche, "The properties of equally weighted risk contribution portfolios",
+  *Journal of Portfolio Management* 36(4), 2010; T. Griveau-Billion, J.-C. Richard and T. Roncalli, "A fast algorithm
+  for computing high-dimensional risk parity portfolios", 2013; F. Spinu, "An algorithm for computing risk parity
+  weights", 2013 (ERC and its two solvers).
+- C. Lawson and R. Hanson, *Solving Least Squares Problems*, 1974 (non-negative least squares); D. Tasche, "Risk
+  contributions and performance measurement", 1999, and "Capital allocation to business units and sub-portfolios:
+  the Euler principle", 2008 (Euler contributions).
+- RBI's directions as the legal-form table cites them by paragraph (NBFC Registration and Scale Based Regulation,
+  Capital Adequacy, Concentration, ALM and Investment Portfolio Directions; the Repo Directions 2025; the Short Sale
+  and When Issued Directions 2018; the Rupee Interest Rate Derivatives Directions 2025), as recorded in the verified
+  research notes (the claim ids in each row's `source`); SEBI's Master Circular for Mutual Funds (its investment
+  restrictions) as a reference for some example levels.

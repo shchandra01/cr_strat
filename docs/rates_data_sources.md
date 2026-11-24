@@ -693,6 +693,23 @@ with their times, funding at the RBI store's corporate bond repo rate),
 waiting for marks and rating histories under the agencies' terms; the
 corporate terms tables themselves are typed in by the user, and primary
 data and fundamentals for S8 and S10 remain.
+Across the strategies, the risk and portfolio layer (built ahead of any real
+history and tested on synthetic books only, described in
+[`risk.md`](risk.md)): key-rate DV01s, CS01, jump to default, VaR and ES with
+their back-tests, stress scenarios and liquidity in
+[`risk.py`](../src/cr_strat/risk.py) and
+[`stress.py`](../src/cr_strat/stress.py), `cr-strat risk` and `var-backtest`;
+a dated limits table with daily checks and a breach log, the legal forms'
+rules for counsel to confirm, and a pre-trade gate that refuses orders with
+their reasons, in back-tests as in paper trading, in
+[`limits.py`](../src/cr_strat/limits.py), `cr-strat limits` and `pre-trade`;
+allocation across strategy books (fixed weights, inverse volatility, equal
+risk contribution, risk budgets), drawdown de-risking, sizing and DV01-neutral
+hedges in [`portfolio.py`](../src/cr_strat/portfolio.py), `cr-strat allocate`;
+and the daily paper-trading report in [`daily.py`](../src/cr_strat/daily.py),
+`cr-strat daily-report`. Every limit level shipped is an example for the
+fund's own policy; the layer waits for the fitted curve history, spread
+histories, the fund's approved limits and counsel's reading of its legal form.
 
 ## Pitfalls
 

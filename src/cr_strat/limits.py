@@ -46,7 +46,19 @@ that first appears on a day an order in its scope filled is ``active`` (the gate
 Cure periods (examples, UNVERIFIED): concentration, rating and tenor 30 business days (the period SEBI's Master
 Circular for Mutual Funds, para 3.11, gives schemes after a passive breach: a reference), market risk and liquidity 5,
 drawdown and stop-loss 1 (``derisk``), legal-form rules 0. A holding downgraded below the rating floor is a passive
-breach, never a forced sale; the gate blocks only purchases.
+breach, never a forced sale; the gate blocks only purchases. ``monitoring_limits`` joins the fund's table with every
+preset's legal-form rows, so that a day's checks list the other form's rules as ``not_applicable``.
+
+**The pre-trade gate** (L5.6; ``PreTradeGate`` gives the rules in full). An order is decided against the state of the
+book at the decision time (``state_from_result``: an engine run's day or a ``cr-strat returns`` directory;
+``state_from_snapshot``: a back-test's ``Snapshot``; each book's cash from the day's NAV rows, which the ALM and
+settlement-cover metrics read) plus the orders already approved in the same decision: first the access preset's own
+rules (OIS purpose, short sales, when-issued shares, borrowing a preset cannot do), then every limit in force, in
+``limit_id`` order, on the post-trade book. It is refused when an enforced hard level is passed and the value is worse
+than before, approved with a warning for a warning level, a ``DRAFT`` row or an incomplete metric; on a refused order
+the rows that only warn begin ``warning only:``. A fund's row may not reuse a legal-form row's id. ``GatedStrategy``
+wraps a ``Strategy`` for ``returns.run_backtest``: refused orders never reach the engine and are logged by
+``(decision_date, seq)``; a gate that approves everything leaves the engine's outputs byte-identical.
 
 **Sources** (cited in our own words): RBI's NBFC Registration and SBR, Capital Adequacy, Concentration, ALM and
 Investment Portfolio Directions, the Repo Directions 2025, the Short Sale and When Issued Directions 2018 and the

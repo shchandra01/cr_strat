@@ -60,8 +60,8 @@ import math
 import re
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime
+from pathlib import Path
 from statistics import NormalDist
-from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -1082,9 +1082,8 @@ def component_var_hs(pnl, alpha: float = rk.VAR_ALPHA, *, band: int = HS_VAR_BAN
     return pd.Series(comp, index=labels, dtype=float)
 
 
-def write_allocation(frame: pd.DataFrame, path) -> Any:
+def write_allocation(frame: pd.DataFrame, path) -> Path:
     """Write an allocation (``ALLOCATION_COLUMNS``) to ``path`` (the same frame gives the same bytes)."""
-    from pathlib import Path
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
     frame.to_csv(out, index=False, date_format="%Y-%m-%d")
