@@ -282,6 +282,11 @@ PERFORMANCE_COLUMNS = ("book", "start", "end", "business_days", "calendar_days",
                        "turnover", "traded_dv01", "dv01_turnover", "pnl", "costs", "costs_share", "costs_bp_nav",
                        "notes")
 DRAWDOWN_COLUMNS = ("date", "book", "index", "peak", "drawdown")
+# read-only views of a back-test's state for the risk layer (Snapshot.open_orders, Snapshot.swaps)
+OPEN_ORDER_COLUMNS = ("order_id", "book", "isin", "side", "face", "months", "venue", "purpose", "auction_date",
+                      "from_date", "waited", "date_decided")
+SWAP_STATE_COLUMNS = ("trade_id", "book", "trade_date", "effective", "months", "fixed_rate_pct", "notional",
+                      "pay_fixed", "purpose", "alive")
 
 CARRY_LINES = ("accrual", "pull_to_par")
 RESET_LINE = "coupon_reset"  # a coupon as known changing in the period it is accrued (FRBs, rating steps)
@@ -2004,6 +2009,66 @@ class Snapshot:
                 out[day] = rate
         return out
 
+    # -- read-only views for the risk layer (risk, limits): none of them changes the engine's state
+
+    def instrument(self, isin: str) -> Instrument:
+        """The engine's instrument of ``isin`` as known at ``as_of``: the one it holds, or one built by the same code
+        without registering it (``_Engine.instrument(register=False)``: a security never traded leaves no trace in
+        the engine), from the master or the corporate and FRB terms of the market data. A corporate bond or an FRB is
+        rebuilt as known at ``as_of`` (``Instrument.known``, called directly, not through the engine's memo), with
+        ``paying`` and ``maturity`` as the day's refresh sets them. Errors (no terms, an FRB coupon that cannot be
+        projected) are raised naming the ISIN; a run that never trades the ISIN is not stopped by them."""
+        code = str(isin).strip().upper()
+        engine = self._engine
+        try:
+            inst = engine.instrument(code, None, f"Snapshot.instrument({code})", register=False)
+        except (ValueError, TypeError) as exc:
+            text = str(exc)
+            raise ValueError(text if code in text else f"{code}: {text}") from None
+        if inst.known is None:
+            return inst
+        try:
+            bond = inst.known(self.as_of)
+        except (ValueError, NotImplementedError) as exc:
+            text = str(exc)
+            raise ValueError(text if text.startswith(code) else f"{code}: {text}") from None
+        paying = replace(bond, calendar=engine.calendar) if isinstance(bond, GoiFloatingRateBond) else bond
+        return replace(inst, bond=bond, paying=paying, maturity=bond.maturity)
+
+    def open_orders(self) -> pd.DataFrame:
+        """The engine's queue at the decision (``OPEN_ORDER_COLUMNS``): orders of earlier days not yet filled,
+        cancelled or refused, in the natural order of their ids (``O9`` before ``O10``). Read it inside ``decide``:
+        the queue it reads moves on after the decision."""
+        rows = [{"order_id": o["order_id"], "book": o["book"], "isin": o["isin"], "side": o["side"],
+                 "face": o["face"], "months": o["months"], "venue": o["venue"], "purpose": o["purpose"],
+                 "auction_date": o["auction_date"], "from_date": o["from"], "waited": o["waited"],
+                 "date_decided": o["date_decided"]}
+                for o in sorted(self._engine.queue, key=lambda o: (_natural(o["order_id"]), o["order_id"]))]
+        return pd.DataFrame(rows, columns=list(OPEN_ORDER_COLUMNS))
+
+    def swaps(self) -> pd.DataFrame:
+        """Every book's OIS swaps as the engine holds them at the decision (``SWAP_STATE_COLUMNS``; ``alive``:
+        not yet ended at the day's valuation), sorted by book and trade id."""
+        rows = []
+        for name, book in sorted(self._engine.books.items()):
+            for tid in sorted(book.swaps, key=lambda t: (_natural(t), t)):
+                state = book.swaps[tid]
+                swap = state.swap
+                rows.append({"trade_id": tid, "book": name, "trade_date": state.trade_date,
+                             "effective": swap.effective, "months": swap.months,
+                             "fixed_rate_pct": swap.fixed_rate_pct, "notional": swap.notional,
+                             "pay_fixed": swap.pay_fixed, "purpose": state.purpose, "alive": state.alive})
+        return pd.DataFrame(rows, columns=list(SWAP_STATE_COLUMNS))
+
+    def curve_history(self, name: str = "gsec") -> dict[date, Any]:
+        """Every curve ``name`` (``ois``: the OIS curves) of a mark date on or before the day whose entry was public
+        by ``as_of``, ``{mark date: curve}`` in date order (a curve without a time counts from the marks' default
+        time on its date, as the engine reads it): the history a VaR at the decision may use."""
+        curves = self._engine.curves
+        table = curves.ois if name == "ois" else curves.named.get(name, {})
+        return {day: entry.curve for day, entry in sorted(table.items())
+                if day <= self.day and entry.public_from is not None and entry.public_from <= self.as_of}
+
 
 # ---------------------------------------------------------------- the engine
 
@@ -2197,7 +2262,6 @@ class _Engine:
             return bond.effective_bond(t)
 
         rating = _text(row.get("rating_bucket")).upper() or None
-        self._base_maturity[isin] = base.maturity
         return Instrument(isin=isin, kind="corporate", bond=base, paying=base, maturity=base.maturity,
                           issue_date=base.issue_date, conventions=base.conventions, known=known,
                           rating_bucket=rating)
@@ -2574,8 +2638,12 @@ class _Engine:
             self._pay_cache[inst.isin] = (pay, pay.year not in self.strict_years)
         return self._pay_cache[inst.isin]
 
-    def instrument(self, isin: str, terms: Mapping | None, where: str) -> Instrument:
-        """The ISIN's instrument, built once from the trade's terms filled from the master (a conflict refused)."""
+    def instrument(self, isin: str, terms: Mapping | None, where: str, *, register: bool = True) -> Instrument:
+        """The ISIN's instrument, built once from the trade's terms filled from the master (a conflict refused).
+
+        ``register=False`` (the risk layer's read-only view): an instrument already held is returned as it is, and a
+        new one is built by the same code but neither stored in ``instruments`` nor recorded in ``_base_maturity``, so
+        the engine's state, and every output of a run, stay as they were."""
         given = {k: (terms or {}).get(k) for k in ("kind", "coupon_pct", "maturity_date", "issue_date",
                                                    "first_coupon_date", "liquidity")}
         master = self.master.get(isin, {})
@@ -2610,7 +2678,10 @@ class _Engine:
             inst = make_instrument(isin, merged, self.calendar, where)
         if inst.known is not None:
             self._check_given_terms(inst, given, where)
-        self.instruments[isin] = inst
+        if register:
+            if inst.kind == "corporate":
+                self._base_maturity[isin] = inst.maturity  # the terms' own maturity, read by _terms_note
+            self.instruments[isin] = inst
         return inst
 
     def _check_given_terms(self, inst: Instrument, given: Mapping, where: str) -> None:
@@ -4429,6 +4500,58 @@ def run_backtest(strategy: Strategy, market: MarketData, settings: EngineSetting
     return engine.result()
 
 
+def _terms_by_isin(terms) -> dict[str, dict]:
+    """``{ISIN: terms}`` from a mapping of that form or from trade rows (``TRADE_COLUMNS``: ``isin`` and any of
+    ``kind``, ``coupon_pct``, ``maturity_date``, ``issue_date``, ``first_coupon_date``, ``liquidity``); two rows of
+    one ISIN whose terms differ are refused, naming the ISIN and the term."""
+    if terms is None:
+        return {}
+    if isinstance(terms, Mapping):
+        return {str(k).strip().upper(): dict(v) for k, v in terms.items()}
+    frame = _frame(terms, "the terms")
+    if "isin" not in frame:
+        raise ValueError("the terms need an isin column (TRADE_COLUMNS rows)")
+    out: dict[str, dict] = {}
+    for n, rec in _lines(frame):
+        isin = _text(rec.get("isin")).upper()
+        if not isin:
+            continue
+        row = {k: rec.get(k) for k in _MASTER_TERMS}
+        if isin in out:
+            for key in _MASTER_TERMS:
+                a, b = out[isin].get(key), row.get(key)
+                if not _blank(a) and not _blank(b) and not _same_term(a, b):
+                    raise ValueError(f"the terms give {isin} two values of {key} ({a!r} and {b!r}, line {n})")
+                if _blank(a) and not _blank(b):
+                    out[isin][key] = b
+            continue
+        out[isin] = row
+    return out
+
+
+def instruments_as_known(market: MarketData, settings: EngineSettings, isins: Iterable[str], as_of, *,
+                         terms=None) -> dict[str, Instrument]:
+    """Each ISIN's ``Instrument`` as the engine builds it, as known at ``as_of`` (the risk layer's view of a positions
+    file): a fresh engine on ``market`` and ``settings`` with no trades builds each one from ``terms`` (``{ISIN:
+    terms}`` or trade rows, ``TRADE_COLUMNS``) filled from the master, or from the corporate and FRB terms of the
+    market data; a corporate bond or an FRB is then taken as known at ``as_of`` (fixings, rating steps and exercises
+    public by then; an FRB's coupons as ``floating.goi_frb_rates`` knows them), with ``paying`` and ``maturity`` as the
+    engine's daily refresh sets them. Raises as the engine does (no terms, an FRB coupon that cannot be known, an
+    exercise public after its record date), naming the ISIN."""
+    when = as_time(as_of, "as_of")
+    engine = _Engine(market, settings)
+    given = _terms_by_isin(terms)
+    out: dict[str, Instrument] = {}
+    for isin in sorted({str(i).strip().upper() for i in isins if str(i).strip()}):
+        inst = engine.instrument(isin, given.get(isin), f"instrument {isin}")
+        if inst.known is not None:
+            bond = engine._bond_known(inst, when)
+            paying = replace(bond, calendar=engine.calendar) if isinstance(bond, GoiFloatingRateBond) else bond
+            inst = replace(inst, bond=bond, paying=paying, maturity=bond.maturity)
+        out[isin] = inst
+    return out
+
+
 # ---------------------------------------------------------------- performance
 
 
@@ -4597,11 +4720,13 @@ __all__ = [
     "ACCESS_PRESETS", "ATTRIBUTION_COLUMNS", "AUCTION_COLUMNS", "BUCKETS", "CHECK_COLUMNS", "COSTS_IN_PNL",
     "DEFAULT_NODES", "DEFAULT_REFERENCE", "DRAWDOWN_COLUMNS", "FACTORS", "FILL_COLUMNS", "FLOW_COLUMNS",
     "FUNDING_COLUMNS", "MARK_COLUMNS", "MARK_ORDER", "MARK_SOURCES", "MEMO_LINES", "NAV_COLUMNS", "NSS_PARAMS_COLUMNS",
-    "PERFORMANCE_COLUMNS", "POSITION_COLUMNS", "RATE_BASES", "RESULT_FILES", "SWAP_TRADE_COLUMNS", "TRADE_COLUMNS",
+    "OPEN_ORDER_COLUMNS", "PERFORMANCE_COLUMNS", "POSITION_COLUMNS", "RATE_BASES", "RESULT_FILES",
+    "SWAP_STATE_COLUMNS", "SWAP_TRADE_COLUMNS", "TRADE_COLUMNS",
     "AccessPolicy", "AttributionSettings", "BookResult", "CurveEntry", "EngineSettings", "FundingPolicy", "Instrument",
     "MarkPolicy", "MarkState", "MarketData", "Order", "ShiftedCurve", "Snapshot", "Strategy", "access_policy",
     "append_nss_params", "attribute_bond", "attribute_ois", "auctions_from_events", "drawdowns", "factor_curves",
-    "factor_moves", "factor_shapes", "funding_from_store", "make_instrument", "mark_state", "marks_from_prices",
+    "factor_moves", "factor_shapes", "funding_from_store", "instruments_as_known", "make_instrument", "mark_state",
+    "marks_from_prices",
     "model_yield", "nss_params_row", "performance", "read_flows", "read_marks", "read_nss_params", "read_swaps",
     "read_trades", "roll_reference", "rolled", "run_backtest", "run_book", "seen_from", "write_result",
 ]
