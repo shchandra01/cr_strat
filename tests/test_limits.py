@@ -81,7 +81,7 @@ def test_shipped_tables_say_what_they_are():
     assert nb.set_index("limit_id").loc["L10", "hard_level"] == 7.0  # base layer leverage ratio
     rw = lm.read_risk_weights().set_index(["kind", "sector"])["risk_weight_pct"]
     assert rw[("gsec", "")] == 0 and rw[("sdl", "")] == 0 and rw[("corporate", "")] == 100 and \
-        rw[("corporate", "psu_bank")] == 20 and rw[("cd", "")] == 100
+        rw[("corporate", "psu_bank")] == 20 and rw[("cd", "")] == 0 and rw[("cd", "pfi")] == 100  # bank CDs: item (1)
 
 
 def test_limits_in_force_by_dates_approval_and_legal_form_i11():
@@ -184,7 +184,13 @@ def test_utilisation_and_status_rules():
     assert by.loc[("E17", "fund", "fund", ""), "status"] == "incomplete"
     assert (checks[checks["policy_status"] == "EXAMPLE"]["detail"].str.startswith("EXAMPLE")).all()
     e27 = by.loc[("E27", "fund", "fund", "")]
-    assert e27["status"] == "breach" and e27["value"] < 50 and e27["utilisation"] > 1  # a minimum missed
+    # the fund's cash counts as saleable at day 0 (43% of NAV here) and the bonds are netted by ISIN: within the 50%
+    assert e27["status"] == "ok" and e27["value"] > 50 and e27["utilisation"] < 1
+    tight = lm.limit_table(lf.limit_frame([lf.approved(metric="liquid_share", unit="pct_nav", direction="min",
+                                                       selector="days=1", hard_level="99", warning_level="99.5")]))
+    mt = lm.limit_metrics(rr, res, ctx, limits=tight)
+    x1 = lm.check_limits(mt, tight, as_of=ctx.as_of, legal_form=UNREG).iloc[0]
+    assert x1["status"] == "breach" and x1["value"] < 99 and x1["utilisation"] > 1  # a minimum missed
     nb, table_n, *_ = _metrics("nbfc_non_pd")
     checks_n = lm.check_limits(nb, table_n, as_of=ctx.as_of, legal_form=NBFC).set_index(
         ["limit_id", "scope_type", "scope", "key"])
@@ -423,7 +429,8 @@ def test_t26_an_ois_hedge_at_the_wrong_tenor_is_refused_under_hedge_only():
                                       pay_fixed=True), calendar=cal).dv01
         return rt.Order(book="b", side="pay", face=round(dv01 / abs(unit) * 1e7, 0), months=months)
     good, bad = sized(48), sized(12)
-    assert pf.hedge_ois_notional(dv01, curve, 12, start, calendar=cal) > bad.face  # annuity sizing is larger
+    annuity = pf.hedge_ois_notional(dv01, curve, 12, start, calendar=cal, method="annuity")
+    assert annuity > bad.face  # annuity sizing is larger
     approved, rows = lm.PreTradeGate(None, ctx).check(st, [bad, good])
     decisions, frame = _decisions(rows)
     assert decisions == ["refused", "approved"] and approved == [good]

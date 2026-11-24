@@ -159,8 +159,9 @@ METRICS: dict[str, Metric] = {
     "exposure": Metric(("pct_nav", "rs"), "max", ("issuer", "group", "sector", "rating_bucket", "kind", "isin"),
                        "concentration", "market value, a purchase to settle at its market value"),
     "isin_share": Metric(("pct",), "max", ("isin", "kind"), "concentration", "face over the ISIN's outstanding stock"),
-    "rating_floor": Metric(("notch", "pct_nav"), "max", ("below", "of", "isin", "kind"), "concentration",
-                           "the worst rating held as known at as_of, or the share of NAV below a grade"),
+    "rating_floor": Metric(("notch", "pct_nav"), "max", ("below", "of", "isin", "kind", "exclude_strategy"),
+                           "concentration", "the worst rating held as known at as_of, or the share of NAV below a "
+                           "grade (exclude_strategy: a strategy held to its own row, S9's forced-selling purchases)"),
     "max_tenor": Metric(("years",), "max", ("kind",), "concentration", "the longest residual maturity held"),
     "var": Metric(("rs", "pct_nav"), "max", ("method", "horizon", "alpha", "horizon_rule"), "market",
                   "the VaR table of the risk run (the gate: parametric)"),
@@ -204,15 +205,22 @@ UNVERIFIED_RULES = (
     "every level of limits_example.csv (EXAMPLE) and its warning-to-hard spacing; cure periods 30 business days "
     "for concentration, rating and tenor, 5 for market risk and liquidity, 1 for drawdown and stop-loss, 0 for "
     "legal-form rules",
-    "an incomplete metric is checked as a warning, never a breach",
-    "utilisation of a minimum: hard/value for a positive level, value/hard for a negative one",
+    "an incomplete metric is checked as a warning, never a breach; a breach episode is carried, not cured, through a "
+    "day its metric is incomplete",
+    "utilisation: value/hard for a maximum above zero, hard/value below zero; hard/value for a minimum above zero, "
+    "value/hard below zero (a drawdown); infinity once a level's sign is crossed the wrong way",
     "exposures, CS01, JTD by issuer, group and sector over corporate bonds, CP and CD; GoI and states exempt",
     "a purchase still to settle counts at its market value (trade-date view); payables count as outside liabilities",
     "the borrowing a book needs: purchases to settle less sales to settle less its net cash",
     "owned fund, Tier 1 and capital taken as NAV; OIS counterparty risk not risk-weighted",
     "a holding known only by its rating bucket takes the bucket's worst notch",
     "the OIS hedge effect: the larger of the swaps' effect on parametric VaR and on the sum of absolute KRDs (each "
-    "tenor's G-sec and OIS KRDs netted)",
+    "tenor's G-sec and OIS KRDs netted, the KRDs beyond the OIS curve's last node netted into it); while the VaR "
+    "cannot be computed the key-rate test alone decides; L06 enforced (APPROVED) though it is this reading (counsel)",
+    "CRAR: bank CDs weighted 0% (the cash and bank balances line), a CD weighted 100% only when the issuer table "
+    "gives its issuer the sector pfi (a public financial institution); counsel and the accountant to confirm",
+    "selector values: key tenors, curves, rating buckets, kinds and tenor buckets must be the risk layer's (case "
+    "ignored); sectors compare in lower case, so a sector the fund does not hold reads 0",
     "the gate: VaR and ES parametric (EWMA) on the post-trade sensitivities; queued orders count as filled; a purchase "
     "under a preset that cannot borrow keeps 1% of its consideration in cash for the fill and costs",
 )
@@ -304,9 +312,73 @@ def parse_selector(text, metric: str, where: str = "the selector") -> tuple[tupl
             raise ValueError(f"{where}: selector key {key!r} is given twice")
         if "*" in values and len(values) > 1:
             raise ValueError(f"{where}: {key}=* takes no alternatives")
+        values = _canonical_values(metric, key, values, where)
         _check_selector_value(metric, key, values, where)
         out[key] = values
     return tuple(sorted(out.items()))
+
+
+KRD_CURVES = ("gsec", "sdl", "ois", "ois_par")  # the curve names of the risk layer's key rates
+RATING_BUCKETS = (*rk.IG_BUCKETS, "SUB_IG", "D", "unrated", "sovereign")
+SELECTOR_KINDS = tuple(sorted(rt.PRICED_KINDS))
+
+
+def _canonical_values(metric: str, key: str, values: tuple[str, ...], where: str) -> tuple[str, ...]:
+    """Selector values in the form the risk tables use, or refused naming the line: a key tenor as its label
+    (``10`` or ``10y``: ``10y``; one of the risk layer's key tenors), a curve, rating bucket, kind or tenor bucket of
+    the known ones (case ignored), a sector in lower case (the issuer table's), an ISIN in upper case. A value that
+    matched nothing would otherwise read 0 and be ``ok`` for ever."""
+    def each(fn):
+        return tuple(v if v == "*" else fn(v) for v in values)
+
+    def bad(value: str, allowed) -> ValueError:
+        return ValueError(f"{where}: {key} {value!r} is not one of {tuple(allowed)}{_closest(value, allowed)}")
+
+    if key == "tenor" and metric == "krd":
+        labels = sorted({rk.tenor_label(t) for t in (*rk.KEY_TENORS, *rk.OIS_KEY_TENORS)},
+                        key=lambda x: float(x[:-1]))
+
+        def tenor(v: str) -> str:
+            text = v.strip().lower()
+            try:
+                label = rk.tenor_label(float(text[:-1] if text.endswith("y") else text))
+            except ValueError:
+                raise bad(v, labels) from None
+            if label not in labels:
+                raise bad(v, labels)
+            return label
+        return each(tenor)
+    if key == "curve" and metric == "krd":
+        def curve(v: str) -> str:
+            if v.lower() not in KRD_CURVES:
+                raise bad(v, KRD_CURVES)
+            return v.lower()
+        return each(curve)
+    if key == "rating_bucket":
+        lookup = {b.lower(): b for b in RATING_BUCKETS}
+
+        def bucket(v: str) -> str:
+            if v.lower() not in lookup:
+                raise bad(v, RATING_BUCKETS)
+            return lookup[v.lower()]
+        return each(bucket)
+    if key == "kind" and metric != "leverage":
+        def kind(v: str) -> str:
+            if v.lower() not in SELECTOR_KINDS:
+                raise bad(v, SELECTOR_KINDS)
+            return v.lower()
+        return each(kind)
+    if key == "tenor_bucket":
+        def tenor_bucket(v: str) -> str:
+            if v.lower() not in BUCKETS:
+                raise bad(v, BUCKETS)
+            return v.lower()
+        return each(tenor_bucket)
+    if key == "sector":
+        return each(str.lower)
+    if key == "isin":
+        return each(str.upper)
+    return values
 
 
 def _check_selector_value(metric: str, key: str, values: tuple[str, ...], where: str) -> None:
@@ -755,16 +827,24 @@ def _m_krd(view: MetricInputs, st: str, sc: str, sel, unit: str) -> list[Value]:
 
 
 def _m_cs01(view: MetricInputs, st: str, sc: str, sel, unit: str) -> list[Value]:
-    rows = [r for r in view.rows() if view.in_scope(r, st, sc) and not r["is_swap"] and _finite(r.get("cs01"))]
+    scope_rows = [r for r in view.rows() if view.in_scope(r, st, sc) and not r["is_swap"]]
+    rows = [r for r in scope_rows if _finite(r.get("cs01"))]
     dims = ("rating_bucket", "issuer", "group", "sector", "tenor_bucket", "kind")
     groups = _select(rows, sel, dims)
+    # a credit position whose CS01 is not known (no curve, in a risk run without the yield proxy): the key it falls
+    # in is incomplete, never a silent zero
+    unknown = _select([r for r in scope_rows if r["kind"] in CREDIT_KINDS and not _finite(r.get("cs01"))], sel, dims)
+    for key in unknown:
+        groups.setdefault(key, [])
     if not groups:
         groups = {"": []}
     out = []
     for key, members in sorted(groups.items()):
         raw = _fsum(float(r["cs01"]) for r in members)
         value, ok = _per_nav(_abs(sel, raw), view.nav_of(st, sc), unit, years=True)
-        out.append((key, value, ok, f"CS01 Rs {raw:,.2f} per bp of {len(members)} position(s)"))
+        missing = sorted({_text(r.get("isin")) for r in unknown.get(key, [])})
+        out.append((key, value, ok and not missing, f"CS01 Rs {raw:,.2f} per bp of {len(members)} position(s)"
+                    + (f"; CS01 not known for {', '.join(missing)}" if missing else "")))
     return out
 
 
@@ -834,7 +914,9 @@ def _net_by_isin(rows: Iterable[dict]) -> dict[tuple[str, str], list[dict]]:
 
 
 def _m_rating_floor(view: MetricInputs, st: str, sc: str, sel, unit: str) -> list[Value]:
-    rows = [r for r in view.rows() if view.in_scope(r, st, sc) and not r["is_swap"] and r["kind"] in CREDIT_KINDS]
+    excluded = set(_sel(sel, "exclude_strategy") or ())
+    rows = [r for r in view.rows() if view.in_scope(r, st, sc) and not r["is_swap"] and r["kind"] in CREDIT_KINDS
+            and r["strategy"] not in excluded]
     held = [members for members in _net_by_isin(rows).values() if _fsum(m["face"] for m in members) > 0]
     note = " (holdings: the gate checks each purchase)" if _sel_one(sel, "of") == "purchases" else ""
     kinds = _sel(sel, "kind")
@@ -1157,44 +1239,67 @@ def _liq_rows(view: MetricInputs, st: str, sc: str) -> list[dict] | None:
                  or (st == "strategy" and _text(r["strategy"]) == sc))]
 
 
-def _m_illiquid_share(view: MetricInputs, st: str, sc: str, sel, unit: str) -> list[Value]:
+def _scope_cash(view: MetricInputs, st: str, sc: str) -> tuple[float, bool]:
+    """The scope's net cash on a trade-date view (each book's net cash less its purchases to settle plus its sales to
+    settle), and whether every book's cash is known."""
+    total, ok = 0.0, True
+    for book in view.books_of(st, sc):
+        net, _, buys, sells = _book_cash(view, book)
+        if not _finite(net):
+            ok = False
+            continue
+        total += net - buys + sells
+    return total, ok
+
+
+def _scope_liquidity_of(view: MetricInputs, st: str, sc: str) -> tuple[dict | None, float, bool]:
     rows = _liq_rows(view, st, sc)
     if rows is None:
+        return None, math.nan, False
+    cash, ok = _scope_cash(view, st, sc)
+    return _scope_figures(rows, cash if ok else 0.0), cash, ok
+
+
+def _scope_figures(rows, cash: float) -> dict:
+    """``stress.scope_liquidity`` (a module function: the metric functions' ``st`` argument is the scope type)."""
+    return st.scope_liquidity(rows, cash=cash)
+
+
+def _m_illiquid_share(view: MetricInputs, st: str, sc: str, sel, unit: str) -> list[Value]:
+    figures, _, _ = _scope_liquidity_of(view, st, sc)
+    if figures is None:
         return [("", math.nan, False, "no liquidity table")]
-    flag = [r for r in rows if str(r.get("illiquid")).strip().lower() in ("true", "1", "yes")]
-    raw = _fsum(abs(_float(r.get("value"), 0.0)) for r in flag)
-    value, ok = _per_nav(raw, view.nav_of(st, sc), unit)
-    return [("", value, ok, f"{len(flag)} illiquid position(s) worth Rs {raw:,.2f}")]
+    flagged = [x["isin"] for x in figures["isins"] if x["illiquid"]]
+    value, ok = _per_nav(figures["illiquid_value"], view.nav_of(st, sc), unit)
+    return [("", value, ok, f"{len(flagged)} illiquid ISIN(s) worth Rs {figures['illiquid_value']:,.2f} (netted "
+             "across the scope's books and rows)")]
 
 
 def _m_liquid_share(view: MetricInputs, st: str, sc: str, sel, unit: str) -> list[Value]:
-    rows = _liq_rows(view, st, sc)
-    if rows is None:
+    figures, cash, cash_ok = _scope_liquidity_of(view, st, sc)
+    if figures is None:
         return [("", math.nan, False, "no liquidity table")]
     n = float(_sel_one(sel, "days", "5"))
-    total = 0.0
-    for r in rows:
-        days, value = _float(r.get("days_to_liquidate"), math.inf), abs(_float(r.get("value"), 0.0))
-        total += value if days <= 0 else min(1.0, n / days) * value if math.isfinite(days) else 0.0
+    total = figures["liquid"](n)
     value, ok = _per_nav(total, view.nav_of(st, sc), unit)
-    return [("", value, ok, f"Rs {total:,.2f} saleable within {n:g} business days")]
+    return [("", value, ok and cash_ok, f"Rs {total:,.2f} saleable within {n:g} business days, net cash Rs "
+             f"{cash:,.2f} at day 0 (positions netted by ISIN)" + ("" if cash_ok else "; a book's cash is not known"))]
 
 
 def _m_days_to_liquidate(view: MetricInputs, st: str, sc: str, sel, unit: str) -> list[Value]:
-    rows = _liq_rows(view, st, sc)
-    if rows is None:
+    figures, _, _ = _scope_liquidity_of(view, st, sc)
+    if figures is None:
         return [("", math.nan, False, "no liquidity table")]
-    if not rows:
+    if not figures["isins"]:
         return [("", 0.0, True, "no position")]
-    days = [(_float(r.get("days_to_liquidate"), math.inf), abs(_float(r.get("value"), 0.0)), _text(r.get("isin")))
-            for r in rows]
     if _sel_one(sel, "stat", "max") == "mean":
-        weight = _fsum(w for _, w, _ in days)
-        if any(not math.isfinite(d) for d, w, _ in days if w > 0):
+        mean = figures["mean_days"]
+        if math.isinf(mean):
             return [("", math.inf, True, "a position with no volume (no ADV) has infinite days")]
-        return [("", _fsum(d * w for d, w, _ in days) / weight if weight else 0.0, True, "value-weighted mean")]
-    worst = max(days, key=lambda x: (x[0], x[2]))
-    return [("", worst[0], True, f"longest: {worst[2]}")]
+        return [("", mean if _finite(mean) else 0.0, True, "value-weighted mean of the net positions")]
+    if not _finite(figures["max_days"]) and not math.isinf(figures["max_days"]):
+        return [("", 0.0, True, "no long position")]
+    return [("", figures["max_days"], True, f"longest: {figures['max_isin']} (netted across the scope's books)")]
 
 
 def _m_ois_hedge_ratio(view: MetricInputs, st: str, sc: str, sel, unit: str) -> list[Value]:
@@ -1225,12 +1330,15 @@ def _wide_changes(view: MetricInputs) -> pd.DataFrame | None:
 
 
 def parametric_from_frames(sens: pd.DataFrame, changes: pd.DataFrame, settings: rk.RiskSettings, *,
-                           horizon_days: int = 1, alpha_var: float | None = None, alpha_es: float | None = None
-                           ) -> tuple[float, float, float, int, str]:
+                           horizon_days: int = 1, alpha_var: float | None = None, alpha_es: float | None = None,
+                           day=None, calendar=None) -> tuple[float, float, float, int, str]:
     """``(VaR, ES, coverage, observations, detail)`` of a set of sensitivity rows (``SENSITIVITY_COLUMNS``; par-quote
-    rows left out) on a wide factor history (date x factor, bp): the factors with at least ``min_obs_hard`` changes,
-    the dates on which all of them have one, the EWMA (or sample) covariance of the latest of them, as
-    ``risk.parametric_var`` computes it (no proxies). Raises below ``min_obs_hard`` observations."""
+    rows left out) on a wide factor history (date x factor, bp): the factors with at least ``min_obs_hard`` changes
+    and, with ``day`` (the book's), a change within ``max_gap_days`` business days of it (a factor whose series
+    stopped would drag every factor's dates back: it is left out, coverage below one), the dates on which all of them
+    have one, the EWMA (or sample) covariance of the latest of them, as ``risk.parametric_var`` computes it (no
+    proxies). Raises below ``min_obs_hard`` observations, and when the dates end more than ``max_gap_days`` business
+    days before ``day``."""
     a_var = settings.var_alpha if alpha_var is None else alpha_var
     a_es = settings.es_alpha if alpha_es is None else alpha_es
     use = sens[sens["basis"].astype(str) != "par"] if len(sens) else sens
@@ -1239,15 +1347,30 @@ def parametric_from_frames(sens: pd.DataFrame, changes: pd.DataFrame, settings: 
         s_by[f] = s_by.get(f, 0.0) + float(v)
     total = _fsum(abs(v) for v in s_by.values())
     counts = {f: int(changes[f].notna().sum()) for f in changes.columns} if changes is not None else {}
-    used = sorted(f for f in s_by if counts.get(f, 0) >= settings.min_obs_hard)
+    d = rk.as_date(day) if day is not None else None
+    cal = (calendar if calendar is not None else mumbai_settlement_calendar()).lenient()
+    stale: set[str] = set()
+    if d is not None and changes is not None:
+        for f in s_by:
+            if f in changes.columns and counts.get(f, 0):
+                last = changes.index[changes[f].notna().to_numpy()][-1]
+                if rk._gap_days(cal, rk.as_date(last), d) > settings.max_gap_days:
+                    stale.add(f)
+    used = sorted(f for f in s_by if counts.get(f, 0) >= settings.min_obs_hard and f not in stale)
     covered = _fsum(abs(s_by[f]) for f in used)
     coverage = covered / total if total > 0 else 1.0
     if not used:
         if total > 0:
-            raise ValueError("no factor of the scope has a history of min_obs_hard changes")
+            raise ValueError("no factor of the scope has a history of min_obs_hard changes"
+                             + (f" up to {d} (stale: {', '.join(sorted(stale))})" if stale else ""))
         return 0.0, 0.0, 1.0, 0, "no sensitivity"
     block = changes[used].to_numpy(dtype=float)
     rows = np.flatnonzero(np.all(np.isfinite(block), axis=1))
+    if d is not None and len(rows):
+        end = rk.as_date(changes.index[rows[-1]])
+        if rk._gap_days(cal, end, d) > settings.max_gap_days:
+            raise ValueError(f"the dates with every factor end on {end}, more than {settings.max_gap_days} business "
+                             f"days before {d}")
     if settings.cov_method == "ewma":
         rows = rows[-settings.ewma_max_obs:]
     else:
@@ -1262,7 +1385,8 @@ def parametric_from_frames(sens: pd.DataFrame, changes: pd.DataFrame, settings: 
     s = np.array([s_by[f] for f in used])
     sigma = math.sqrt(max(float(s @ cov @ s), 0.0))
     var, es = rk.normal_var_es(sigma, a_var, a_es, horizon_days)
-    return var, es, coverage, n, f"parametric {settings.cov_method}:{n} on {len(used)} factor(s)"
+    return var, es, coverage, n, f"parametric {settings.cov_method}:{n} on {len(used)} factor(s)" + (
+        f"; stale factor(s) left out: {', '.join(sorted(stale))}" if stale else "")
 
 
 def _sens_in_scope(view: MetricInputs, st: str, sc: str, *, swaps: bool = True) -> pd.DataFrame:
@@ -1288,25 +1412,30 @@ def _gate_var(view: MetricInputs, st: str, sc: str, what: str, horizon: int, alp
         if what == "var":
             value, _, coverage, n, detail = parametric_from_frames(_sens_in_scope(view, st, sc), wide,
                                                                    view.risk_settings, horizon_days=horizon,
-                                                                   alpha_var=alpha)
+                                                                   alpha_var=alpha, day=view.day)
         else:
             _, value, coverage, n, detail = parametric_from_frames(_sens_in_scope(view, st, sc), wide,
                                                                    view.risk_settings, horizon_days=horizon,
-                                                                   alpha_es=alpha)
+                                                                   alpha_es=alpha, day=view.day)
     except ValueError as exc:
         return math.nan, nav, False, f"parametric {what} refused: {exc}"
     return value, nav, coverage >= 1 - 1e-12, f"{detail}, coverage {coverage:.4f} (the gate's approximation)"
 
 
-def _abs_krd_sum(sens: pd.DataFrame) -> float:
+def _abs_krd_sum(sens: pd.DataFrame, last_node: float | None = None) -> float:
     """The sum over key tenors of the absolute zero-rate KRD, each tenor's G-sec and OIS (and any other curve's)
     KRDs netted (UNVERIFIED: the basis between the curves is left to the VaR half of the hedge-effect test), so that a
-    swap at the bond's own tenor reduces it and one at another tenor raises it (T26)."""
+    swap at the bond's own tenor reduces it and one at another tenor raises it (T26); with ``last_node`` (the OIS
+    curve's last key tenor) every KRD beyond it is netted into it, since no swap reaches further (UNVERIFIED): a long
+    bond hedged at the curve's end is then a hedge on this test, its curve risk beyond the node left to the VaR."""
     use = sens[(sens["basis"].astype(str) == "zero")] if len(sens) else sens
     sums: dict[float, float] = {}
     for tenor, value in zip(pd.to_numeric(use["tenor"]), pd.to_numeric(use["sensitivity"])):
-        if math.isfinite(float(tenor)):
-            sums[float(tenor)] = sums.get(float(tenor), 0.0) + float(value)
+        t = float(tenor)
+        if math.isfinite(t):
+            if last_node is not None and t > last_node:
+                t = last_node
+            sums[t] = sums.get(t, 0.0) + float(value)
     return _fsum(abs(v) for v in sums.values())
 
 
@@ -1317,21 +1446,31 @@ def _ratio(a: float, b: float) -> float:
 
 
 def _m_ois_hedge_effect(view: MetricInputs, st: str, sc: str, sel, unit: str) -> list[Value]:
+    """The swaps' effect on the scope's risk (L06, L19, E30): the larger of the ratio of the sum of absolute KRDs with
+    the swaps to without (each tenor netted across curves, the KRDs beyond the OIS curve's last node netted into it)
+    and of the parametric VaRs with and without. When the VaR cannot be computed (a short or stale factor history),
+    the key-rate ratio alone decides, complete: it needs no history, so a swap that raises the key-rate risk is
+    refused from the first day under a hedging-only preset (UNVERIFIED reading of RBI's definition of hedging)."""
     with_s = _sens_in_scope(view, st, sc)
-    if not len(with_s) or not with_s["isin"].astype(str).str.startswith("OIS:").any():
+    swaps = with_s[with_s["isin"].astype(str).str.startswith("OIS:")] if len(with_s) else with_s
+    if not len(swaps):
         return [("", 1.0, True, "no swaps in scope")]
     without = _sens_in_scope(view, st, sc, swaps=False)
-    k_with, k_without = _abs_krd_sum(with_s), _abs_krd_sum(without)
+    ois = swaps[(swaps["basis"].astype(str) == "zero") & (swaps["curve"].astype(str) == "ois")]
+    tenors = pd.to_numeric(ois["tenor"], errors="coerce").dropna()
+    last = float(tenors.max()) if len(tenors) else None
+    k_with, k_without = _abs_krd_sum(with_s, last), _abs_krd_sum(without, last)
     ratio_k = 1.0 if k_with == k_without else _ratio(k_with, k_without)
-    detail = f"sum of absolute KRDs Rs {k_with:,.2f} with the swaps, Rs {k_without:,.2f} without"
+    detail = f"sum of absolute KRDs Rs {k_with:,.2f} with the swaps, Rs {k_without:,.2f} without" + (
+        f" (KRDs beyond {last:g} years netted into it)" if last is not None else "")
     wide = _wide_changes(view)
     if wide is None:
-        return [("", ratio_k, False, f"{detail}; no factor history: the VaR test not computed")]
+        return [("", ratio_k, True, f"{detail}; no factor history: the key-rate test decides")]
     try:
-        v_with = parametric_from_frames(with_s, wide, view.risk_settings)[0]
-        v_without = parametric_from_frames(without, wide, view.risk_settings)[0]
+        v_with = parametric_from_frames(with_s, wide, view.risk_settings, day=view.day)[0]
+        v_without = parametric_from_frames(without, wide, view.risk_settings, day=view.day)[0]
     except ValueError as exc:
-        return [("", ratio_k, False, f"{detail}; the VaR test refused: {exc}")]
+        return [("", ratio_k, True, f"{detail}; the VaR test refused ({exc}): the key-rate test decides")]
     ratio_v = 1.0 if v_with == v_without else _ratio(v_with, v_without)
     return [("", max(ratio_k, ratio_v), True, f"{detail}; parametric VaR Rs {v_with:,.2f} with, Rs {v_without:,.2f} "
              "without")]
@@ -1391,20 +1530,25 @@ def _risk_weight(view: MetricInputs, kind: str, sector: str) -> tuple[float, boo
 def _m_crar(view: MetricInputs, st: str, sc: str, sel, unit: str) -> list[Value]:
     nav = view.nav_of(st, sc)
     rows = [r for r in view.rows() if view.in_scope(r, st, sc) and not r["is_swap"]]
-    rwa, unknown = 0.0, []
+    rwa, unknown, bank_cds = 0.0, [], []
     for members in _net_by_isin(rows).values():
         mv = _fsum(m["mv"] for m in members)
         if mv <= 0:
             continue
-        weight, known = _risk_weight(view, members[0]["kind"], _text(members[0].get("sector")))
+        sector = _text(members[0].get("sector"))
+        weight, known = _risk_weight(view, members[0]["kind"], sector)
         if not known:
             unknown.append(members[0]["kind"])
+        if members[0]["kind"] == "cd" and sector.lower() != "pfi":
+            bank_cds.append(_text(members[0].get("isin")))
         rwa += weight / 100 * mv
     if not _finite(nav):
         return [("", math.nan, False, "no NAV (capital) for the scope")]
     value = nav / rwa * 100 if rwa > 0 else math.inf
     return [("", value, True, f"capital (NAV) Rs {nav:,.2f} over risk-weighted assets Rs {rwa:,.2f}; OIS not "
-             "weighted" + (f"; kinds without a weight taken at 100%: {sorted(set(unknown))}" if unknown else ""))]
+             "weighted" + (f"; kinds without a weight taken at 100%: {sorted(set(unknown))}" if unknown else "")
+             + (f"; CDs taken as banks' (the issuer table gives no sector pfi): {', '.join(sorted(bank_cds))}"
+                if bank_cds else ""))]
 
 
 def _m_single(view: MetricInputs, st: str, sc: str, sel, unit: str, dim: str) -> list[Value]:
@@ -1698,14 +1842,26 @@ def limit_metrics(risk, engine, ctx: rk.RiskContext, *, limits=None, day=None, b
 
 
 def utilisation(value: float, hard: float, direction: str) -> float:
-    """``value / hard`` for a maximum; for a minimum ``hard / value`` with a positive level and ``value / hard``
-    with a negative one (a drawdown), so that 1 is the boundary either way (F22, refined: UNVERIFIED); a zero
-    denominator gives 0 when the numerator is 0 and infinity otherwise."""
+    """How far ``value`` has gone towards ``hard`` (1 at the level, above 1 past it; F22, refined: UNVERIFIED): for a
+    maximum ``value / hard`` with a positive level and ``hard / value`` with a negative one (a loss no deeper than,
+    infinity once the value is zero or above); for a minimum ``hard / value`` with a positive level (infinity once the
+    value is zero or below) and ``value / hard`` with a negative one (a drawdown, 0 while the value is not
+    negative); a zero denominator gives 0 when the numerator is 0 and infinity otherwise."""
     if not (_finite(value) or (isinstance(value, float) and math.isinf(value))):
         return math.nan
-    if direction == "max" or hard < 0:
+    if direction == "max" and hard < 0:
+        if value >= 0:
+            return math.inf
+        num, den = hard, value
+    elif direction == "max":
+        num, den = value, hard
+    elif hard < 0:
+        if value >= 0:
+            return 0.0
         num, den = value, hard
     else:
+        if hard > 0 and value <= 0:
+            return math.inf
         num, den = hard, value
     if den == 0:
         return 0.0 if num == 0 else math.inf
@@ -1872,11 +2028,32 @@ def update_breach_log(previous, checks: pd.DataFrame, *, as_of, calendar=None, f
     active_scopes = _filled_scopes(fills, day, strategies or {})
     breaches = checks[checks["status"] == "breach"]
     today = {(r["limit_id"], r["scope_type"], r["scope"], _text(r["key"])): r for r in breaches.to_dict("records")}
+    status_of = {(r["limit_id"], r["scope_type"], r["scope"], _text(r["key"])): _text(r["status"])
+                 for r in checks.to_dict("records")}
+    checked_ids = set(checks["limit_id"].astype(str)) if len(checks) else set()
     out, seen = [], set()
     for entry in log:
         key = (entry["limit_id"], entry["scope_type"], entry["scope"], entry["key"])
         if entry["status"] not in OPEN_BREACHES or entry["last_date"] > day:
             out.append(entry)  # a cured episode, or a later day's row: kept as it is
+            continue
+        measured = status_of.get(key)
+        if key not in today and measured not in ("ok", "warning") and (measured is not None
+                                                                       or entry["limit_id"] in checked_ids):
+            if measured is None:
+                measured = "missing"  # the limit is checked today, but not this key: the exposure is gone
+            if measured == "missing":
+                out.append({**entry, "status": "cured", "closed_date": day})
+                continue
+            # not measured today (incomplete or not applicable): the episode goes on, its cure date kept
+            if entry["last_date"] == day:
+                out.append(entry)  # the same day run again
+                continue
+            status = "escalated" if entry["status"] == "escalated" or (
+                entry["cure_due"] is not None and day > entry["cure_due"]) else "continuing"
+            note = f"not measured on {day} ({measured})"
+            out.append({**entry, "last_date": day, "business_days": len(cal.business_days(entry["first_date"], day)),
+                        "status": status, "notes": f"{entry['notes']}; {note}" if entry["notes"] else note})
             continue
         if key in today and key not in seen:
             rec = today[key]
@@ -2122,6 +2299,9 @@ def state_from_result(engine, day, ctx: rk.RiskContext, *, orders=None, risk=Non
     mine = positions[[rk._date(v, "date") == d for v in positions["date"]]] if len(positions) else positions
     nav_rows = [r for r in ef["nav"].to_dict("records") if rk._date(r["date"], "date") == d] \
         if ef["nav"] is not None and len(ef["nav"]) else []
+    if not nav_rows:
+        raise ValueError(f"nothing to decide against: no NAV on {d} in the engine's frames (a holiday, a mistyped "
+                         "date or a day the engine has not run): the gate needs the book of a day it holds")
     books = sorted({_text(r.get("book")) for r in nav_rows if _text(r.get("book")) != "fund"}
                    | {_text(b) for b in mine["book"]} if len(mine) else
                    {_text(r.get("book")) for r in nav_rows if _text(r.get("book")) != "fund"})
@@ -2736,6 +2916,9 @@ class PreTradeGate:
                 if "of=purchases" in rec["selector"] and rec["metric"] == "rating_floor":
                     if o.side.strip().lower() != "buy" or risked.kind not in rk.CREDIT_KINDS:
                         continue
+                    if risked.strategy in (_sel(parse_selector(rec["selector"], "rating_floor"), "exclude_strategy")
+                                           or ()):
+                        continue  # the strategy is held to its own floor row
                     notch = risked.notch
                     if not _finite(notch):
                         out.append({**common, "hard": False, "post": notch,

@@ -38,11 +38,15 @@ fund's NAV halves its budgets until it is back above half the trigger (UNVERIFIE
 
 **Sizing and hedges** (P6.5, P6.6). ``size_to_dv01`` ``face = target / (DV01 per 100 / 100)`` (and CS01);
 ``size_to_vol`` ``target / current`` capped at 2 (UNVERIFIED); ``round_to_lot`` down to the market lot (Rs 5 crore on
-NDS-OM, UNVERIFIED, a parameter). ``hedge_ois_notional`` ``N = DV01 / (A x 1e-4)`` with the swap's annuity on the OIS
-curve re-based to its start (``asset_swaps.hedge_notional``'s rule for one bond); ``hedge_gsec_face`` ``-DV01 / (DV01_h
-/ 100)``; ``key_rate_hedge`` minimises ``|| KRD_book + K h ||^2`` by least squares or, with every hedge in its allowed
-direction, by non-negative least squares (``nnls``: the active-set method of Lawson and Hanson, Solving Least Squares
-Problems, 1974, written in numpy). Every hedge or rebalance still passes the pre-trade gate (``limits``).
+NDS-OM, UNVERIFIED, a parameter). ``hedge_ois_notional`` by default the notional whose DV01 as ``ois.ois_npv``
+measures it (the continuously compounded zero rates up 1 bp: the engine's, the gate's and the risk tables' measure)
+equals the DV01 given, ``|DV01| / DV01 per rupee of a par swap``; ``method="annuity"`` ``N = DV01 / (A x 1e-4)`` with
+the swap's annuity re-based to its start (``asset_swaps.hedge_notional``'s rule for one bond, which offsets a 1 bp move
+of the swap's par rate and is 1.4% to 6% larger on the engine's measure for 3- to 48-month swaps on the tests' curve);
+``hedge_gsec_face`` ``-DV01 / (DV01_h / 100)``; ``key_rate_hedge`` minimises ``|| KRD_book + K h ||^2`` by least
+squares or, with every hedge in its allowed direction, by non-negative least squares (``nnls``: the active-set method
+of Lawson and Hanson, Solving Least Squares Problems, 1974, written in numpy). Every hedge or rebalance still passes
+the pre-trade gate (``limits``).
 
 **Euler contributions** (P6.7; Tasche 1999 and 2008, Garman, Risk 1997): parametric ``x_i (Sigma x)_i z / sigma_p``
 summing to the VaR; historical ES ``-sum_s a_s PnL_{s,i} / m`` with the Acerbi-Tasche weights (``risk.tail_weights``,
@@ -68,7 +72,7 @@ import pandas as pd
 
 from cr_strat import returns as rt
 from cr_strat import risk as rk
-from cr_strat.ois import MIBOR_OIS, OisConventions, as_time, ois_schedule
+from cr_strat.ois import MIBOR_OIS, OisConventions, OisSwap, as_time, ois_npv, ois_par_rate, ois_schedule
 
 # ---------------------------------------------------------------- conventions (each UNVERIFIED unless said)
 
@@ -198,7 +202,10 @@ def strategy_returns(nav, strategy_books=None, *, as_of=None) -> pd.DataFrame:
     """Daily returns by strategy (a date-indexed frame, one column per strategy, sorted) from the engine's NAV rows
     (``returns.NAV_COLUMNS``: ``date``, ``book``, ``nav``, ``flow``; the ``fund`` rows are left out): each strategy's
     books (``strategy_books``, as mapped on each date; default each book its own strategy) summed, ``(NAV - NAV_prev -
-    flow) / (NAV_prev + flow)``; NaN on a day without capital. With ``as_of``, only dates on or before its day."""
+    flow) / (NAV_prev + flow)``; NaN on a day without capital. A book with no row on a date after one with a row (a gap
+    in its rows, or the end of its history) gives its strategy no return that day (NaN), never -100%, and the day
+    after a gap none either (no previous NAV); a book's first row counts from its flow. With ``as_of``, only dates on
+    or before its day."""
     frame = rk._frame(nav, "the NAV table")
     rk._check_columns(frame, ("date", "book", "nav"), ("date", "book", "nav", "flow"), "the NAV table")
     rows = []
@@ -221,6 +228,7 @@ def strategy_returns(nav, strategy_books=None, *, as_of=None) -> pd.DataFrame:
     navs = table.pivot(index="date", columns="book", values="nav").sort_index().sort_index(axis=1)
     flows = table.pivot(index="date", columns="book", values="flow").reindex_like(navs).fillna(0.0)
     present = navs.notna()
+    before = present.shift(1, fill_value=False)
     navs = navs.fillna(0.0)
     prev = navs.shift(1).fillna(0.0)
     mapping = rk.read_strategy_books(strategy_books) if strategy_books is not None else None
@@ -234,18 +242,33 @@ def strategy_returns(nav, strategy_books=None, *, as_of=None) -> pd.DataFrame:
     out: dict[str, dict[date, float]] = {}
     for day in navs.index:
         groups: dict[str, list[str]] = {}
+        gaps: set[str] = set()
         for book in navs.columns:
-            if present.loc[day, book] or prev.loc[day, book]:
+            here, was = bool(present.loc[day, book]), bool(before.loc[day, book])
+            if here:
                 groups.setdefault(strategy_of(book, day), []).append(book)
+            elif was:  # no row today after one yesterday: a gap or the book's end, not a -100% day
+                gaps.add(strategy_of(book, day))
+        for strategy in sorted(gaps):
+            out.setdefault(strategy, {})[day] = math.nan
         for strategy, books in groups.items():
+            if strategy in gaps:
+                continue
             n = math.fsum(navs.loc[day, b] for b in books)
-            p = math.fsum(prev.loc[day, b] for b in books)
+            p = math.fsum(prev.loc[day, b] for b in books if before.loc[day, b])
             f = math.fsum(flows.loc[day, b] for b in books)
             base = p + f
-            out.setdefault(strategy, {})[day] = (n - p - f) / base if base > 0 else math.nan
+            after_gap = any(not before.loc[day, b] and _had_row(present, day, b) for b in books)
+            out.setdefault(strategy, {})[day] = (n - p - f) / base if base > 0 and not after_gap else math.nan
     result = pd.DataFrame(out).sort_index().sort_index(axis=1)
     result.index.name = "date"
     return result
+
+
+def _had_row(present: pd.DataFrame, day, book: str) -> bool:
+    """Whether ``book`` has a row on a date before ``day`` (a row after a gap has no previous NAV to count from)."""
+    column = present[book]
+    return bool(column[column.index < day].any())
 
 
 def _pair_rows(x: np.ndarray, y: np.ndarray) -> np.ndarray:
@@ -954,12 +977,32 @@ def ois_annuity(curve, months: int, start, *, conventions: OisConventions | None
     return float(sum(p.year_fraction * v for p, v in zip(periods, values[1:] / values[0])))
 
 
+HEDGE_METHODS = ("engine", "annuity")
+
+
 def hedge_ois_notional(dv01: float, curve, months: int, start, *, conventions: OisConventions | None = None,
-                       calendar=None) -> float:
-    """The OIS notional (rupees) whose DV01 offsets ``dv01`` rupees per bp (F18): ``N = DV01 / (A x 1e-4)``, ``A`` the
-    swap's annuity from ``start``; pay fixed against a long book's positive DV01."""
-    a = ois_annuity(curve, months, start, conventions=conventions, calendar=calendar)
-    return abs(_num(dv01, "dv01")) / (a * 1e-4)
+                       calendar=None, method: str = "engine") -> float:
+    """The OIS notional (rupees) whose DV01 offsets ``dv01`` rupees per bp (F18); pay fixed against a long book's
+    positive DV01. ``method="engine"`` (the default): ``N = |DV01| / |DV01_1|``, ``DV01_1`` the DV01 per rupee of
+    notional of a par swap of ``months`` from ``start`` as ``ois.ois_npv`` measures it (the zero rates up 1 bp), the
+    measure the engine's hedge test (L05), the gate and the risk tables use: the hedge's DV01 on it is ``dv01``.
+    ``method="annuity"``: ``N = DV01 / (A x 1e-4)``, ``A`` the swap's annuity from ``start`` (the rule of
+    ``asset_swaps.hedge_notional``: a 1 bp move of the swap's par rate), larger on the engine's measure. Give the
+    book's DV01 on the measure to be neutralised (a bond's yield DV01 is not its curve DV01)."""
+    rk._choice(method, HEDGE_METHODS, "the hedge sizing method")
+    target = abs(_num(dv01, "dv01"))
+    if method == "annuity":
+        a = ois_annuity(curve, months, start, conventions=conventions, calendar=calendar)
+        return target / (a * 1e-4)
+    s = rk._date(start, "the swap's start")
+    conv = conventions if conventions is not None else getattr(curve, "conventions", MIBOR_OIS)
+    cal = calendar if calendar is not None else getattr(curve, "calendar", None)
+    rate = ois_par_rate(curve, s, int(months), conv, cal)
+    unit = ois_npv(curve, OisSwap(effective=s, months=int(months), fixed_rate_pct=rate, notional=1e7, pay_fixed=True,
+                                  conventions=conv), calendar=cal).dv01
+    if not (math.isfinite(unit) and unit != 0):
+        raise ValueError(f"a {months}-month swap from {s} has no DV01 on the curve to size a hedge with")
+    return target / abs(unit) * 1e7
 
 
 def hedge_gsec_face(dv01: float, dv01_h_per100: float) -> float:

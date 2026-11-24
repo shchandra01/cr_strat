@@ -166,8 +166,14 @@ def test_the_gate_writes_tomorrows_paper_trades(two_days):
         f"refused order 2 (c buy {lf.NCD}): {blocking['reason'].iloc[0]}"]
 
 
-def test_the_breach_log_is_carried_and_the_var_history_grows(two_days):
-    _, r1, r2, _ = two_days
+def test_the_breach_log_is_carried_and_the_var_history_grows(tmp_path):
+    # a tight issuer limit (X01, 5% of NAV) the paper NCD breaches on both days: the shipped examples hold on this
+    # book once its cash is counted as liquid and its ADV over the days the marks cover
+    root = lf.paper_fund(tmp_path, limits="limits.csv")
+    lf.tight_limits(root)
+    r1 = _run(root, lf.DAY1)
+    lf.append_approved(root, lf.DAY1)
+    r2 = _run(root, lf.DAY2, orders=False)
     open1 = r1.breach_log[r1.breach_log["status"].isin(lm.OPEN_BREACHES)]
     open2 = r2.breach_log[r2.breach_log["status"].isin(lm.OPEN_BREACHES)]
     assert set(open1["limit_id"]) == set(open2["limit_id"]) and len(open1)

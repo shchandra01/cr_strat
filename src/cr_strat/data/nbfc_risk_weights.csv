@@ -1,13 +1,15 @@
 kind,sector,risk_weight_pct,source,status,notes
-gsec,,0,"RBI NBFC Capital Adequacy Directions para 18(1) table item (6)(a): fund-based claims on the Central Government (verified notes NR:S9)",V,
-green,,0,"para 18(1) table item (6)(a) (sovereign green bonds are Central Government securities)",V,
-special,,0,"para 18(1) table item (6)(a) (GoI special securities)",V,
-tbill,,0,"para 18(1) table item (6)(a) (Treasury bills)",V,
-cmb,,0,"para 18(1) table item (6)(a) (cash management bills)",V,
-strips,,0,"para 18(1) table item (6)(a) (STRIPS of Central Government securities)",V,
-frb,,0,"para 18(1) table item (6)(a) (GoI floating-rate bonds)",V,
-sdl,,0,"para 18(1) table item (6)(b): investment in State Government securities (verified notes NR:S10)",V,State Government guaranteed claims are a separate 20% line (not modelled)
-corporate,,100,"para 18(1) table item (2)(d): debentures and bonds of all companies irrespective of rating (verified notes NR:S11)",V,
-cp,,100,"para 18(1) table item (2)(d): commercial paper of all companies (verified notes NR:S11)",V,
-cd,,100,"para 18(1) table: certificates of deposit 100% (verified notes NR:S11, note)",V,
-corporate,psu_bank,20,"para 18(1) table: bonds of public sector banks 20% (verified notes NR:S11, note)",V,needs sector psu_bank in the issuer table
+gsec,,0,RBI NBFC Capital Adequacy Directions para 18(1) table item (6)(a): fund-based claims on the Central Government (verified notes NR:S9),V,
+green,,0,para 18(1) table item (6)(a) (sovereign green bonds are Central Government securities),V,
+special,,0,para 18(1) table item (6)(a) (GoI special securities),V,
+tbill,,0,para 18(1) table item (6)(a) (Treasury bills),V,
+cmb,,0,para 18(1) table item (6)(a) (cash management bills),V,
+strips,,0,para 18(1) table item (6)(a) (STRIPS of Central Government securities),V,
+frb,,0,para 18(1) table item (6)(a) (GoI floating-rate bonds),V,
+sdl,,0,para 18(1) table item (6)(b): investment in State Government securities (verified notes NR:S10),V,State Government guaranteed claims are a separate 20% line (not modelled)
+corporate,,100,para 18(1) table item (2)(d): debentures and bonds of all companies irrespective of rating (verified notes NR:S11),V,
+cp,,100,para 18(1) table item (2)(d): commercial paper of all companies (verified notes NR:S11),V,
+cd,,0,RBI NBFC Capital Adequacy Directions para 18(1) table item (1): cash and bank balances including fixed deposits and certificates of deposit with banks,V,a CD is read as a bank's unless the issuer table gives its issuer the sector pfi (U: counsel and the accountant to confirm)
+cd,pfi,100,"para 18(1) table item (2)(c): fixed deposits, certificates of deposit and bonds of public financial institutions",V,needs sector pfi in the issuer table
+corporate,psu_bank,20,"para 18(1) table item (2)(b): bonds of public sector banks (verified notes NR:S11, note)",V,needs sector psu_bank in the issuer table
+corporate,pfi,100,para 18(1) table item (2)(c): bonds of public financial institutions,V,needs sector pfi in the issuer table (the same 100% as other companies)

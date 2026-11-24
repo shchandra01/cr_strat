@@ -39,8 +39,12 @@ marks' ``volume_cr`` over the last 20 business days (days without a traded mark 
 conservative reading), else the user's ADV table, else proxies (``ADV_PROXIES``, U examples to be replaced); the exit
 cost ``|F| / 100 x h x DV01`` with ``h`` the half spread of ``costs.cost_rule`` (the engine's fill rule), stressed
 ``STRESS_SPREAD_MULTIPLIER`` (3, U) times; shares of NAV saleable in 1, 5 and 20 business days, the longest and the
-value-weighted days, the illiquid share (CCIL class illiquid or none, SDLs, corporate bonds below AA, more than 20 days:
-U) and the liquidity-adjusted VaR (VaR plus the stressed cost, U). **Funding liquidity** (R4.4): for an unregistered
+value-weighted days, the illiquid share (CCIL class illiquid or none, SDLs, corporate bonds (kind ``corporate``) below
+AA- or unrated, more than 20 days; CP and CD are not illiquid by rating: U) and the liquidity-adjusted VaR (VaR plus
+the stressed cost, U). Positions are netted by ISIN before their days are counted (a sale to settle reduces the
+holding it sells; one ISIN in two books of a scope is one position), and a scope's net cash counts as saleable at day
+0. The ADV from the marks is averaged over the days they cover (from the file's first traded mark or the bond's issue
+date), flagged ``short_adv_window`` below 20; below 5 days the ADV table or a proxy is used where one applies. **Funding liquidity** (R4.4): for an unregistered
 company, the settlement cover of purchases still to settle; for an NBFC, the night's borrowing against its limit, the
 haircut equity, the funding stresses and the structural liquidity ratios of RBI's ALM Directions (cumulative negative
 mismatches at most 10%, 10% and 20% of cumulative outflows in 1-7, 8-14 and 15-30 days: verified notes NR:S18-S20;
@@ -103,13 +107,13 @@ IRRBB_INR = {"parallel": 400.0, "short": 500.0, "long": 300.0}
 IRRBB_DECAY = 4.0
 ROTATIONS = {"steepener": (-0.65, 0.9), "flattener": (0.8, -0.6)}
 # FRTB CSR sector buckets (MAR21.51 Table 3) under the names a user's sector column must carry (U mapping)
-FRTB_SECTORS = ("sovereign", "local_government", "financials", "basic_materials_energy_industrials",
-                "consumer_transport", "technology_telecoms", "health_care_utilities", "covered")
+FRTB_SECTORS = rk.FRTB_SECTORS  # FRTB's credit-spread buckets (MAR21.51 Table 3) by the issuer table's names
 CS_RATING_LADDER = {"AAA": 50.0, "AA+": 100.0, "AA": 100.0, "AA-": 150.0, "A+": 200.0, "A": 200.0, "A-": 200.0,
                     "BBB": 300.0, "SUB_IG": 500.0, "D": 500.0, "unrated": 500.0}  # U examples (R3.3)
 PARTICIPATION = 0.20  # U: share of a day's volume the fund can sell
 STRESS_SPREAD_MULTIPLIER = 3.0  # U
 ADV_WINDOW_DAYS = 20  # U
+MIN_ADV_DAYS = 5  # U: fewer business days of marks than this: the ADV table or a proxy before the marks' few days
 ILLIQUID_DAYS = 20  # U
 # U example average daily volumes, rupees (R4.1): to be replaced by the fund's own volumes
 ADV_PROXIES = {"gsec_liquid": 1000e7, "gsec_semi_liquid": 100e7, "gsec_illiquid": 10e7, "sdl": 5e7, "tbill": 500e7,
@@ -364,7 +368,9 @@ def _attributes(item) -> dict[str, str]:
                 "sector": "", "frtb_sector": "", "issuer": "", "group": "", "seniority": "", "ig": ""}
     bucket = item.rating_bucket or ("sovereign" if item.rating_source == "sovereign" else "unrated")
     sector = item.sector or ""
-    frtb = sector if sector in FRTB_SECTORS else "other"
+    # FRTB's bucket: the issuer table's frtb_sector, else the sector when it is one of FRTB's names or a fund name
+    # read as one (a public sector bank, a bank, an NBFC, an HFC, a public financial institution: financials, U)
+    frtb = item.frtb_sector or (sector if sector in FRTB_SECTORS else rk.SECTOR_FRTB.get(sector, "other"))
     if item.seniority == "covered":
         frtb = "covered"
     return {"kind": item.kind, "book": item.book, "isin": item.isin, "tenor_bucket": item.tenor_bucket,
@@ -422,6 +428,20 @@ def _migration_bp(row: ScenarioRow, item, matrix: pd.DataFrame | None) -> float:
     return (CS_RATING_LADDER.get(lower, 500.0) - CS_RATING_LADDER.get(bucket, 500.0)) * row.multiplier
 
 
+def _ladder_no_step(rows: Sequence[ScenarioRow], item, matrix) -> bool:
+    """Whether a downgrade row selecting ``item`` read through the ladder (no peer matrix for its tenor) gives no
+    spread step: the ladder treats AA+ and AA, and A+, A and A-, alike (give a peer matrix: flagged ladder_no_step)."""
+    if item.kind not in rk.CREDIT_KINDS or item.rating_bucket in (None, "D") or not (
+            item.rating_bucket in LT_NOTCH or item.rating_bucket in ("BBB", "SUB_IG")):
+        return False
+    for r in rows:
+        if r.component != "rating_migration" or not selects(r, item):
+            continue
+        if _migration_bp(r, item, None) == 0 and (matrix is None or _migration_bp(r, item, matrix) == 0):
+            return True
+    return False
+
+
 def _spread_bp(rows: Sequence[ScenarioRow], item, matrix) -> float:
     """The z-spread change (bp) of a bond under a scenario's spread rows that select it."""
     total = 0.0
@@ -448,8 +468,10 @@ def _bond_pnl(item: rk.RiskPosition, rate_rows: Sequence[ScenarioRow], spread_bp
                      and r.shape != "yield_parallel"]
         h = float(_rate_shift_bp(gsec_rows, np.array([t_reset]))[0]) if gsec_rows else 0.0
         h += sum(r.size_bp * r.multiplier for r in frb_rows if r.component == "frb_index")
+        # its own yield moved (yield_parallel, a rate scenario): the index moves, coupons and discount rate with it,
+        # as a rate shock moves a floater; its margin moves only under frb_dm (U)
+        h += sum(r.size_bp * r.multiplier for r in yield_rows)
         dm = sum(r.size_bp * r.multiplier for r in frb_rows if r.component == "frb_dm")
-        dm += sum(r.size_bp * r.multiplier for r in yield_rows)  # its own yield: the margin moves (U)
         if not (h or dm):
             return 0.0, "frb_full"
         base = rk._frb_dirty(bond, item.settlement, item.yield_pct, 0.0, 0.0)
@@ -546,6 +568,8 @@ def apply_scenario(book: rk.RiskBook, rows: Sequence[ScenarioRow], sctx: StressC
             method = "full"
         else:
             spread = _spread_bp(by_cat["spread"], item, matrix)
+            if _ladder_no_step(by_cat["spread"], item, matrix):
+                flags.append("ladder_no_step")
             p_rates, method = _bond_pnl(item, rate_rows, 0.0, [], ctx.risk)
             p_spread = _bond_pnl(item, [], spread, [], ctx.risk)[0] if spread else 0.0
             p_frb = _bond_pnl(item, [], 0.0, frb_rows, ctx.risk)[0] if frb_rows else 0.0
@@ -597,6 +621,8 @@ def run_stress(book: rk.RiskBook, scenarios: Sequence[ScenarioRow], sctx: Stress
                     continue
                 value = rk._fsum(r[column] for r in mine)
                 mark = list(flags)
+                if component in ("total", "spread") and any("ladder_no_step" in r["flags"].split(";") for r in mine):
+                    mark.append("ladder_no_step: a downgrade the rating ladder gives no step (give a peer matrix)")
                 if (funding_only or component == "funding") and not borrows:
                     value = math.nan
                     if component == "funding" and not funding_only:
@@ -649,33 +675,48 @@ def read_adv(table) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=list(ADV_COLUMNS))
 
 
-def _marks_adv(ctx: rk.RiskContext, d: date) -> dict[str, float]:
-    """Mean traded volume (rupees a day) over the last ``ADV_WINDOW_DAYS`` business days to ``d``, from the marks'
-    ``volume_cr`` of traded rows public by ``as_of`` (a day without one counts as zero volume)."""
+def _marks_adv(ctx: rk.RiskContext, d: date) -> tuple[dict[str, float], date | None]:
+    """``(traded volume by ISIN in rupees over the last ADV_WINDOW_DAYS business days to d, the file's first day)``:
+    the marks' ``volume_cr`` of traded rows public by ``as_of``, and the first day any traded row of the file covers
+    (a day before it is no data, never zero volume)."""
     marks = ctx.market.marks
     if marks is None or not len(marks):
-        return {}
+        return {}, None
     frame = rk._frame(marks, "the marks")
     if "volume_cr" not in frame:
-        return {}
+        return {}, None
     cal = ctx.calendar.lenient()
     start = cal.add_business_days(d, -(ADV_WINDOW_DAYS - 1))
     default = ctx.default_time
     sums: dict[str, float] = {}
+    first = None
     for _, rec in rk._lines(frame):
         source = _text(rec.get("source")).lower() or "traded"
         if source != "traded" or _blank(rec.get("volume_cr")):
             continue
         day = rk._date(rec.get("date"), "the marks' date")
-        if not start <= day <= d:
+        if day > d:
             continue
         public = rk.public_time(rec.get("public_from"), "the marks' public_from") if not _blank(
             rec.get("public_from")) else (datetime.combine(day, default) if default is not None else None)
         if public is None or public > ctx.as_of:
             continue
+        first = day if first is None or day < first else first
+        if day < start:
+            continue
         isin = _text(rec.get("isin")).upper()
         sums[isin] = sums.get(isin, 0.0) + rk._num(rec.get("volume_cr"), "the marks' volume_cr") * 1e7
-    return {k: v / ADV_WINDOW_DAYS for k, v in sums.items()}
+    return sums, first
+
+
+def _covered_days(cal, d: date, first: date | None, issue: date | None) -> int:
+    """Business days of the ADV window to ``d`` that the marks cover: from the latest of the window's start, the
+    file's first traded day and the bond's issue date (at most ADV_WINDOW_DAYS)."""
+    start = cal.add_business_days(d, -(ADV_WINDOW_DAYS - 1))
+    for floor in (first, issue):
+        if floor is not None and floor > start:
+            start = floor
+    return min(len(cal.business_days(start, d)), ADV_WINDOW_DAYS) if start <= d else 0
 
 
 def _stock_on(ctx: rk.RiskContext, isin: str, d: date) -> float | None:
@@ -697,7 +738,8 @@ def adv_of(book: rk.RiskBook, ctx: rk.RiskContext) -> dict[tuple, tuple[float, s
     table (the ISIN's latest row public by ``as_of``, else its kind's and CCIL class's), else a proxy
     (``ADV_PROXIES`` by kind and class; corporate bonds ``CORPORATE_ADV_SHARE`` of the issue's outstanding by rating,
     from ``MarketData.stock``), flagged ``proxy_adv``. NaN where nothing applies (``no_adv``). Swaps have none."""
-    from_marks = _marks_adv(ctx, book.date)
+    volumes, first = _marks_adv(ctx, book.date)
+    cal = ctx.calendar.lenient()
     table = read_adv(ctx.adv) if ctx.adv is not None else None
     if table is not None:
         table = table[[(r["date"] <= book.date) and (r["public_from"] is None or r["public_from"] <= ctx.as_of)
@@ -705,9 +747,17 @@ def adv_of(book: rk.RiskBook, ctx: rk.RiskContext) -> dict[tuple, tuple[float, s
     out = {}
     for item in book.positions:
         flags: list[str] = []
-        if from_marks.get(item.isin):
-            out[item.key] = (from_marks[item.isin], "marks", ())
-            continue
+        short = None
+        if volumes.get(item.isin):
+            covered = _covered_days(cal, book.date, first, item.instrument.issue_date)
+            adv_marks = volumes[item.isin] / covered if covered else math.nan
+            if covered >= MIN_ADV_DAYS:
+                out[item.key] = (adv_marks, "marks", () if covered == ADV_WINDOW_DAYS else
+                                 (f"short_adv_window:{covered}d",))
+                continue
+            # fewer marked days than MIN_ADV_DAYS: the table or a proxy if one applies, else these few days
+            short = (adv_marks, "marks", (f"short_adv_window:{covered}d",))
+            flags.append(f"short_adv_window:{covered}d")
         if table is not None and len(table):
             rows = table[table["isin"] == item.isin]
             if not len(rows):
@@ -715,7 +765,7 @@ def adv_of(book: rk.RiskBook, ctx: rk.RiskContext) -> dict[tuple, tuple[float, s
                              & ((table["liquidity"] == "") | (table["liquidity"] == (item.liquidity or "")))]
             if len(rows):
                 row = rows.sort_values(["date", "liquidity"], kind="mergesort").iloc[-1]
-                out[item.key] = (float(row["adv_cr"]) * 1e7, "table", ())
+                out[item.key] = (float(row["adv_cr"]) * 1e7, "table", tuple(flags))
                 continue
         adv, source = math.nan, "proxy_class"
         kind = item.kind
@@ -736,6 +786,9 @@ def adv_of(book: rk.RiskBook, ctx: rk.RiskContext) -> dict[tuple, tuple[float, s
                 flags.append("no_stock")
             else:
                 adv, source = stock * CORPORATE_ADV_SHARE[band], "proxy_issue"
+        if not math.isfinite(adv) and short is not None:
+            out[item.key] = short
+            continue
         if not math.isfinite(adv):
             flags.append("no_adv")
         else:
@@ -774,21 +827,118 @@ def _exit_cost(item, sctx: StressContext) -> float:
         return math.nan
 
 
+def _static_illiquid(item) -> bool:
+    """Illiquid by kind, CCIL class or rating, whatever its size: a G-sec of CCIL's illiquid class or none, an SDL, a
+    corporate bond (kind ``corporate``) rated below AA- or unrated (CP and CD are not counted by rating; U)."""
+    return (item.kind in ("gsec", "green", "special") and item.liquidity not in ("liquid", "semi_liquid")) \
+        or item.kind == "sdl" or (item.kind == "corporate" and (item.rating_bucket or "unrated")
+                                  not in ("AAA", "AA+", "AA", "AA-"))
+
+
+def _days(face: float, participation: float, adv: float) -> float:
+    if not face:
+        return 0.0
+    return abs(face) / (participation * adv) if math.isfinite(adv) and adv > 0 else math.inf
+
+
+def scope_liquidity(rows: Iterable[Mapping], *, cash: float = 0.0, days_limit: float = ILLIQUID_DAYS) -> dict:
+    """A scope's liquidity from its bond rows (``LIQUIDITY_COLUMNS`` records; swaps left out), netted by ISIN across
+    the scope's books and its settled and pending rows (a sale to settle reduces the holding it sells; one ISIN in
+    two books is one position): per ISIN the net face and value and its days ``|net face| / (participation x ADV)``;
+    ``liquid(n)`` the value saleable within ``n`` business days, ``sum min(1, n / days) x net value`` over net longs
+    (a net short counts its full value) plus ``cash`` at day 0 (the scope's net cash on a trade-date view); the
+    longest days, the value-weighted mean, the value of the illiquid ISINs (by kind, class or rating, flagged
+    ``illiquid_static`` on a row, or past ``days_limit`` days)."""
+    by: dict[str, list[Mapping]] = {}
+    for r in rows:
+        if _text(r.get("kind")) == "ois":
+            continue
+        by.setdefault(_text(r.get("isin")), []).append(r)
+    isins = []
+    for isin, members in sorted(by.items()):
+        face = rk._fsum(float(m.get("face") or 0.0) for m in members)
+        value = rk._fsum(float(m.get("value") or 0.0) for m in members)
+        adv = next((float(m["adv"]) for m in members if _finite(m.get("adv"))), math.nan)
+        part = next((float(m["participation"]) for m in members if _finite(m.get("participation"))), PARTICIPATION)
+        days = _days(face, part, adv)
+        static = any("illiquid_static" in _text(m.get("flags")).split(";") for m in members)
+        isins.append({"isin": isin, "face": face, "value": value, "days": days,
+                      "illiquid": static or days > days_limit})
+
+    def liquid(n: float) -> float:
+        total = [cash]
+        for x in isins:
+            if x["face"] > 0:
+                total.append(x["value"] if x["days"] <= 0 else (min(1.0, n / x["days"]) * x["value"]
+                                                               if math.isfinite(x["days"]) else 0.0))
+            else:
+                total.append(x["value"])
+        return rk._fsum(total)
+
+    longs = [x for x in isins if x["face"] > 0]
+    weights = rk._fsum(abs(x["value"]) for x in longs)
+    if any(not math.isfinite(x["days"]) for x in longs if abs(x["value"]) > 0):
+        mean = math.inf
+    else:
+        mean = rk._fsum(abs(x["value"]) * x["days"] for x in longs) / weights if weights else math.nan
+    worst = max(longs, key=lambda x: (x["days"], x["isin"])) if longs else None
+    return {"isins": isins, "liquid": liquid, "max_days": worst["days"] if worst else math.nan,
+            "max_isin": worst["isin"] if worst else "", "mean_days": mean,
+            "illiquid_value": rk._fsum(abs(x["value"]) for x in isins if x["illiquid"])}
+
+
+def _finite(value) -> bool:
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def _book_cash(ctx: rk.RiskContext, book: rk.RiskBook) -> dict[str, float]:
+    """Each book's net cash on a trade-date view: the NAV row's cash less borrowing plus money lent and receivables,
+    less the purchases still to settle and plus the sales still to settle (their market value), so that a pending
+    trade moves money between cash and the bond it is (NaN without the book's NAV row)."""
+    rows: dict[str, Mapping] = {}
+    if ctx.nav is not None:
+        frame = rk._frame(ctx.nav, "the NAV table")
+        for _, rec in rk._lines(frame):
+            if "date" in rec and rk._date(rec["date"], "the NAV date") == book.date:
+                rows[_text(rec.get("book"))] = rec
+    out = {}
+    for name in sorted({p.book for p in book.items} | set(rows) - {"fund"}):
+        rec = rows.get(name)
+        if rec is None:
+            out[name] = math.nan
+            continue
+        net = rk._fsum(rk._num(rec.get(k), k, blank=0.0) * s for k, s in (("cash", 1), ("repo_borrowed", -1),
+                                                                          ("lent", 1), ("receivables", 1)))
+        pending = rk._fsum(p.market_value for p in book.positions if p.book == name and p.state == "pending")
+        out[name] = net - pending
+    return out
+
+
 def liquidity(book: rk.RiskBook, ctx: rk.RiskContext, *, participation: float = PARTICIPATION,
               multiplier: float = STRESS_SPREAD_MULTIPLIER, var_by_scope: Mapping[tuple[str, str], float] | None = None
               ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """``(LIQUIDITY_COLUMNS, LIQUIDITY_SUMMARY_COLUMNS)``: per position the ADV and its source, days to liquidate at
-    ``participation`` of it, the half spread, the exit cost and the stressed cost (``multiplier`` times), the illiquid
-    flag; per scope the shares of NAV saleable within 1, 5 and 20 business days (``sum min(1, D/days) |value| / NAV``),
-    the longest and the value-weighted days, the illiquid share, the costs and the liquidity-adjusted VaR (the scope's
-    one-day VaR of ``var_by_scope`` plus the stressed cost)."""
+    """``(LIQUIDITY_COLUMNS, LIQUIDITY_SUMMARY_COLUMNS)``. Per position the ADV and its source, the half spread and
+    the illiquid flag; its days and exit costs are those of its book's net position in the ISIN (settled and pending
+    rows netted: a sale to settle shortens the days of the holding it sells), the cost allocated to the rows by face.
+    Per scope (``scope_liquidity``, netted by ISIN across the scope's books): the shares of NAV saleable within 1, 5
+    and 20 business days, the scope's net cash (trade-date view) counted at day 0, the longest and the value-weighted
+    days, the illiquid share, the costs of the net positions (stressed ``multiplier`` times) and the
+    liquidity-adjusted VaR (the scope's one-day VaR of ``var_by_scope`` plus the stressed cost)."""
     if not 0 < participation <= 1:
         raise ValueError(f"participation must be above 0 and at most 1, not {participation}")
     if not multiplier >= 1:
         raise ValueError(f"the stressed spread multiplier must be at least 1, not {multiplier}")
     sctx = StressContext(risk=ctx, participation=participation, multiplier=multiplier)
     advs = adv_of(book, ctx)
-    rows = []
+    net_book: dict[tuple[str, str], list[float]] = {}
+    for item in book.positions:
+        acc = net_book.setdefault((item.book, item.isin), [0.0, 0.0])
+        acc[0] += item.face
+        acc[1] += abs(item.face)
+    rows, gross = [], []
     for item in book.items:
         if isinstance(item, rk.RiskSwap):
             try:
@@ -801,50 +951,60 @@ def liquidity(book: rk.RiskBook, ctx: rk.RiskContext, *, participation: float = 
                          "value": item.value, "adv": math.nan, "adv_source": "", "participation": participation,
                          "days_to_liquidate": math.nan, "half_spread_bp": h, "liquidation_cost": cost,
                          "stressed_cost": cost * multiplier, "illiquid": False, "flags": "no_adv_ois"})
+            gross.append(cost)
             continue
         adv, source, flags = advs[item.key]
-        days = abs(item.face) / (participation * adv) if math.isfinite(adv) and adv > 0 else math.inf
+        net, total = net_book[(item.book, item.isin)]
+        days = _days(net, participation, adv)
         try:
             h, cost = _exit_parameters(item, sctx)
         except ValueError as exc:
             h, cost = math.nan, math.nan
             flags = (*flags, f"no_cost_rule: {exc}")
-        illiquid = (item.kind in ("gsec", "green", "special") and item.liquidity not in ("liquid", "semi_liquid")) \
-            or item.kind == "sdl" or (item.kind == "corporate" and (item.rating_bucket or "unrated")
-                                      not in ("AAA", "AA+", "AA", "AA-")) or days > ILLIQUID_DAYS
+        static = _static_illiquid(item)
+        if static:
+            flags = (*flags, "illiquid_static")
+        share = abs(net) / total if total else 0.0  # the book's net position's cost, allocated to its rows by face
         rows.append({"date": book.date, "as_of": rk._iso(book.as_of), "book": item.book, "strategy": item.strategy,
                      "isin": item.isin, "kind": item.kind, "face": item.face, "value": item.market_value, "adv": adv,
                      "adv_source": source, "participation": participation, "days_to_liquidate": days,
-                     "half_spread_bp": h, "liquidation_cost": cost, "stressed_cost": cost * multiplier,
-                     "illiquid": bool(illiquid), "flags": rk._flags(flags)})
+                     "half_spread_bp": h, "liquidation_cost": cost * share, "stressed_cost": cost * share * multiplier,
+                     "illiquid": bool(static or days > ILLIQUID_DAYS), "flags": rk._flags(flags)})
+        gross.append(cost)
     detail = pd.DataFrame(rows, columns=list(LIQUIDITY_COLUMNS))
+    cash = _book_cash(ctx, book)
     summary = []
     for scope_type, scope in book.scopes():
-        mine = [r for r in rows if scope_type == "fund" or (scope_type == "book" and r["book"] == scope)
-                or (scope_type == "strategy" and r["strategy"] == scope)]
-        bonds = [r for r in mine if r["kind"] != "ois"]
+        idx = [k for k, r in enumerate(rows) if scope_type == "fund" or (scope_type == "book" and r["book"] == scope)
+               or (scope_type == "strategy" and r["strategy"] == scope)]
+        mine = [rows[k] for k in idx]
+        books = sorted({b for b in cash if scope_type == "fund" or (scope_type == "book" and b == scope)
+                        or (scope_type == "strategy" and book.strategies.get(b, b) == scope)})
+        scope_cash = rk._fsum(cash[b] for b in books) if all(math.isfinite(cash[b]) for b in books) else math.nan
+        figures = scope_liquidity(mine, cash=scope_cash if math.isfinite(scope_cash) else 0.0)
         nav = book.nav_of(scope_type, scope)
-        weights = [abs(r["value"]) for r in bonds]
-        total_w = rk._fsum(weights)
-
-        def share(days_limit: int, bonds=bonds, nav=nav) -> float:
-            if not (math.isfinite(nav) and nav > 0):
-                return math.nan
-            return rk._fsum(min(1.0, days_limit / r["days_to_liquidate"]) * abs(r["value"]) if
-                            r["days_to_liquidate"] > 0 else abs(r["value"]) for r in bonds) / nav
-
-        finite_days = [r["days_to_liquidate"] for r in bonds]
-        cost = rk._fsum(r["liquidation_cost"] for r in mine if math.isfinite(r["liquidation_cost"]))
-        stressed = rk._fsum(r["stressed_cost"] for r in mine if math.isfinite(r["stressed_cost"]))
+        ok = math.isfinite(nav) and nav > 0 and math.isfinite(scope_cash)
+        # the scope's exit cost on its net positions: each ISIN's gross cost per unit of face times its net face
+        unit: dict[str, list[float]] = {}
+        for k in idx:
+            r = rows[k]
+            if r["kind"] == "ois":
+                continue
+            acc = unit.setdefault(r["isin"], [0.0, 0.0])
+            acc[0] += gross[k] if math.isfinite(gross[k]) else 0.0
+            acc[1] += abs(r["face"])
+        cost = rk._fsum((c / f * abs(x["face"]) if f else 0.0) for x in figures["isins"]
+                        for c, f in [unit.get(x["isin"], [0.0, 0.0])])
+        cost += rk._fsum(gross[k] for k in idx if rows[k]["kind"] == "ois" and math.isfinite(gross[k]))
         var = (var_by_scope or {}).get((scope_type, scope), math.nan)
         summary.append({"date": book.date, "as_of": rk._iso(book.as_of), "scope_type": scope_type, "scope": scope,
-                        "share_1d": share(1), "share_5d": share(5), "share_20d": share(20),
-                        "max_days": max(finite_days) if finite_days else math.nan,
-                        "mean_days": rk._fsum(w * r["days_to_liquidate"] for w, r in zip(weights, bonds)) / total_w
-                        if total_w else math.nan,
-                        "illiquid_share": rk._fsum(abs(r["value"]) for r in bonds if r["illiquid"]) / nav
-                        if math.isfinite(nav) and nav > 0 else math.nan,
-                        "liquidation_cost": cost, "stressed_cost": stressed, "lvar": var + stressed})
+                        "share_1d": figures["liquid"](1) / nav if ok else math.nan,
+                        "share_5d": figures["liquid"](5) / nav if ok else math.nan,
+                        "share_20d": figures["liquid"](20) / nav if ok else math.nan,
+                        "max_days": figures["max_days"], "mean_days": figures["mean_days"],
+                        "illiquid_share": figures["illiquid_value"] / nav if math.isfinite(nav) and nav > 0
+                        else math.nan, "liquidation_cost": cost, "stressed_cost": cost * multiplier,
+                        "lvar": var + cost * multiplier})
     return detail, pd.DataFrame(summary, columns=list(LIQUIDITY_SUMMARY_COLUMNS))
 
 

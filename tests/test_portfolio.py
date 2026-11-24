@@ -267,7 +267,8 @@ def test_ois_hedge_notional_matches_asset_swaps_for_one_bond():
     clean = 99.0
     face = 1e9
     dv01 = face / 100 * bond.analytics(s, clean_price=clean).dv01
-    assert pf.hedge_ois_notional(dv01, curve, 48, s, calendar=cal) == pytest.approx(
+    # the annuity rule (a 1 bp move of the par rate); the default sizes on the engine's DV01 (test_portfolio_review)
+    assert pf.hedge_ois_notional(dv01, curve, 48, s, calendar=cal, method="annuity") == pytest.approx(
         hedge_notional(bond, s, clean, curve, 48, face=face, calendar=cal), rel=1e-12)
 
 

@@ -1402,6 +1402,16 @@ def _nav_map(nav, d: date, books: Iterable[str], strategies: Mapping[str, str]) 
     return out
 
 
+def _nav_books(nav, d: date) -> set[str]:
+    """The books with a NAV row on ``d`` (``fund`` left out): a book holding only cash has no position row."""
+    if nav is None:
+        return set()
+    frame = _frame(nav, "the NAV table")
+    if not len(frame) or "date" not in frame or "book" not in frame:
+        return set()
+    return {_text(b) for v, b in zip(frame["date"], frame["book"]) if _date(v, "the NAV table's date") == d} - {"fund"}
+
+
 def risk_book(positions, ctx: RiskContext, *, day=None) -> RiskBook:
     """The book of one day of a positions table (``returns.POSITION_COLUMNS``: the rows of ``day``, or the only date
     there) as risk sees it at ``ctx.as_of``: each bond as known then (``returns.instruments_as_known``), priced for its
@@ -1429,7 +1439,7 @@ def risk_book(positions, ctx: RiskContext, *, day=None) -> RiskBook:
         if key in seen:
             raise ValueError(f"the positions list {key[1]} of book {key[0]} ({key[2]}, {key[3]}) twice on {d}")
         seen.add(key)
-    books = sorted({_text(r.get("book")) for r in rows})
+    books = sorted({_text(r.get("book")) for r in rows} | _nav_books(ctx.nav, d))  # a cash-only book too
     strategies = _strategy_map(ctx.strategy_books, books, d)
     bond_rows = [r for r in rows if _text(r.get("state")).lower() in ("settled", "pending")]
     swap_rows = [r for r in rows if _text(r.get("state")).lower() == "ois"]

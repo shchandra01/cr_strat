@@ -2132,6 +2132,13 @@ def _pre_trade(args: argparse.Namespace) -> int:
         calendar = mumbai_settlement_calendar()
         calendar = calendar.lenient() if args.project_calendar else calendar
         day = _date_arg(args.date, "--date")
+        nav_path = Path(args.engine_dir) / "nav.csv"
+        if not nav_path.exists():
+            raise FileNotFoundError(f"--engine-dir: {nav_path} not found (cr-strat returns writes it)")
+        if not (_read_csv_text(str(nav_path))["date"] == day.isoformat()).any():
+            print(f"nothing to decide against: no NAV on {day} in {nav_path} (a holiday, a mistyped date or a day "
+                  "the engine has not run)")
+            return 1
         access = return_engine.access_policy(args.access)
         as_of = _layer_as_of(args, day, access)
         market = _layer_market(args, calendar)

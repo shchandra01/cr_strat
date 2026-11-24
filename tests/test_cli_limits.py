@@ -69,7 +69,8 @@ def test_daily_report_limits_and_pre_trade_agree_under_both_presets(tmp_path, pr
 
 
 def test_the_breach_log_is_carried_by_the_command_as_by_the_daily_process(tmp_path):
-    root = lf.paper_fund(tmp_path / "fund")
+    root = lf.paper_fund(tmp_path / "fund", limits="limits.csv")
+    lf.tight_limits(root)  # X01: an issuer limit the NCD breaches on both days
     for day, extra in (("2026-11-18", ["--orders", root / "orders.csv"]), ("2026-11-19", [])):
         code, _, err = _main(["daily-report", "--config", root / "config.toml", "--date", day, *extra,
                               "--out-dir", root])
@@ -78,7 +79,7 @@ def test_the_breach_log_is_carried_by_the_command_as_by_the_daily_process(tmp_pa
             lf.append_approved(root, lf.DAY1)
     day2 = root / "2026-11-19"
     code, out, err = _main(["limits", "--risk-dir", day2 / "risk", "--engine-dir", day2 / "engine", "--date",
-                            "2026-11-19", "--limits", "example", "--access", "unregulated_company",
+                            "2026-11-19", "--limits", root / "limits.csv", "--access", "unregulated_company",
                             *_market_args(root), "--breach-log", root / "2026-11-18" / "limits" / "breach_log.csv",
                             "--out-dir", tmp_path / "limits"])
     assert code == 0, err

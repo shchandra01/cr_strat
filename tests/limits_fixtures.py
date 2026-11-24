@@ -195,6 +195,23 @@ min_obs_hard = 60
     return root
 
 
+def tight_limits(root) -> str:
+    """The example table plus an EXAMPLE issuer limit of 5% of NAV that the paper fund's NCD (about 7.3% of NAV)
+    breaches on both days: a real breach to carry in the breach log. Returns its file name, for ``limits=``."""
+    table = pd.read_csv(lm.EXAMPLE_LIMITS_CSV, dtype=str, keep_default_na=False)
+    row = {c: "" for c in table.columns}
+    row.update({"limit_id": "X01", "name": "a tight issuer limit (tests)", "metric": "exposure", "scope_type": "fund",
+                "scope": "fund", "selector": "issuer=*", "unit": "pct_nav", "direction": "max", "warning_level": "4",
+                "hard_level": "5", "legal_form": "any", "cure_business_days": "5", "action": "block_increase",
+                "policy_status": "EXAMPLE", "source": "tests", "status": "U", "counsel": "no",
+                "notes": EXAMPLE_NOTE})
+    pd.concat([table, pd.DataFrame([row])], ignore_index=True).to_csv(Path(root) / "limits.csv", index=False)
+    return "limits.csv"
+
+
+EXAMPLE_NOTE = lm.EXAMPLE_NOTE
+
+
 def append_approved(root, day) -> None:
     """The operator's step: the day's approved trades appended to the paper trades file."""
     root = Path(root)
@@ -210,4 +227,4 @@ def files_under(root) -> dict[str, bytes]:
 
 __all__ = ["END", "NCD", "NCD_TERMS", "BONDS", "MASTER", "fits", "market_and_trades", "context", "engine_and_risk",
            "nav_rows", "state", "gsec_row", "ois_entries", "ois_market", "scenario_rows", "limit_frame", "approved",
-           "ORDERS", "DAY1", "DAY2", "paper_fund", "append_approved", "files_under", "np", "fx"]
+           "ORDERS", "DAY1", "DAY2", "paper_fund", "append_approved", "files_under", "tight_limits", "np", "fx"]
