@@ -31,8 +31,11 @@ input's path, sha256 and rows, the settings, ``as_of``, the package version, the
 ``access`` (required: the access preset, a question for counsel), ``inception``, ``board_resolution_date``,
 ``allow_example_limits``, ``limits`` (``example`` or a table's path), ``project_calendar``, ``[inputs]`` (paths
 relative to the file: ``marks``, ``nss_params``, ``flows``, ``trades``, ``swaps`` and the optional tables of
-``cr-strat returns`` and ``cr-strat risk``), ``[risk]`` (methods, horizons, window, observation thresholds, levels,
-``stressed``), ``[gate]`` (``cash_buffer_pct``). Unknown keys are refused, naming the closest.
+``cr-strat returns`` and ``cr-strat risk``, ``spread_matrix`` the peer matrix credit migrations read),
+``[risk]`` (methods, horizons, window, observation thresholds, levels, ``stressed``, ``residual``, ``sdl_mode``,
+``quantile_rule``, ``gap_rule``, ``max_gap_days``, ``participation``, ``stress_multiplier``: as ``cr-strat risk``'s
+options), ``[gate]`` (``cash_buffer_pct``). Unknown keys are refused, naming the closest. The back-test pairs a
+strategy's VaR with the P&L of its books (``strategy_books``) as the VaR's scopes are mapped.
 
 **Limits.** Built and tested on synthetic books only; no licensed price has been through it. A library ``Strategy``
 runs as ``returns.run_backtest(limits.GatedStrategy(strategy, gate), ...)`` (the same gate); the daily command takes an
@@ -71,9 +74,11 @@ INPUT_KEYS = ("marks", "nss_params", "ois_quotes", "fixings", "store", "haircuts
               "residual_history", "corporate_terms", "corporate_schedule", "corporate_options",
               "corporate_amortisation", "corporate_steps", "ratings", "corporate_floating", "benchmark_fixings",
               "frb_terms", "frb_coupons", "tbills", "issuers", "stock", "strategy_books", "factor_history", "adv",
-              "seniority", "proxies", "scenarios", "costs", "auctions", "flows", "trades", "swaps")
+              "seniority", "proxies", "scenarios", "costs", "auctions", "flows", "trades", "swaps", "spread_matrix",
+              "counterparties")
 RISK_KEYS = ("methods", "horizons", "window", "min_obs", "min_obs_hard", "stressed", "var_alpha", "es_alpha",
-             "cov_method", "ewma_lambda", "participation", "stress_multiplier")
+             "cov_method", "ewma_lambda", "participation", "stress_multiplier", "residual", "sdl_mode",
+             "quantile_rule", "gap_rule", "max_gap_days")
 GATE_KEYS = ("cash_buffer_pct",)
 RECONCILIATION_COLUMNS = ("date", "file", "key", "column", "stored", "replayed", "difference")
 RECONCILE_RTOL = 1e-6
@@ -209,6 +214,7 @@ class DailyResult:
     paths: list = field(default_factory=list)
     config: DailyConfig | None = None
     limits: pd.DataFrame | None = None
+    counterparty: pd.DataFrame | None = None
 
 
 # ---------------------------------------------------------------- reading the inputs
@@ -320,7 +326,12 @@ def _risk_settings(config: DailyConfig) -> rk.RiskSettings:
         var_alpha=float(r.get("var_alpha", defaults.var_alpha)), es_alpha=float(r.get("es_alpha", defaults.es_alpha)),
         cov_method=str(r.get("cov_method", defaults.cov_method)),
         ewma_lambda=float(r.get("ewma_lambda", defaults.ewma_lambda)),
-        windows=("current", "stressed") if r.get("stressed", False) else ("current",))
+        windows=("current", "stressed") if r.get("stressed", False) else ("current",),
+        residual=str(r["residual"]) if r.get("residual") not in (None, "") else defaults.residual,
+        sdl_mode=str(r.get("sdl_mode", defaults.sdl_mode)),
+        quantile_rule=str(r.get("quantile_rule", defaults.quantile_rule)),
+        gap_rule=str(r.get("gap_rule", defaults.gap_rule)),
+        max_gap_days=int(r.get("max_gap_days", defaults.max_gap_days)))
 
 
 def _previous_dir(root: Path, day: date) -> Path | None:
@@ -551,10 +562,18 @@ def report_markdown(result: DailyResult) -> str:
     lines.append("")
     order = {"escalated": 0, "new": 1}
     rows = sorted(hot.to_dict("records"), key=lambda r: (order[r["status"]], r["limit_id"], r["scope"], r["key"]))
+    breach_columns = [("limit", "limit_id"), ("scope", "scope"), ("key", "key"), ("status", "status"),
+                      ("origin", "origin"), ("first day", "first_date"), ("worst", "worst"), ("hard", "hard"),
+                      ("cure due", "cure_due"), ("action", "action")]
     lines += _table([{**r, "worst": _f(r["worst_value"], 4), "hard": _f(r["hard_level"], 4)} for r in rows],
-                    [("limit", "limit_id"), ("scope", "scope"), ("key", "key"), ("status", "status"),
-                     ("origin", "origin"), ("first day", "first_date"), ("worst", "worst"), ("hard", "hard"),
-                     ("cure due", "cure_due"), ("action", "action")])
+                    breach_columns)
+    # the hard breaches still open from an earlier day, so the top of the report shows the fund's whole state
+    still = log[(log["status"] == "continuing") & (log["last_date"] == result.day)] if len(log) else log
+    still_rows = sorted(still.to_dict("records"), key=lambda r: (r["limit_id"], r["scope"], r["key"]))
+    lines.append("Still open from an earlier day (continuing):")
+    lines.append("")
+    lines += _table([{**r, "worst": _f(r["worst_value"], 4), "hard": _f(r["hard_level"], 4)} for r in still_rows],
+                    breach_columns)
     nav = result.engine.nav
     fund = nav[nav["book"] == "fund"] if (nav["book"] == "fund").any() else nav
     fund = fund[fund["date"] <= result.day] if len(fund) else fund
@@ -614,6 +633,17 @@ def report_markdown(result: DailyResult) -> str:
                             [(dim, "key"), ("market value", "mv"), ("% NAV", "pct"), ("JTD", "jtd")])
     else:
         lines += ["(no credit position)", ""]
+    exposure = result.counterparty
+    fund_cpty = exposure[exposure["scope_type"] == "fund"] if exposure is not None and len(exposure) else None
+    if fund_cpty is not None and len(fund_cpty):
+        lines.append("OIS counterparty exposure (current exposure method: gross positive MTM plus the add-on; CCPs "
+                     "zero):")
+        lines.append("")
+        lines += _table([{**r, "ce": _f(r["current_exposure"]), "pfe": _f(r["pfe"]), "eq": _f(r["credit_equivalent"]),
+                          "pc": _f(r["pct_nav"], 4)} for r in fund_cpty.to_dict("records")],
+                        [("counterparty", "counterparty"), ("type", "counterparty_type"), ("swaps", "swaps"),
+                         ("current exposure", "ce"), ("add-on", "pfe"), ("credit equivalent", "eq"), ("% NAV", "pc"),
+                         ("flags", "flags")])
     lines.append("## VaR and ES")
     lines.append("")
     if rr is not None:
@@ -623,6 +653,8 @@ def report_markdown(result: DailyResult) -> str:
                         [("method", "method"), ("days", "horizon_days"), ("window", "window"), ("obs", "n_obs"),
                          (f"VaR {rr.book.settings.var_alpha:g}", "v"), (f"ES {rr.book.settings.es_alpha:g}", "e"),
                          ("coverage", "c"), ("status", "status")])
+        lines.append("The VaR leaves out: " + "; ".join(rk.VAR_LEAVES_OUT) + ".")
+        lines.append("")
     else:
         lines += ["(no VaR: no position)", ""]
     lines.append("## Stress (fund, worst first)")
@@ -648,12 +680,20 @@ def report_markdown(result: DailyResult) -> str:
                          ("exit cost", "cost"), ("stressed", "stressed")])
         fl = rr.funding_liquidity
         if len(fl) and not fl["applicable"].astype(bool).any():
-            lines.append(f"Funding liquidity: not applicable ({str(fl['notes'].iloc[0])[:160]})")
+            lines.append(f"Funding liquidity: not applicable (`{cfg.access}` does not borrow: no repo or TREPS, a "
+                         "question for counsel). Settlement cover (cash over the purchases still to settle) and the "
+                         "share of NAV in cash, T-bills, CMBs and CP, by book:")
+            lines.append("")
+            lines += _table([{"book": r["book"], "p": _f(r["pending_purchases"]), "c": _f(r["settlement_cover"], 4),
+                              "l": _f(r["liquid_asset_share"] * 100, 2)} for r in fl.to_dict("records")],
+                            [("book", "book"), ("purchases to settle", "p"), ("settlement cover", "c"),
+                             ("% NAV in cash, T-bills, CP", "l")])
         elif len(fl):
             base = fl[fl["scenario_id"].astype(str) == ""]
-            lines += _table([{**r, "b": _f(r["borrowed"]), "a1": _f(r["alm_1_7d"], 4)} for r in
-                             base.to_dict("records")],
-                            [("book", "book"), ("borrowed", "b"), ("ALM 1-7d", "a1")])
+            lines += _table([{**r, "b": _f(r["borrowed"]), "a1": _f(r["alm_1_7d"], 4),
+                              "l": _f(r["liquid_asset_share"] * 100, 2)} for r in base.to_dict("records")],
+                            [("book", "book"), ("borrowed", "b"), ("ALM 1-7d", "a1"),
+                             ("% NAV in cash, T-bills, CP", "l")])
         lines.append("")
     lines.append("## Limits")
     lines.append("")
@@ -678,8 +718,9 @@ def report_markdown(result: DailyResult) -> str:
     bts = result.backtest_summary
     lines += _table([{**r, "k": _f(r["kupiec_p"], 4), "c": _f(r["christoffersen_p"], 4)}
                      for r in bts.to_dict("records")],
-                    [("scope", "scope"), ("method", "method"), ("observations", "observations"),
-                     ("exceptions", "exceptions"), ("Kupiec p", "k"), ("Christoffersen p", "c"), ("zone", "zone")])
+                    [("type", "scope_type"), ("scope", "scope"), ("method", "method"),
+                     ("observations", "observations"), ("exceptions", "exceptions"), ("Kupiec p", "k"),
+                     ("Christoffersen p", "c"), ("zone", "zone")])
     lines.append("## Reconciliation with the previous report")
     lines.append("")
     rec = result.reconciliation
@@ -788,7 +829,8 @@ def run_daily(config: DailyConfig, day, *, orders=None, out_dir) -> DailyResult:
         issuers=_csv(config.inputs.get("issuers")), strategy_books=_csv(config.inputs.get("strategy_books")),
         factor_history=_csv(config.inputs.get("factor_history")), proxies=_csv(config.inputs.get("proxies")),
         adv=_csv(config.inputs.get("adv")), seniority=_csv(config.inputs.get("seniority")),
-        nss_table=market.curves or None)
+        nss_table=market.curves or None, spread_matrix=_csv(config.inputs.get("spread_matrix")),
+        counterparties=_csv(config.inputs.get("counterparties")))
     gate = lm.PreTradeGate(user, ctx, allow_example_limits=config.allow_example_limits,
                            cash_buffer_pct=float(config.gate.get("cash_buffer_pct", lm.CASH_BUFFER_PCT))) \
         if len(proposed) else None
@@ -823,6 +865,14 @@ def run_daily(config: DailyConfig, day, *, orders=None, out_dir) -> DailyResult:
                                calendar=cal, fills=engine.fills, limits=table, strategies=strategies)
     breaches = lm.breaches_of_day(log, d)
     paths += lm.write_limits(metrics, checks, breaches, out / "limits", breach_log=log)
+    # the OIS counterparty exposure (current exposure method) of the fund and each book, for the report (no new file:
+    # the day's set of files is fixed; cr-strat limits gives the metric to any limit row that asks for it)
+    fund_nav = engine.nav[(engine.nav["book"] == "fund") & (engine.nav["date"] == d)]["nav"]
+    books = sorted(set(engine.nav["book"].astype(str)) - {"fund"})
+    exposure = lm.counterparty_exposure(
+        rr.position_risk.to_dict("records") if rr is not None else [], d, ctx.counterparties,
+        nav={("fund", "fund"): float(fund_nav.iloc[0])} if len(fund_nav) else None,
+        scopes=(("fund", "fund"), *(("book", b) for b in books)), strategies=strategies)
     if gate is not None:
         state = lm.state_from_result(out / "engine", d, replace(ctx, nav=None, funding=None), scenarios=scenarios,
                                      board_resolution_date=config.board_resolution_date)
@@ -858,7 +908,8 @@ def run_daily(config: DailyConfig, day, *, orders=None, out_dir) -> DailyResult:
         history = pd.DataFrame(columns=list(rk.VAR_HISTORY_COLUMNS))
     paths.append(_write(history, out / "backtest" / "var_history.csv"))
     if len(history):
-        bt, bts = rk.backtest(history, engine.nav, engine.attribution, calendar=cal)
+        # a strategy's P&L is its books' (strategy_books, as mapped on the VaR's day), as the VaR's scopes are
+        bt, bts = rk.backtest(history, engine.nav, engine.attribution, calendar=cal, strategy_books=ctx.strategy_books)
     else:
         bt = pd.DataFrame(columns=list(rk.BACKTEST_COLUMNS))
         bts = pd.DataFrame(columns=list(rk.BACKTEST_SUMMARY_COLUMNS))
@@ -870,7 +921,7 @@ def run_daily(config: DailyConfig, day, *, orders=None, out_dir) -> DailyResult:
                          breach_log=log, breaches=breaches, proposed=proposed, gate=gate_frame, approved=approved,
                          approved_trades=trades_next, approved_swaps=swaps_next, var_history=history,
                          backtest=bt, backtest_summary=bts, reconciliation=reconciliation, scales=scales,
-                         notes=notes, config=config, limits=table)
+                         notes=notes, config=config, limits=table, counterparty=exposure)
     result.report = report_markdown(result)
     report_path = out / "report.md"
     report_path.write_text(result.report, encoding="utf-8")

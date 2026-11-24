@@ -92,7 +92,7 @@ from cr_strat.bonds import DiscountInstrument
 from cr_strat.calendars import mumbai_settlement_calendar
 from cr_strat.floating import GoiFloatingRateBond, index_dv01
 from cr_strat.issuance import TENOR_BUCKETS
-from cr_strat.ois import MIBOR_OIS, OisSwap, as_time, effective_date, ois_npv, ois_par_rate
+from cr_strat.ois import MIBOR_OIS, OisSwap, add_months, as_time, effective_date, ois_npv, ois_par_rate
 from cr_strat.rating_scale import LT_NOTCH, parse_rating
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
@@ -188,7 +188,10 @@ METRICS: dict[str, Metric] = {
                                "parametric VaR and the sum of absolute KRDs with the swaps over without"),
     "short_face": Metric(("rs",), "max", ("kind",), "legal", "face sold short (when-issued sales left out)"),
     "when_issued": Metric(("pct",), "max", ("side", "isin"), "legal", "when-issued face over the notified amount"),
-    "crar": Metric(("pct",), "min", (), "legal", "NAV over risk-weighted assets (nbfc_risk_weights.csv)"),
+    "crar": Metric(("pct",), "min", (), "legal", "NAV over risk-weighted assets (nbfc_risk_weights.csv; OIS by the "
+                   "current exposure method)"),
+    "counterparty_exposure": Metric(("pct_nav", "rs"), "max", ("counterparty", "type"), "concentration",
+                                    "an OIS counterparty's credit equivalent: gross positive MTM plus the add-on"),
     "tier1": Metric(("pct",), "min", (), "legal", "NAV over risk-weighted assets (Tier 1 taken as NAV)"),
     "single_party": Metric(("pct",), "max", ("issuer",), "legal", "non-sovereign exposure to one party over NAV"),
     "single_group": Metric(("pct",), "max", ("group",), "legal", "non-sovereign exposure to one group over NAV"),
@@ -212,7 +215,11 @@ UNVERIFIED_RULES = (
     "exposures, CS01, JTD by issuer, group and sector over corporate bonds, CP and CD; GoI and states exempt",
     "a purchase still to settle counts at its market value (trade-date view); payables count as outside liabilities",
     "the borrowing a book needs: purchases to settle less sales to settle less its net cash",
-    "owned fund, Tier 1 and capital taken as NAV; OIS counterparty risk not risk-weighted",
+    "owned fund, Tier 1 and capital taken as NAV",
+    "OIS counterparty risk by the current exposure method as the NBFC capital directions give it for interest rate "
+    "contracts (gross positive MTM plus 0.5%, 1% or 3% of notional by residual maturity; CCPs zero; weights 0% "
+    "government, 20% banks, 100% others), no bilateral netting; a swap without a counterparty row (a new order) "
+    "counted as an unknown counterparty at 100%",
     "a holding known only by its rating bucket takes the bucket's worst notch",
     "the OIS hedge effect: the larger of the swaps' effect on parametric VaR and on the sum of absolute KRDs (each "
     "tenor's G-sec and OIS KRDs netted, the KRDs beyond the OIS curve's last node netted into it); while the VaR "
@@ -319,6 +326,20 @@ def parse_selector(text, metric: str, where: str = "the selector") -> tuple[tupl
 
 
 KRD_CURVES = ("gsec", "sdl", "ois", "ois_par")  # the curve names of the risk layer's key rates
+# OIS counterparty credit risk (P7): the current exposure method of the NBFC Capital Adequacy Directions as saved and
+# read in this build (para 18(3)(ii) weights, 18(7)(v) CCPs, 18(8) CEM, its add-on table for interest rate
+# contracts): the gross positive MTM per counterparty plus the notional times the add-on by residual maturity (up to
+# 12 months 0.5%, up to 60 months 1%, beyond 3%); a CCP's exposure zero; weights 0% (Central or State Government),
+# 20% (banks), 100% (others). OIS read as an interest rate contract and the 100% for a swap without a counterparty
+# row: UNVERIFIED. No bilateral netting (it needs an agreement the directions name: not built).
+COUNTERPARTY_COLUMNS = ("trade_id", "counterparty", "counterparty_type")
+COUNTERPARTY_TYPES = ("ccp", "bank", "government", "other")
+CEM_ADDON_PCT = ((12, 0.5), (60, 1.0), (None, 3.0))  # (residual months up to, add-on % of notional)
+CEM_RISK_WEIGHT_PCT = {"ccp": 0.0, "government": 0.0, "bank": 20.0, "other": 100.0}
+UNKNOWN_COUNTERPARTY = "unknown"
+COUNTERPARTY_EXPOSURE_COLUMNS = ("date", "scope_type", "scope", "counterparty", "counterparty_type", "swaps",
+                                 "notional", "mtm", "current_exposure", "pfe", "credit_equivalent", "risk_weight_pct",
+                                 "risk_weighted", "pct_nav", "flags")
 RATING_BUCKETS = (*rk.IG_BUCKETS, "SUB_IG", "D", "unrated", "sovereign")
 SELECTOR_KINDS = tuple(sorted(rt.PRICED_KINDS))
 
@@ -378,6 +399,12 @@ def _canonical_values(metric: str, key: str, values: tuple[str, ...], where: str
         return each(str.lower)
     if key == "isin":
         return each(str.upper)
+    if key == "type" and metric == "counterparty_exposure":
+        def ctype(v: str) -> str:
+            if v.lower() not in COUNTERPARTY_TYPES:
+                raise bad(v, COUNTERPARTY_TYPES)
+            return v.lower()
+        return each(ctype)
     return values
 
 
@@ -658,6 +685,7 @@ class MetricInputs:
     notified: dict[str, float] = field(default_factory=dict)
     risk_weights: pd.DataFrame | None = None
     board_resolution: date | None = None
+    counterparties: pd.DataFrame | None = None
     changes: pd.DataFrame | None = None
     risk_settings: rk.RiskSettings = field(default_factory=rk.RiskSettings)
     var_method: str | None = None  # the gate: every VaR and ES by this method (parametric)
@@ -1542,13 +1570,132 @@ def _m_crar(view: MetricInputs, st: str, sc: str, sel, unit: str) -> list[Value]
         if members[0]["kind"] == "cd" and sector.lower() != "pfi":
             bank_cds.append(_text(members[0].get("isin")))
         rwa += weight / 100 * mv
+    swaps = _exposures(view, st, sc)
+    swap_rwa = _fsum(swaps["risk_weighted"]) if len(swaps) else 0.0
+    rwa += swap_rwa
     if not _finite(nav):
         return [("", math.nan, False, "no NAV (capital) for the scope")]
     value = nav / rwa * 100 if rwa > 0 else math.inf
-    return [("", value, True, f"capital (NAV) Rs {nav:,.2f} over risk-weighted assets Rs {rwa:,.2f}; OIS not "
-             "weighted" + (f"; kinds without a weight taken at 100%: {sorted(set(unknown))}" if unknown else "")
+    ois = (f"OIS by the current exposure method: credit equivalent Rs {_fsum(swaps['credit_equivalent']):,.2f}, "
+           f"weighted Rs {swap_rwa:,.2f}" + ("; swaps without a counterparty row at 100%" if
+                                            (swaps["flags"] != "").any() else "")) if len(swaps) else "no OIS"
+    return [("", value, True, f"capital (NAV) Rs {nav:,.2f} over risk-weighted assets Rs {rwa:,.2f}; {ois}"
+             + (f"; kinds without a weight taken at 100%: {sorted(set(unknown))}" if unknown else "")
              + (f"; CDs taken as banks' (the issuer table gives no sector pfi): {', '.join(sorted(bank_cds))}"
                 if bank_cds else ""))]
+
+
+def read_counterparties(source=None) -> pd.DataFrame:
+    """The swaps' counterparties (``COUNTERPARTY_COLUMNS``: the swap's ``trade_id``, the counterparty's name and its
+    type, one of ``COUNTERPARTY_TYPES``), from a frame or a CSV; blank rows dropped; a trade given twice or an unknown
+    type refused, naming the line."""
+    if source is None:
+        return pd.DataFrame(columns=list(COUNTERPARTY_COLUMNS))
+    frame = source.copy() if isinstance(source, pd.DataFrame) else pd.read_csv(Path(source), dtype=str,
+                                                                               keep_default_na=False)
+    frame.columns = [str(c).strip().lower() for c in frame.columns]
+    missing = [c for c in COUNTERPARTY_COLUMNS if c not in frame]
+    if missing:
+        raise ValueError(f"the counterparty table lacks {missing} (columns: {', '.join(COUNTERPARTY_COLUMNS)})")
+    rows, seen = [], {}
+    for k, rec in enumerate(frame.to_dict("records")):
+        where = f"the counterparty table line {k + 2}"
+        values = {c: _text(rec.get(c)) for c in COUNTERPARTY_COLUMNS}
+        if not any(values.values()):
+            continue
+        if not values["trade_id"] or not values["counterparty"]:
+            raise ValueError(f"{where}: a trade_id and a counterparty are required")
+        kind = values["counterparty_type"].lower()
+        if kind not in COUNTERPARTY_TYPES:
+            raise ValueError(f"{where}: counterparty_type {values['counterparty_type']!r} is not one of "
+                             f"{COUNTERPARTY_TYPES}{_closest(kind, COUNTERPARTY_TYPES)}")
+        if values["trade_id"] in seen:
+            raise ValueError(f"{where}: trade {values['trade_id']} is given twice (line {seen[values['trade_id']]})")
+        seen[values["trade_id"]] = k + 2
+        rows.append({**values, "counterparty_type": kind})
+    return pd.DataFrame(rows, columns=list(COUNTERPARTY_COLUMNS))
+
+
+def _cem_addon_pct(day: date, end) -> float:
+    """The CEM add-on (% of notional) of an interest rate contract ending on ``end`` seen from ``day``."""
+    stop = rk._date(end, "the swap's end") if not _blank(end) else None
+    if stop is None:
+        return CEM_ADDON_PCT[-1][1]  # no end known: the longest bucket's (conservative)
+    for months, pct in CEM_ADDON_PCT:
+        if months is None or stop <= add_months(day, months):
+            return pct
+    return CEM_ADDON_PCT[-1][1]
+
+
+def counterparty_exposure(rows: Sequence[Mapping], day, counterparties=None, *, nav: Mapping | None = None,
+                          scopes: Sequence[tuple[str, str]] = (("fund", "fund"),),
+                          strategies: Mapping[str, str] | None = None) -> pd.DataFrame:
+    """``COUNTERPARTY_EXPOSURE_COLUMNS`` of the swaps among ``rows`` (position-risk records: ``isin``
+    ``OIS:<trade_id>``, signed notional ``face``, NPV ``value``, ``maturity_date``) by scope and counterparty
+    (``counterparties``, ``read_counterparties``; a swap without a row is ``unknown``, type other, flagged
+    ``no_counterparty``): the gross positive MTM (no netting), the add-on ``|notional| x CEM_ADDON_PCT`` by residual
+    maturity, the credit equivalent (zero for a CCP), its weight and the risk-weighted amount, and the credit
+    equivalent over the scope's NAV."""
+    d = rk.as_date(day)
+    table = read_counterparties(counterparties) if not isinstance(counterparties, pd.DataFrame) or not set(
+        COUNTERPARTY_COLUMNS) <= set(counterparties.columns) else counterparties
+    who = {r["trade_id"]: (r["counterparty"], r["counterparty_type"]) for r in table.to_dict("records")}
+    maps = dict(strategies or {})
+    swaps = []
+    for rec in rows:
+        if _text(rec.get("kind")) != "ois" and _text(rec.get("state")) != "ois":
+            continue
+        trade = _text(rec.get("isin"))
+        trade = trade[4:] if trade.startswith("OIS:") else trade
+        name, kind = who.get(trade, (UNKNOWN_COUNTERPARTY, "other"))
+        notional = abs(_float(rec.get("face"), 0.0))
+        mtm = _float(rec.get("value"), 0.0)
+        book = _text(rec.get("book"))
+        swaps.append({"book": book, "strategy": _text(rec.get("strategy")) or maps.get(book, book),
+                      "counterparty": name, "type": kind, "notional": notional, "mtm": mtm,
+                      "pfe": notional * _cem_addon_pct(d, rec.get("maturity_date")) / 100,
+                      "flag": "no_counterparty" if trade not in who else ""})
+    out = []
+    for scope_type, scope in scopes:
+        mine = [s for s in swaps if scope_type == "fund" or (scope_type == "book" and s["book"] == scope)
+                or (scope_type == "strategy" and s["strategy"] == scope)]
+        for name, kind in sorted({(s["counterparty"], s["type"]) for s in mine}):
+            group = [s for s in mine if (s["counterparty"], s["type"]) == (name, kind)]
+            current = _fsum(max(s["mtm"], 0.0) for s in group)
+            pfe = _fsum(s["pfe"] for s in group)
+            equivalent = 0.0 if kind == "ccp" else current + pfe
+            weight = CEM_RISK_WEIGHT_PCT[kind]
+            base = (nav or {}).get((scope_type, scope), math.nan)
+            out.append({"date": d, "scope_type": scope_type, "scope": scope, "counterparty": name,
+                        "counterparty_type": kind, "swaps": len(group), "notional": _fsum(s["notional"] for s in group),
+                        "mtm": _fsum(s["mtm"] for s in group), "current_exposure": current, "pfe": pfe,
+                        "credit_equivalent": equivalent, "risk_weight_pct": weight,
+                        "risk_weighted": equivalent * weight / 100,
+                        "pct_nav": equivalent / base * 100 if _finite(base) and base > 0 else math.nan,
+                        "flags": ";".join(sorted({s["flag"] for s in group if s["flag"]}))})
+    return pd.DataFrame(out, columns=list(COUNTERPARTY_EXPOSURE_COLUMNS))
+
+
+def _exposures(view: MetricInputs, st: str, sc: str) -> pd.DataFrame:
+    rows = [r for r in view.rows() if r["is_swap"] and view.in_scope(r, st, sc)]
+    return counterparty_exposure(rows, view.day, view.counterparties, nav=view.nav, scopes=((st, sc),),
+                                 strategies=view.strategies)
+
+
+def _m_counterparty(view: MetricInputs, st: str, sc: str, sel, unit: str) -> list[Value]:
+    table = _exposures(view, st, sc)
+    names = dict(sel).get("counterparty", ("*",))
+    types = dict(sel).get("type", ("*",))
+    table = table[[("*" in names or r["counterparty"] in names) and ("*" in types or r["counterparty_type"] in types)
+                   for r in table.to_dict("records")]] if len(table) else table
+    out = []
+    for r in table.to_dict("records"):
+        value = r["pct_nav"] if unit == "pct_nav" else r["credit_equivalent"]
+        detail = (f"credit equivalent Rs {r['credit_equivalent']:,.2f} ({r['counterparty_type']}: current exposure Rs "
+                  f"{r['current_exposure']:,.2f} plus add-on Rs {r['pfe']:,.2f} on {r['swaps']} swap(s))"
+                  + ("; a swap without a counterparty row: unknown, at 100%" if r["flags"] else ""))
+        out.append((r["counterparty"], value, _finite(value), detail))
+    return out or [("", 0.0, True, "no swap with a counterparty selected")]
 
 
 def _m_single(view: MetricInputs, st: str, sc: str, sel, unit: str, dim: str) -> list[Value]:
@@ -1620,7 +1767,8 @@ _METRIC_FUNCTIONS: dict[str, Callable] = {
     "borrowing": _m_borrowing, "illiquid_share": _m_illiquid_share, "liquid_share": _m_liquid_share,
     "days_to_liquidate": _m_days_to_liquidate, "ois_hedge_ratio": _m_ois_hedge_ratio,
     "ois_hedge_effect": _m_ois_hedge_effect, "short_face": _m_short_face, "when_issued": _m_when_issued,
-    "crar": _m_crar, "tier1": _m_crar, "single_party": lambda v, t, s, sel, u: _m_single(v, t, s, sel, u, "issuer"),
+    "crar": _m_crar, "tier1": _m_crar, "counterparty_exposure": _m_counterparty,
+    "single_party": lambda v, t, s, sel, u: _m_single(v, t, s, sel, u, "issuer"),
     "single_group": lambda v, t, s, sel, u: _m_single(v, t, s, sel, u, "group"), "alm_mismatch": _m_alm,
     "nof": _m_nof, "settlement_cover": _m_settlement_cover, "corporate_repo": _m_corporate_repo,
     "board_resolution": _m_board_resolution,
@@ -1822,7 +1970,7 @@ def metric_inputs(risk, engine, ctx: rk.RiskContext, *, day=None, board_resoluti
         risk_weights=read_risk_weights(risk_weights) if risk_weights is not None else read_risk_weights(),
         board_resolution=rk._opt_date(board_resolution_date, "board_resolution_date")
         if board_resolution_date is not None else None,
-        changes=hist, risk_settings=ctx.risk)
+        changes=hist, risk_settings=ctx.risk, counterparties=read_counterparties(ctx.counterparties))
 
 
 def limit_metrics(risk, engine, ctx: rk.RiskContext, *, limits=None, day=None, board_resolution_date=None,
@@ -2698,7 +2846,8 @@ def _view(state: PortfolioState, items: Sequence[OrderRisk], cache: dict) -> Met
         stock=rk._frame(state.ctx.market.stock, "the stock table") if state.ctx.market.stock is not None else None,
         issue_dates=_issue_dates(state.ctx), notified=_notified(state.ctx, state.day),
         risk_weights=read_risk_weights(), board_resolution=state.board_resolution, changes=state.changes,
-        risk_settings=state.ctx.risk, var_method="parametric")
+        risk_settings=state.ctx.risk, var_method="parametric",
+        counterparties=read_counterparties(state.ctx.counterparties))
 
 
 def _cached_values(view: MetricInputs, cache: dict, metric: str, st: str, sc: str, selector: str, unit: str

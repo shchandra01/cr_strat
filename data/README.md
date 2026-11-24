@@ -147,7 +147,7 @@ each number means: [`docs/risk.md`](../docs/risk.md).
 
 | File (kept by you) | Read by | Main columns |
 |---|---|---|
-| Issuers | `risk --issuers` | `issuer_id`, `name`, `group_id`, `group_name`, `sector` (FRTB's names: `financials`, `basic_materials_energy_industrials`, `consumer_transport`, `technology_telecoms`, `health_care_utilities`, `covered`; any other counts as FRTB's `other`, its largest weight, in `FRTB_CSR`), `seniority` (`senior`, `subordinated`, `covered`), `effective_from`, `effective_to`, `source` |
+| Issuers | `risk --issuers` | `issuer_id`, `name`, `group_id`, `group_name`, `sector` (the fund's own name, read in lower case: `psu_bank` gives a public sector bank's bonds the NBFC risk weight of 20%, `pfi` a public financial institution's CDs 100%; `bank`, `psu_bank`, `nbfc`, `hfc`, `pfi` and `insurance` are read as FRTB's financials), `frtb_sector` (optional, FRTB's bucket, which wins over the sector: `sovereign`, `local_government`, `financials`, `basic_materials_energy_industrials`, `consumer_transport`, `technology_telecoms`, `health_care_utilities`, `covered`; any other name is FRTB's `other`, its largest weight, in `FRTB_CSR`), `seniority` (`senior`, `subordinated`, `covered`), `isin_prefix` (optional: the first characters of the issuer's ISINs, e.g. `INE123A`, so its CP and CD join its NCDs; two issuers with one prefix are refused; without it the prefix of the issuer's bonds in the corporate terms is used), `effective_from`, `effective_to`, `source` |
 | Book to strategy | `risk --strategy-books` | `book`, `strategy`, `effective_from` (default: each book its own strategy) |
 | Seniority by ISIN | `risk --seniority` | `isin`, `seniority`, `source` (else the issuer's, else the terms' tier, else senior) |
 | Factor levels | `risk --factor-history` | `date`, `factor` (`corp:<rating bucket>:<tenor bucket>`, `cd:<tenor bucket>`, `sdl_spread:<tenor bucket>`, `frb_dm:<isin>`, `tbill182`, `resid:<isin>`), `value`, `unit` (`bp` or `pct`), `public_from`, `source` (a source naming `coarse` flags the factor's VaR) |
@@ -155,9 +155,11 @@ each number means: [`docs/risk.md`](../docs/risk.md).
 | Average daily volumes | `risk --adv` | `date`, `isin` (or blank with `kind` and `liquidity` for a class), `adv_cr` (Rs crore a day), `public_from`, `source` |
 | Peer spread matrix | `risk --spread-matrix` | `credit_spreads.read_spread_matrix`'s layout: `rating_bucket` (optionally `instrument_class`, `sector`, `tenor_bucket`), `tenor_years`, `spread_bp`: the spreads a rating migration moves to (else the rating ladder's step) |
 | Scenarios | `risk --scenarios` (with `--no-default-scenarios`: yours only) | `stress.SCENARIO_COLUMNS`: `scenario_id`, `name`, `family`, `component`, `selector`, `shape`, `size_bp`, `tenor_years`, `multiplier`, `horizon_days`, `floor_pct`, `available_from`, `effective_from`, `source`, `status`, `notes`; a row replaces the shipped scenario of the same id (`src/cr_strat/data/stress_scenarios.csv`) |
-| VaR history | written by `risk --var-history`, read by `var-backtest --var-history` | `risk.VAR_HISTORY_COLUMNS`: one row per day, scope, method, horizon and level |
+| VaR history | written by `risk --var-history`, read by `var-backtest --var-history` | `risk.VAR_HISTORY_COLUMNS`: one row per day, scope, method, horizon and level; appending a run replaces only the rows of the same day, scope, method, horizon and level (two runs of one day on different books keep both) |
+| Swap counterparties | `limits --counterparties`, `pre-trade --counterparties`, the daily inputs' `counterparties` | `limits.COUNTERPARTY_COLUMNS`: `trade_id` (the swap's, as in the swap trades), `counterparty` (a name), `counterparty_type` (`ccp`, `bank`, `government`, `other`); a trade given twice or another type is refused; a swap without a row counts as `unknown` at 100% |
 
-`var-backtest` also reads the engine's `nav.csv` (the actual P&L) and `attribution.csv` (the hypothetical P&L).
+`var-backtest` also reads the engine's `nav.csv` (the actual P&L) and `attribution.csv` (the hypothetical P&L, time
+effects left out unless `--time-effects include`), and `--strategy-books` to back-test each strategy on its books' P&L.
 Spread and curve histories come from licensed prices (the exchanges, agency valuations, CCIL's NDS-OM data): keep
 them under their terms; the free auction table is only a coarse stand-in ([`docs/risk.md`](../docs/risk.md)).
 
@@ -176,13 +178,14 @@ is not used); every table is refused, naming the line, for an unknown column, me
 | Fixed weights | `allocate --fixed` | `portfolio.FIXED_WEIGHT_COLUMNS`: `strategy`, `weight` (0 to 1, summing to one), `effective_from`, `approved_by` |
 | Risk budgets | `allocate --budgets` (with `--risk-dir`) | `portfolio.BUDGET_COLUMNS`: `strategy`, `metric` (`dv01`, `cs01`, `var`, `es`), `budget` (positive), `unit` (default `rs_per_bp` for DV01 and CS01, `rs` otherwise), `effective_from` |
 | Weight bounds | `allocate --bounds` | `portfolio.BOUNDS_COLUMNS`: `strategy`, `min_weight`, `max_weight` (`0 <= min <= max <= 1`), each strategy once |
-| The paper fund's configuration | `daily-report --config` | a TOML file: `fund`, **`access`**, **`inception`**, `board_resolution_date`, `allow_example_limits` (true or false), `limits` (`example` or a path), `project_calendar`, `decision_time` (HH:MM); `[inputs]` (paths relative to the file) `marks`, `nss_params`, `ois_quotes`, `fixings`, `store`, `haircuts`, `master`, `liquidity`, `residual_history`, the corporate and FRB tables, `ratings`, `tbills`, `issuers`, `stock`, `strategy_books`, `factor_history`, `adv`, `seniority`, `proxies`, `scenarios`, `costs`, `auctions`, `flows`, `trades`, `swaps`; `[risk]` `methods`, `horizons`, `window`, `min_obs`, `min_obs_hard`, `stressed`, `var_alpha`, `es_alpha`, `cov_method`, `ewma_lambda`, `participation`, `stress_multiplier`; `[gate]` `cash_buffer_pct` |
+| The paper fund's configuration | `daily-report --config` | a TOML file: `fund`, **`access`**, **`inception`**, `board_resolution_date`, `allow_example_limits` (true or false), `limits` (`example` or a path), `project_calendar`, `decision_time` (HH:MM); `[inputs]` (paths relative to the file) `marks`, `nss_params`, `ois_quotes`, `fixings`, `store`, `haircuts`, `master`, `liquidity`, `residual_history`, the corporate and FRB tables, `ratings`, `tbills`, `issuers`, `stock`, `strategy_books`, `factor_history`, `adv`, `seniority`, `proxies`, `scenarios`, `costs`, `auctions`, `flows`, `trades`, `swaps`, `spread_matrix` (the peer matrix migrations read), `counterparties` (the swaps' counterparties); `[risk]` `methods`, `horizons`, `window`, `min_obs`, `min_obs_hard`, `stressed`, `var_alpha`, `es_alpha`, `cov_method`, `ewma_lambda`, `participation`, `stress_multiplier`, `residual` (`in_fit` or `loo`: S3's `resid:` factors from `residual_history`), `sdl_mode`, `quantile_rule`, `gap_rule`, `max_gap_days` (as `cr-strat risk`'s options); `[gate]` `cash_buffer_pct` |
 | The paper book | the daily inputs' `trades` and `swaps` | `returns.TRADE_COLUMNS` and `SWAP_TRADE_COLUMNS`: each day's `orders/approved_trades.csv` and `approved_swaps.csv` appended by you (prices and fixed rates blank: filled by the engine) |
 
 Shipped with the package (`src/cr_strat/data/`): `limits_example.csv` (E01-E30, **every row an EXAMPLE**, not a
 policy), `legal_form_limits.csv` (L01-L24: the legal forms' rules as read from RBI's directions, each row for counsel
-to confirm, always added to the fund's table) and `nbfc_risk_weights.csv` (the middle layer's risk weights by kind and
-sector). The daily process writes its own files under `<out-dir>/<date>/` and never changes its inputs.
+to confirm, always added to the fund's table; L05, L06, L13 and L14 name the conditions left to counsel) and
+`nbfc_risk_weights.csv` (the middle layer's risk weights by kind and sector: a bank's CD 0%, a public financial
+institution's CD 100%, a public sector bank's bonds 20%). The daily process writes its own files under `<out-dir>/<date>/` and never changes its inputs.
 
 ## Corporate bond and FRB terms: `cr-strat corp-price`, `frb-price` and the commands that use them
 

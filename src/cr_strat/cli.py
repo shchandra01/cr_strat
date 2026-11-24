@@ -1990,7 +1990,7 @@ def _var_backtest(args: argparse.Namespace) -> int:
     """The VaR history against the next day's P&L: exceptions, Kupiec, Christoffersen, traffic light."""
     from cr_strat import risk as risk_layer
     try:
-        for flag in ("var_history", "nav", "attribution"):
+        for flag in ("var_history", "nav", "attribution", "strategy_books"):
             value = getattr(args, flag)
             if value and not Path(value).exists():
                 raise FileNotFoundError(f"--{flag.replace('_', '-')}: {value} not found")
@@ -1999,7 +1999,9 @@ def _var_backtest(args: argparse.Namespace) -> int:
         detail, summary = risk_layer.backtest(
             _read_csv_text(args.var_history), _read_csv_text(args.nav),
             _read_csv_text(args.attribution) if args.attribution else None, alpha=args.alpha, window=args.window,
-            method=args.method, calendar=calendar, end=_date_arg(args.end, "--end") if args.end else None)
+            method=args.method, calendar=calendar, end=_date_arg(args.end, "--end") if args.end else None,
+            strategy_books=_read_csv_text(args.strategy_books) if args.strategy_books else None,
+            time_effects=args.time_effects)
         out = Path(args.out_dir)
         out.mkdir(parents=True, exist_ok=True)
         detail.to_csv(out / "backtest.csv", index=False, date_format="%Y-%m-%d")
@@ -2066,7 +2068,7 @@ def _limits(args: argparse.Namespace) -> int:
         for flag in ("risk_dir", "engine_dir"):
             if not Path(getattr(args, flag)).is_dir():
                 raise FileNotFoundError(f"--{flag.replace('_', '-')}: {getattr(args, flag)} is not a directory")
-        for flag in ("strategy_books", "trades"):
+        for flag in ("strategy_books", "trades", "counterparties"):
             value = getattr(args, flag, None)
             if value and not Path(value).exists():
                 raise FileNotFoundError(f"--{flag.replace('_', '-')}: {value} not found")
@@ -2088,7 +2090,8 @@ def _limits(args: argparse.Namespace) -> int:
             market=market, settings=return_engine.EngineSettings(access=access, project_calendar=args.project_calendar),
             risk=risk_layer.RiskSettings(min_obs_hard=args.min_obs_hard, min_obs=max(args.min_obs_hard, 250)),
             as_of=as_of, terms=_read_csv_text(args.trades) if args.trades else None,
-            strategy_books=_read_csv_text(args.strategy_books) if args.strategy_books else None)
+            strategy_books=_read_csv_text(args.strategy_books) if args.strategy_books else None,
+            counterparties=_read_csv_text(args.counterparties) if args.counterparties else None)
         metrics = limits_layer.limit_metrics(Path(args.risk_dir), Path(args.engine_dir), ctx, limits=table, day=day,
                                              board_resolution_date=args.board_resolution_date)
         checks = limits_layer.check_limits(metrics, table, as_of=as_of, legal_form=access)
@@ -2125,7 +2128,7 @@ def _pre_trade(args: argparse.Namespace) -> int:
         if not Path(args.engine_dir).is_dir():
             raise FileNotFoundError(f"--engine-dir: {args.engine_dir} is not a directory")
         for flag in ("orders", "queued", "trades", "swaps", "issuers", "strategy_books", "factor_history", "adv",
-                     "seniority", "scenarios", "costs"):
+                     "seniority", "scenarios", "costs", "counterparties"):
             value = getattr(args, flag, None)
             if value and not Path(value).exists():
                 raise FileNotFoundError(f"--{flag.replace('_', '-')}: {value} not found")
@@ -2153,7 +2156,8 @@ def _pre_trade(args: argparse.Namespace) -> int:
             strategy_books=_read_csv_text(args.strategy_books) if args.strategy_books else None,
             factor_history=_read_csv_text(args.factor_history) if args.factor_history else None,
             adv=_read_csv_text(args.adv) if args.adv else None,
-            seniority=_read_csv_text(args.seniority) if args.seniority else None, nss_table=market.curves or None)
+            seniority=_read_csv_text(args.seniority) if args.seniority else None, nss_table=market.curves or None,
+            counterparties=_read_csv_text(args.counterparties) if args.counterparties else None)
         from cr_strat import stress as stress_layer
         scenarios = stress_layer.read_scenarios(as_of=as_of, extend=args.scenarios)
         proposed = limits_layer.read_orders(args.orders)
@@ -2888,6 +2892,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--alpha", type=float, default=0.99)
     p.add_argument("--window", type=int, default=250)
     p.add_argument("--end", help="the last P&L date counted, YYYY-MM-DD")
+    p.add_argument("--strategy-books", help="book to strategy map (book, strategy, effective_from): a strategy's P&L "
+                                            "is its books' (as cr-strat risk --strategy-books)")
+    p.add_argument("--time-effects", choices=("exclude", "include"), default="exclude",
+                   help="the hypothetical P&L's time lines (accrual, pull to par, roll-down, OIS carry): left out "
+                        "(default, as the VaR moves market factors only) or kept")
     p.add_argument("--project-calendar", action="store_true")
     p.add_argument("--out-dir", required=True)
     p.set_defaults(func=_var_backtest)
@@ -2914,6 +2923,8 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--benchmark-fixings", help="their benchmark fixings")
         p.add_argument("--frb-terms", help="GoI FRB terms CSV (default: the shipped table)")
         p.add_argument("--strategy-books", help="book to strategy map (book, strategy, effective_from)")
+        p.add_argument("--counterparties", help="each swap's counterparty (limits.COUNTERPARTY_COLUMNS: trade_id, "
+                                                "counterparty, counterparty_type ccp|bank|government|other)")
         p.add_argument("--board-resolution-date", help="the board resolution of the financial year (L03), YYYY-MM-DD")
         p.add_argument("--min-obs-hard", type=int, default=60, help="fewer observations: no parametric VaR (60)")
         p.add_argument("--project-calendar", action="store_true",

@@ -108,7 +108,10 @@ yield DV01 that differs from the engine's is flagged `dv01_differs` (the positio
   flows are differentiated analytically (`t x PV x 1e-4`); swaps by central differences of +-0.5 bp of the zero rates,
   and also by +-0.5 bp of each OIS par quote with the curve rebuilt (`ois_par`).
 - **Yield and curve DV01**: the yield DV01 is the engine's, on the bond's own compounding; the curve DV01 is on
-  continuous zero rates, so it is larger by about `1 + y/f` (3.9% for a semi-annual G-sec at 7.7%). Both are reported.
+  continuous zero rates. On a flat curve the curve DV01 is larger by about `1 + y/f` (3.9% for a semi-annual G-sec at
+  7.7%); on a sloped curve the ratio depends on the slope: on the tests' NSS curve it is 1.0325 for 6.94% GS 2036,
+  1.0195 for 7.09% GS 2054 and 1.0345 for 6.36% GS 2031 (the specification's T1-T3). Both are reported; a hedge sized
+  on one does not offset the other exactly.
 - **CS01**: the z-spread to the reference curve moved +-0.5 bp, for corporate bonds, CP and CDs, mapped to the
   factor `corp:<rating bucket>:<tenor bucket>` (CDs `cd:<tenor bucket>`); an SDL on the G-sec curve has an
   `sdl_spread:<tenor bucket>` sensitivity instead (`sdl_mode own_curve` puts it on an SDL curve). Callable bonds are
@@ -145,7 +148,10 @@ For each scope and method:
 
 The window is the latest 250 dates (`--window`) on which every factor of the scope with at least 60 observations
 (`--min-obs-hard`) has a change; a factor with fewer is left out and the figure is `incomplete` (coverage below one)
-unless the proxy table maps it to a factor with history (`proxied`). With fewer than 60 observations the figure is
+unless the proxy table maps it to a factor with history (`proxied`). A factor whose last change is more than
+`max_gap_days` business days before the book's day (a series that stopped, or a hole at its end) is left out the same
+way (`stale_factor:<factor>`, proxied if the table maps it) rather than dragging the window back in time; a window
+that still ends before the book's day is flagged `stale_window` and `incomplete`. With fewer than 60 observations the figure is
 refused, with the count; below 250 (`--min-obs`) it is flagged `short_history`. VaR at level `a` is the
 `ceil(n(1 - a))`-th largest loss (`--quantile-rule`; `floor_plus_one` and `interpolate` also offered) and ES the mean
 of the worst `m = n(1 - a)` losses, a fractional last one counted in part (the tail size held as an exact fraction).
@@ -154,24 +160,35 @@ instead); the parametric method always scales by the square root of time.
 
 **Stressed ES** (`--stressed`): the window of `window` observations, searched over the whole history, in which the
 book's 10-day ES on the reduced set of factors (those whose history starts within 30 days of the earliest) is
-largest; the stressed ES is the full set's current ES scaled by the ratio of the reduced set's stressed to current ES,
-the ratio floored at one (Basel's MAR33.6 rule). **Liquidity horizons** (`--liquidity-horizons`): the 10-day ES
-cascaded over the horizons of each factor class (G-sec, SDL and OIS rates 10 days, FRB margins 20, CD and corporate
-spreads 40, below-investment-grade 60) as MAR33.4 does. **Components**: each figure split by position, book, strategy
+largest (ties to the earliest start, compared on exact window sums); the stressed ES is the reduced set's ES in that
+stressed window, scaled by the ratio of the full set's current ES to the reduced set's current ES, the ratio floored at
+one (Basel's MAR33.6 rule: `ES_R,S x max(1, ES_F,C / ES_R,C)`). **Liquidity horizons** (`--liquidity-horizons`): the
+10-day ES cascaded over the horizons of each factor class as MAR33.4 does, the horizons of MAR33.12 Table 2 as read
+for INR: G-sec and OIS key rates and the T-bill factor 10 days (domestic interest rates); SDL spreads, a G-sec's
+residual and FRB margins 20 (sovereign investment-grade credit spreads); CD and corporate spreads 40 (investment
+grade), 60 below (UNVERIFIED mapping, listed in the notes). **Components**: each figure split by position, book, strategy
 and factor class (Euler: parametric exactly; historical ES by the tail scenarios' weights exactly; historical VaR by a
 band of five scenarios around the VaR's, rescaled).
 
 ### Back-tests
 
 The one-day VaR of business day `d` against the P&L of `d + 1`: the actual P&L is the engine's `nav.csv` `pnl`, the
-hypothetical one the attribution's market lines on positions held from the previous close (accrual, pull to par,
-roll-down, curve factors, rich/cheap, convexity, OIS carry; trades, costs, funding and the benchmark left out). An
-exception is a P&L strictly below minus the VaR; a missing VaR or P&L counts as one. Actual and hypothetical
+hypothetical one the attribution's market lines on positions held from the previous close (curve factors, rich/cheap,
+convexity; trades, costs, funding and the benchmark left out). Time effects (accrual, pull to par, roll-down, OIS carry
+and roll-down) are left out of the hypothetical P&L by default, as the VaR has none (MAR32.27 and MAR10.32 ask the two
+to treat them alike; `time_effects="include"`, or `cr-strat var-backtest --time-effects include`, keeps them); the
+notes count both readings. A book with an actual P&L but no market line on a day the attribution covers held nothing
+from the previous close: its hypothetical P&L is 0, not missing. A strategy's P&L is the sum of its books' (the
+`strategy_books` map, as mapped on the VaR's day; `--strategy-books`), so a strategy is back-tested like a book; a
+scope with no P&L at all is reported as not back-tested, never as exceptions. An exception is a P&L strictly below
+minus the VaR; a missing VaR or P&L counts as one. Actual and hypothetical
 exceptions are counted apart and the larger count used. Over the last 250 pairs: Kupiec's proportion-of-failures test
 (chi-squared, one degree), Christoffersen's independence and conditional-coverage tests, and the Basel traffic light:
 green while the cumulative binomial probability of the count is below 95%, amber below 99.99%, red above (green 0-4
 exceptions at 250 observations, amber 5-9 with multipliers 1.70 to 1.92, red from 10); with fewer than six
-observations no exception is always green (the probability of none is already above 95% there).
+observations no exception is always green (the probability of none is already above 95% there). At 99%, MAR32.19's
+desk rule (more than 12 exceptions at 99%, or 30 at 97.5%, in the last 250 pairs) is counted in the summary's notes:
+reported, not enforced.
 
 ### Stress scenarios
 
@@ -192,46 +209,63 @@ The IRRBB shapes are BCBS's: `short = size e^(-t/4)`, `long = size (1 - e^(-t/4)
 `-0.65 |short| + 0.9 |long|` and the flattener `+0.8 |short| - 0.6 |long|`, on the INR sizes (parallel 400 bp, short
 500, long 300). Key-rate points of one scenario are joined by the triangles and held flat beyond the ends. A shock
 never takes a zero rate below `floor_pct` (0%). A `selector` (`key=value` pairs joined by `;`, alternatives by `|`:
-`rating_bucket=AA+|AA`, `sector=financials`, `kind`, `tenor_bucket`, `frtb_sector`, `seniority`, `issuer`, `book`,
-`isin`) narrows a row. Your table (`--scenarios`) replaces shipped scenarios with the same id and adds the rest
+`rating_bucket=AA+|AA`, `frtb_sector=financials`, `sector`, `kind`, `tenor_bucket`, `seniority`, `issuer`, `book`,
+`isin`) narrows a row. `frtb_sector` is FRTB's bucket: the issuer table's `frtb_sector` column, else its `sector` when
+that is one of FRTB's names, a fund's own name read as one (`bank`, `psu_bank`, `nbfc`, `hfc`, `pfi`, `insurance`:
+financials, UNVERIFIED), else `other`; so a public sector bank keeps `sector=psu_bank` for the NBFC risk weight and
+is a financial for the stress. The shipped financials rows select `frtb_sector=financials`. Your table (`--scenarios`) replaces shipped scenarios with the same id and adds the rest
 (`--no-default-scenarios`: yours only). A row with an unknown component, shape, family or selector key is refused
 naming the closest known one.
 
 Each scenario is **revalued in full**: bonds on their curve seen from their settlement, `P' = sum CF_i D(t_i)
 e^(-shift(t_i) t_i) e^(-(z + dz) t_i)`; a bond without its curve at its yield moved by the shift at its Macaulay
-duration (`yield_proxy`); an FRB with its projected coupons and discount rate moved by the shift at its next reset;
-swaps through `ois.ois_npv` on the shifted OIS curve. Funding P&L is the extra interest of a repo-rate shock on each
+duration (`yield_proxy`); an FRB with its projected coupons and discount rate moved by the shift at its next reset
+(a `yield_parallel` shock, a bond's own yield moved, moves an FRB's index, its margin moving only under `frb_dm`);
+swaps through `ois.ois_npv` on the shifted OIS curve. A rating migration read through the ladder (no peer matrix) gives
+no step between grades the ladder prices alike (AA+ and AA; A+, A and A-): such rows are flagged `ladder_no_step`
+(give a peer matrix: `--spread-matrix`, or `spread_matrix` in the daily configuration). Funding P&L is the extra interest of a repo-rate shock on each
 long's share of the night's borrowing (`positions.funded`, `horizon_days` nights); liquidity P&L the exit cost at the
 scenario's half spreads. Under a preset that cannot borrow (`unregulated_company`), funding rows are
 `not_applicable`, with a NaN P&L and the reason, never a zero.
 
-Shipped scenarios (37, every row with its source and status):
+Shipped scenarios (38, every row with its source and status):
 
 | Family | Scenarios | Status |
 |---|---|---|
 | `rates_irrbb` | `IRRBB_INR_PARALLEL_UP`, `_PARALLEL_DOWN`, `_STEEPENER`, `_FLATTENER`, `_SHORT_UP`, `_SHORT_DOWN` (BCBS's six, available from 30 Apr 2016) | V |
-| `rates` | `RATES_PAR_UP_100`, `RATES_PAR_DOWN_100`, `RATES_PAR_UP_50`, `YIELD_UP_100`, `GSEC_OIS_BASIS_25`, `MPC_SURPRISE_25`, `MPC_SURPRISE_50`, `SDL_SPREAD_UP_25` | U examples |
+| `rates` | `RATES_PAR_UP_100`, `RATES_PAR_DOWN_100`, `RATES_PAR_UP_50`, `YIELD_UP_100`, `AUCTION_TAIL_10Y` (S4: the 10-year point +10 bp, 7 and 15 years unchanged), `GSEC_OIS_BASIS_25`, `MPC_SURPRISE_25`, `MPC_SURPRISE_50`, `SDL_SPREAD_UP_25` | U examples |
 | `credit` | `CS_RATING_LADDER` (AAA 50 bp, AA+ and AA 100, AA- 150, A 200, BBB 300, below 500), `_HALF`, `CS_FINANCIALS_X2`, `DOWNGRADE_1_NOTCH`, `DOWNGRADE_2_NOTCH_FORCED` | U examples |
-| `credit` | `FRTB_CSR` (FRTB's credit spread risk weights by sector and grade, read as spread shocks; from 31 Jan 2019) | V |
+| `credit` | `FRTB_CSR` (FRTB's credit spread risk weights by bucket and grade, read as spread shocks, every bucket of MAR21.53 Table 4 including sovereign 50/200 bp and local government 100/400 bp; from 31 Jan 2019) | V |
 | `frb` | `FRB_INDEX_IRRBB` (V), `FRB_INDEX_JUL2013` (P), `FRB_DM_25`, `FRB_DM_50` (U) | V, P, U |
 | `funding` | `REPO_UP_200_10D`, `HAIRCUT_UP_2PP`, `HAIRCUT_X2`, `TREPS_CAP_EARLIER`, `NO_MARKET_REPO` | U examples |
 | `liquidity` | `BIDASK_X3`, `BIDASK_CORP_X5`, `ADV_HALF` | U examples |
-| `historical` | `H2013_JUL_TIGHTENING`, `H2013_TAPER`, `H2018_SELLOFF_ILFS`, `H2020_COVID_CREDIT`, `H2022_HIKES` (typed-in moves, each available only from its episode's end) | P, V, coarse |
+| `historical` | `H2013_JUL_TIGHTENING`, `H2013_TAPER`, `H2018_SELLOFF_ILFS`, `H2020_COVID_CREDIT`, `H2022_HIKES` (typed-in moves, each available only from its episode's end; H2022's 0.25-year point is the repo rate's +90 bp used as a proxy for the short end: U) | P, V, U, coarse |
 
 The historical episodes are moves typed in from secondary sources (press reports through search summaries, BIS's
 policy-rate series) and the free auction table's same-security cut-off changes (coarse); they are not a history of
-fitted curves. AMFI's stress parameters for debt funds were not found.
+fitted curves. AMFI's stress parameters for debt funds were not found. S3's rich/cheap shocks are not shipped: write
+them through `--scenarios` as a `yield_parallel` row with `isin=` (one bond's own yield) or a `gsec_curve` key-rate
+row at its tenor; S4's auction-day supply shock has the U example `AUCTION_TAIL_10Y`, to be replaced by the fund's own
+sizes.
 
 ### Liquidity
 
-Days to liquidate `|face| / (participation x ADV)`, 20% of a day's volume; ADV from the marks' `volume_cr` over the
-last 20 business days (days without a traded mark count as zero volume), else your ADV table (`--adv`, its latest row
+Days to liquidate `|net face| / (participation x ADV)`, 20% of a day's volume, with positions **netted by ISIN**
+first: a sale still to settle reduces the holding it sells, and one ISIN held in two books of a scope is one position
+sharing one ADV (a book's row shows its own net position's days; a scope's figures net across its books). ADV from
+the marks' `volume_cr` over the last 20 business days the marks cover (from the file's first traded mark or the bond's
+issue date; a covered day without a traded mark counts as zero volume), flagged `short_adv_window:<n>d` below 20;
+with fewer than 5 covered days your ADV table or a proxy is used first. Else your ADV table (`--adv`, its latest row
 public by `as_of`), else a proxy by kind and CCIL class (corporate bonds a share of the issue's outstanding by
-rating), flagged `proxy_adv`; none at all gives `inf` days (`no_adv`). The exit cost is `|face| / 100 x half spread x
-DV01` with the half spread of the cost table's fill rule (`costs.cost_rule`), stressed three times. A position is
-illiquid when it is a G-sec of CCIL's illiquid class or none, an SDL, a corporate bond below AA- or more than 20
-days to liquidate. **Funding liquidity**: for a preset that cannot borrow, the settlement cover of purchases still to
-settle; for one that borrows, the night's borrowing against its limit, the haircut equity, the funding stresses and the
+rating), flagged `proxy_adv`; none at all gives `inf` days (`no_adv`). The shares of NAV saleable within 1, 5 and 20
+days count the scope's net cash (the NAV rows' cash less borrowing, plus money lent and receivables, less purchases
+still to settle and plus sales still to settle) at day 0, so an all-cash book is 100% liquid. The exit cost is `|net
+face| / 100 x half spread x DV01` with the half spread of the cost table's fill rule (`costs.cost_rule`), stressed
+three times. A position is illiquid when it is a G-sec of CCIL's illiquid class or none, an SDL, a corporate bond
+(kind `corporate`) rated below AA- or unrated, or more than 20 days to liquidate; CP and CD are not illiquid by
+rating. **Funding liquidity**: for a preset that cannot borrow, the settlement cover of purchases still to settle;
+under either preset the share of NAV in cash, T-bills, CMBs and CP (`liquid_asset_share`, R4.4); for one that
+borrows, the night's borrowing against its limit, the haircut equity, the funding stresses and the
 three structural liquidity ratios of RBI's ALM Directions for NBFCs (cumulative mismatches at most 10%, 10% and 20% of
 cumulative outflows in 1-7, 8-14 and 15-30 days), securities slotted by their days to liquidate.
 
@@ -258,10 +292,12 @@ log: the next day's `--breach-log`). Exit 0 written, 1 no NAV on the date, 2 bad
 first line printed is the EXAMPLE warning.
 
 **The table** (`LIMIT_COLUMNS`; the format is in [data/README.md](../data/README.md), Limits, orders and allocation
-tables). One row per limit: `limit_id` (unique across the tables used together), `metric` (one of the 33 below),
+tables). One row per limit: `limit_id` (unique across the tables used together), `metric` (one of the 34 below),
 `scope_type` (`fund`, `book` or `strategy`) and `scope` (a name, or `*` for each scope of the type), `selector`
 (`key=value` pairs joined by `;`, alternatives by `|`, `*` to check each value separately, as in
-`sector=*;kind=corporate|cp`; besides each metric's own keys, `abs=yes` compares absolute values and `min_assets_cr`
+`sector=*;kind=corporate|cp`; selector values are checked against the risk tables' own (key tenors such as `10y`,
+the curves, rating buckets, kinds, tenor buckets; sectors read in lower case and ISINs in upper case), so a value that
+would match nothing is refused naming the line, never read as 0; besides each metric's own keys, `abs=yes` compares absolute values and `min_assets_cr`
 and `max_assets_cr` make a row apply only from, or below, a size of total assets in crore), `unit`, `direction` (`max`
 or `min`), `warning_level` and `hard_level` (a blank warning is the hard level), `legal_form` (`any` or a preset),
 `effective_from`, `effective_to`, `approved_by`, `approval_date`, `approval_ref`, `cure_business_days`, `action`
@@ -277,17 +313,29 @@ is `any` or the run's preset, so a limit approved later never applies to an earl
 | Family | Metrics |
 |---|---|
 | Market | `dv01` (Rs per bp or years of NAV, by tenor `bucket`), `krd` (by `curve` and `tenor`), `cs01` (by rating, issuer, group, sector, tenor bucket, kind), `var` and `es` (the risk run's; the gate's parametric), `stress_loss` (a scenario, or the worst of a family), `leverage` (gross bonds or repo over NAV) |
-| Concentration | `exposure` (% of NAV or Rs, by issuer, group, sector, rating, kind or ISIN), `isin_share` (face over the outstanding stock), `rating_floor` (the worst notch held, or the share of NAV below a grade; `of=purchases` reads each credit purchase), `max_tenor`, `jtd` |
-| Liquidity | `liquid_share` (NAV saleable within `days`), `illiquid_share`, `days_to_liquidate` |
+| Concentration | `exposure` (% of NAV or Rs, by issuer, group, sector, rating, kind or ISIN), `isin_share` (face over the outstanding stock), `rating_floor` (the worst notch held, or the share of NAV below a grade; `of=purchases` reads each credit purchase; `exclude_strategy=S9` leaves a strategy's positions to its own row, the way to give S9's forced-selling purchases their own floor), `max_tenor`, `jtd`, `counterparty_exposure` (an OIS counterparty's credit equivalent, % of NAV or Rs, by `counterparty` or `type`) |
+| Liquidity | `liquid_share` (NAV saleable within `days`, the scope's net cash at day 0), `illiquid_share`, `days_to_liquidate` (positions netted by ISIN: orders of one ISIN add up) |
 | Performance | `drawdown` (the NAV index below its peak), `loss_window` (P&L over `days` business days over NAV at the start) |
 | Legal form | `borrowing`, `total_assets`, `outside_liabilities`, `nof`, `crar`, `tier1`, `single_party`, `single_group`, `alm_mismatch`, `short_face`, `when_issued`, `ois_hedge_ratio`, `ois_hedge_effect`, `settlement_cover`, `corporate_repo`, `board_resolution` |
 
 Exposures, CS01 and JTD by issuer, group and sector count corporate bonds, CP and CD (GoI and state bonds exempt). A
 purchase still to settle counts at its market value (the trade-date view) and its payable as an outside liability;
-owned fund, Tier 1 and capital are taken as NAV (the accountant's mapping); all UNVERIFIED.
+owned fund, Tier 1 and capital are taken as NAV (the accountant's mapping); all UNVERIFIED. A credit position whose
+CS01 is not known (no curve) makes `cs01` incomplete rather than leaving it out; its CS01 is taken as its yield DV01
+(`cs01_from_yield`, flagged) where it has a yield. **OIS counterparty exposure** (`counterparty_exposure`, and in the
+NBFC's `crar`): the current exposure method of the NBFC Capital Adequacy Directions as read from the saved copy (para
+18(3)(ii), 18(7)(v) and 18(8)): per counterparty the gross positive MTM of its swaps (no netting) plus an add-on of
+the notional by residual maturity (up to a year 0.5%, up to five years 1%, beyond 3%); a CCP's exposure is zero;
+weighted 0% for the Central or State Government, 20% for banks, 100% for others. The counterparties are your table
+(`--counterparties`, `[inputs] counterparties`: `trade_id`, `counterparty`, `counterparty_type` of `ccp`, `bank`,
+`government`, `other`); a swap without a row, which includes a new order in the gate, is `unknown` at 100%
+(flagged). Not built: bilateral netting (it needs the netting agreement the directions describe) and the counterparty
+in the single-party and group exposure metrics.
 
-**The checks.** Utilisation is `value / hard` for a maximum and, for a minimum, `hard / value` with a positive level
-or `value / hard` with a negative one (a drawdown), so that 1 is the boundary either way (UNVERIFIED). Status:
+**The checks.** Utilisation is `value / hard` for a maximum above zero and `hard / value` below zero; for a minimum
+`hard / value` with a positive level and `value / hard` with a negative one (a drawdown); infinite once the value has
+crossed zero the wrong way (a negative value against a positive minimum, a positive one against a negative maximum),
+so that 1 is the boundary and more than 1 a breach either way (UNVERIFIED). Status:
 `breach` past the hard level, `warning` past the warning level, `ok`, `incomplete` when the metric's inputs are
 missing (a warning, never a breach: UNVERIFIED), and `not_applicable` for the other legal form's rows (listed, never
 measured, so that the checks show which rules depend on the form) and for the fund's own borrowing limits under a
@@ -295,7 +343,9 @@ preset that cannot borrow. Every row of an `EXAMPLE` limit says `EXAMPLE` in its
 
 **The breach log.** A breach opens an episode (`new`, its cure date `cure_business_days` business days on); still in
 breach the next day it is `continuing`, past its cure date (at once for a legal-form rule) `escalated`, and back
-within the level `cured` (kept in the log). `origin` is `active` when the breach first appears on a day an order in
+within the level `cured` (kept in the log). A day the metric is `incomplete` (inputs missing) or `not_applicable`
+neither cures nor restarts an open episode: it is carried, and its cure date and escalation stand. `origin` is
+`active` when the breach first appears on a day an order in
 its scope filled, `passive` when the market moved. The example cure periods (UNVERIFIED): 30 business days for
 concentration, ratings and tenor, 5 for market risk and liquidity, 1 for drawdown and stop-loss, 0 for legal-form
 rules.
@@ -311,8 +361,11 @@ says to replace it with the fund's approved risk policy before any real use, and
 (L01-L24) is this project's reading of RBI's directions for each legal form, for counsel to confirm: every row says
 `counsel=yes` and gives its paragraph and the claim ids of the verified research notes; it is always added to the
 fund's table. `nbfc_risk_weights.csv` holds the middle layer's risk weights (Central Government securities and SDLs
-0, corporate bonds, CP and CD 100%, bonds of public sector banks 20% when the issuer table gives the sector
-`psu_bank`).
+0; CDs of banks 0%, item (1) of para 18(1), "certificates of deposits with banks"; CDs of a public financial
+institution (issuer sector `pfi`) 100%, item (2)(c); corporate bonds and CP 100%; bonds of public sector banks 20%
+when the issuer table gives the sector `psu_bank`); the CRAR's detail names the CDs taken as banks'. The levels of
+`limits_example.csv` are examples, never the fund's policy; the legal-form rows are this project's reading for
+counsel.
 
 **What depends on the legal form.** The fund's legal form is unsettled and a question for counsel. Everything runs
 under either preset; these rules change with it:
@@ -321,8 +374,8 @@ under either preset; these rules change with it:
 |---|---|---|
 | Borrowing (repo, TREPS) | none: L01 and the gate's cash rule (V) | allowed; below Rs 1,000 crore of assets, outside liabilities at most 7 times owned fund (L10, V) |
 | Short sales | none (L04, V) | none for a non-PD NBFC (L18, V) |
-| OIS | hedging only: the engine's DV01 test (L05, V) and the swaps must not raise the VaR or the sum of absolute key rates (L06: the definition V, this reading U) | any purpose; OIS views of a base-layer NBFC (L19, DRAFT, P: warns) |
-| Size | assets below Rs 1,000 crore for the exemption (L02, V) | net owned fund at least Rs 10 crore (L09, V); from Rs 1,000 crore of assets CRAR 15%, Tier 1 10%, single party 25% and single group 40% (L11-L14, V) |
+| OIS | hedging only: the engine's DV01 test (L05, V) and the swaps must not raise the risk (L06, APPROVED and enforced, the reading U: the larger of the VaR ratio and the ratio of absolute key rates with the swaps' key rates beyond the OIS curve's last node netted into it; with too little history for a VaR the key-rate ratio alone binds). A resident with a net worth of at least Rs 500 crore (or turnover of Rs 1,000 crore) is a non-retail user that may use OIS for any purpose (Rupee IRD Directions para 5.2(ii)): not applied, a question for counsel | any purpose; OIS views of a base-layer NBFC (L19, DRAFT, P: warns) |
+| Size | assets below Rs 1,000 crore for the exemption (L02, V) | net owned fund at least Rs 10 crore (L09, V); from Rs 1,000 crore of assets CRAR 15% (OIS counted by the current exposure method), Tier 1 10%, single party 25% and single group 40% (L11-L14, V). The Concentration Directions (para 16) exempt an NBFC not accessing public funds and not issuing guarantees from the exposure norms: L13-L14 are applied anyway (conservative), a question for counsel |
 | ALM | not applicable (nothing borrowed) | from Rs 100 crore of assets, negative mismatches at most 10%, 10% and 20% in 1-7, 8-14 and 15-30 days (L15-L17, V) |
 | Settlement payables | leverage at most 1 and purchases covered by cash (L07-L08, DRAFT: warn) | counted as outside liabilities (U) |
 | Corporate bond repo | none | base layer (L20, DRAFT, P: warns) |
@@ -372,7 +425,9 @@ cr-strat pre-trade --orders data/raw/orders_20261215.csv --engine-dir data/out/r
 ```
 
 writes `gate.csv`, `approved_trades.csv` and `approved_swaps.csv` (the next business day's trades, prices blank) and
-prints each decision; exit 0, or 2 on bad input or EXAMPLE limits without the flag.
+prints each decision; exit 0, 1 when the engine directory has no NAV on `--date` (a holiday, a mistyped date or a day
+not yet run: nothing to decide against, nothing written), or 2 on bad input or EXAMPLE limits without the flag.
+`--counterparties` gives the swaps' counterparties (the OIS exposure and the NBFC's CRAR).
 
 **Back-tests through the gate.** `returns.run_backtest(limits.GatedStrategy(strategy, gate,
 recorder=limits.risk_recorder(ctx)), ...)` runs a strategy through the same gate each evening: a refused order never
@@ -393,7 +448,9 @@ cr-strat allocate --nav data/out/returns/nav.csv --strategy-books data/raw/strat
 ```
 
 - **Returns and covariance**: each strategy's daily return from the engine's NAV by book, `(NAV - NAV_prev - flow) /
-  (NAV_prev + flow)`, books mapped to strategies as dated in `strategy_books`; EWMA (lambda 0.94) or sample
+  (NAV_prev + flow)`, books mapped to strategies as dated in `strategy_books`; a book with no row on a day after a
+  row (a gap, or the end of its history) gives its strategy no return that day and the next (NaN, dropped pairwise),
+  never a -100% day; EWMA (lambda 0.94) or sample
   covariance, pairwise over the days both strategies had capital, refused below 20 joint observations, shrunk towards
   its diagonal in steps of 0.05 until positive definite (UNVERIFIED).
 - **Methods** (`ALLOCATION_COLUMNS`): `fixed` (a dated table of weights), `inverse_vol`, `erc_vol` (equal risk
@@ -408,16 +465,19 @@ cr-strat allocate --nav data/out/returns/nav.csv --strategy-books data/raw/strat
   `stop_loss_scale` as above.
 - **Sizing**: `size_to_dv01` and `size_to_cs01` (`face = target / (sensitivity per 100 / 100)`), `size_to_vol`
   (capped at 2 times), `round_to_lot` (down to Rs 5 crore, a parameter).
-- **Hedges**: `hedge_ois_notional` (the DV01 over the swap's annuity, the rule of `asset_swaps.hedge_notional`),
-  `hedge_gsec_face`, and `key_rate_hedge` by least squares or, with each hedge in its allowed direction, non-negative
+- **Hedges**: `hedge_ois_notional`, by default the notional whose DV01 as the engine measures it (`ois.ois_npv`,
+  the zero rates up 1 bp; the measure of the hedge test L05, the gate and the risk tables) equals the DV01 given
+  (`method="annuity"`: the DV01 over the swap's annuity, the rule of `asset_swaps.hedge_notional`, which offsets a 1
+  bp move of the swap's par rate), `hedge_gsec_face`, and `key_rate_hedge` by least squares or, with each hedge in its allowed direction, non-negative
   least squares (Lawson and Hanson's active-set method, written in numpy).
 - **Correlation and contributions**: `correlation_table`; Euler components of parametric VaR, of historical ES (the
   Acerbi-Tasche tail weights, summing to the ES exactly) and of historical VaR (a band of 5 scenarios around the
   VaR's, rescaled to sum to it: UNVERIFIED).
 
-An annuity-sized OIS hedge can fail the engine's 105% DV01 test when the swap is short: in the tests a 1-year payer
-sized by its annuity against 6.94% GS 2036 carries 1.0593 times the bond's DV01 as the engine measures it (a 4-year
-one 1.0251). Size the swap by the engine's DV01 when the hedge must pass that test.
+An annuity-sized OIS hedge can fail the engine's 105% DV01 test: in the tests a 1-year payer sized by its annuity
+against Rs 100 crore of 6.94% GS 2036 carries 1.058 times the bond's yield DV01 as the engine measures it (3 months
+1.014, 4 years 1.028); the default sizing gives 1.0000 at every tenor (`tests/test_portfolio_review.py`). Give the
+DV01 on the measure to be neutralised: a bond's yield DV01 is not its curve DV01 (above).
 
 ## The daily process
 
@@ -456,20 +516,27 @@ nss_params = "nss_params.csv"       # with public_from
 flows = "flows.csv"                 # the capital
 trades = "trades.csv"               # the paper book: each day's approved_trades.csv appended
 corporate_terms = "corporate_terms.csv"
+# strategy_books = "strategy_books.csv"   # books to strategies: the strategy back-test sums its books' P&L
+# spread_matrix = "matrix.csv"            # peer spreads by rating for the migration scenarios (else the ladder)
+# counterparties = "counterparties.csv"   # each swap's counterparty for the OIS exposure and the NBFC's CRAR
 
 [risk]
 min_obs_hard = 60
+# residual = "in_fit"                     # S3's resid: factors (needs [inputs] residual_history)
+# sdl_mode, quantile_rule, gap_rule, max_gap_days, participation, stress_multiplier: as cr-strat risk's options
 
 [gate]
 cash_buffer_pct = 1.0
 ```
 
 `report.md` carries `(EXAMPLE limits)` in its first line while any EXAMPLE row is in force, then the date, `as_of`,
-the preset and the limits in force by policy status, then escalated and new breaches, NAV and P&L (the day, the month
-and the financial year to date, the attribution by line), DV01 and key rates, credit (CS01 by rating, the five
-largest issuers, groups and sectors with JTD), VaR and ES with coverage, the stress table worst first, liquidity and
-funding liquidity (or why it does not apply), every limit's status, the next day's orders with each refusal's
-reasons, the back-test, the reconciliation, data quality and the UNVERIFIED rules used.
+the preset and the limits in force by policy status, then escalated and new breaches and, below them, the breaches
+still open from an earlier day (continuing), NAV and P&L (the day, the month and the financial year to date, the
+attribution by line), DV01 and key rates, credit (CS01 by rating, the five largest issuers, groups and sectors with
+JTD; the OIS counterparty exposure when the fund has swaps), VaR and ES with coverage and what the VaR leaves out, the
+stress table worst first, liquidity and funding liquidity (for a preset that cannot borrow, each book's settlement
+cover and share of NAV in cash, T-bills and CP), every limit's status, the next day's orders with each refusal's
+reasons, the back-test by scope type and scope, the reconciliation, data quality and the UNVERIFIED rules used.
 
 **The daily routine of paper trading:**
 
@@ -477,7 +544,7 @@ reasons, the back-test, the reconciliation, data quality and the UNVERIFIED rule
    public, add them to the input files with their `public_from`.
 2. Write the strategy's proposed orders for the next business day (`ORDER_COLUMNS`) and run `cr-strat daily-report`
    for the day.
-3. Read `report.md`: escalated and new breaches first; then the reconciliation, where any row means an input of an
+3. Read `report.md`: escalated, new and continuing breaches first; then the reconciliation, where any row means an input of an
    earlier day changed (a revised mark or fit) and is to be understood before going on; then the refused orders and
    their reasons.
 4. Append the day's `orders/approved_trades.csv` (and `approved_swaps.csv`) to the paper book's trades (and swaps)
@@ -522,10 +589,16 @@ UNVERIFIED (a choice with no source: listed in every run's `notes.txt`, settable
 | JTD | Basel LGDs (MAR22: V), senior by default, GoI and SDLs excluded, no netting | V / U |
 | Quantile | `ceil(n(1-a))`-th largest loss; ES with the tail counted exactly (Acerbi-Tasche) | U / P |
 | History | gaps of 2-5 business days scaled by `1/sqrt(g)`; nearest in-range node for a tenor outside a fit; at least 60 observations | U |
-| Window | latest dates with every factor of at least 60 observations; the rest uncovered | U |
+| Window | latest dates with every factor of at least 60 observations whose last change is within `max_gap_days` of the day; the rest uncovered (or proxied) | U |
 | EWMA | lambda 0.94, 550 observations (RiskMetrics: V), weights normalised (U); sample covariance with ddof 1 | V / U |
 | Stressed window | searched by the sensitivity method on the factors starting within 30 days of the earliest | U |
-| Liquidity | 20% participation, 20-day ADV, example proxies, stressed spreads 3 times, LVaR = VaR + stressed cost | U |
+| Liquidity | 20% participation; the ADV over the last 20 business days the marks cover (fewer than 5: the table or a proxy first); positions netted by ISIN, the scope's net cash at day 0; example proxies, stressed spreads 3 times, LVaR = VaR + stressed cost | U |
+| Liquidity horizons | MAR33.12 Table 2 as read for INR: key rates and T-bills 10 days; SDL spreads, G-sec residuals, FRB margins 20 (sovereign IG credit spread); corporate and CD spreads 40 (IG), 60 below | U (the mapping) |
+| National to FRTB grades and buckets | national AAA to BBB- read as investment grade; a fund's sector names (`bank`, `psu_bank`, `nbfc`, `hfc`, `pfi`, `insurance`) read as FRTB's financials | U |
+| Ratings | the worse of the ISIN's and its issuer's latest long-term ratings; a short-term grade read as the worst long-term grade paired with it (A1+ as A+); an issuer from the issuer table's `isin_prefix`, else its bonds' ISIN prefix | U |
+| Back-test P&L | the hypothetical P&L without time effects (MAR32.27); a flat book's hypothetical P&L 0; MAR32.19's desk rule counted, not enforced | U / V |
+| OIS counterparty risk | the current exposure method of the saved NBFC capital directions (add-ons 0.5%, 1%, 3%; CCP zero; weights 0/20/100%); no netting; a swap without a counterparty at 100% | P (read from the saved directions) / U |
+| OIS hedge sizing | the engine's DV01 (`method="engine"`), the annuity rule as an option | U |
 | Scenario sizes | every row marked U in the table: examples for the fund's policy to replace | U |
 | IRRBB shapes and INR sizes, decay 4 years, rotations | BCBS IRRBB, April 2016, Annex 2 | V |
 | Floor of shocked zero rates | 0% | U (national discretion) |
@@ -549,8 +622,10 @@ UNVERIFIED (a choice with no source: listed in every run's `notes.txt`, settable
 - **OIS quotes and MIBOR fixings** (FBIL's, licensed) for the swaps and the OIS key rates.
 - **Spread histories** for `corp:`, `cd:`, `sdl_spread:` and `frb_dm:` factors (agency valuations or the price panel,
   under their terms), else the credit VaR is incomplete or proxied.
-- The **issuer table** (group, sector, seniority), **rating actions** with public times, the **ADV table** or marks
-  with volumes, the **haircut** and CCIL class tables, the **NAV** and funding of the engine run.
+- The **issuer table** (group, sector, seniority, and where needed `isin_prefix` and `frtb_sector`), **rating
+  actions** with public times, the **ADV table** or marks with volumes, the **haircut** and CCIL class tables, the
+  **NAV** and funding of the engine run, and each swap's **counterparty** (for the OIS counterparty exposure and the
+  NBFC's CRAR).
 - The fund's own **scenario policy** in place of the U examples, and its decisions on the U conventions above.
 - For the limits and the gate: the fund's **approved limit table** in place of every EXAMPLE row, counsel's reading
   of the legal form and of each DRAFT row, the **board resolution** date, the **strategy-book map**, budgets and
@@ -594,6 +669,18 @@ writing the same bytes as the daily process on its own directories under both pr
 commands write the same bytes as at commit 80f9e8b (7 runs, 63 files, by sha256), and a pass-all gate around that
 commit's back-test, with and without a risk recorder, writes its 9 files byte for byte.
 
+Checked after the review of the risk layer (tests `test_risk_review.py`, `test_limits_review.py`,
+`test_stress_review.py`, `test_portfolio_review.py`, `test_daily_review.py`, `test_counterparty_review.py`, each
+failing on the code before the fixes): a stale factor left out of the window instead of dragging it back; ratings
+from short-term grades and issuer rows; one issuer for a company's CP, CD and NCDs; components keyed per position;
+strategy back-tests on their books' P&L; flat books; the stressed window's ties; callable flags; the 20-day sovereign
+spread horizons; the gate's cache across orders; breach episodes carried through incomplete days; selector values;
+CS01 without a curve; utilisation's signs; bank CDs at 0%; the hedge-only rule with short history; liquidity netted by
+ISIN with cash at day 0; the ADV window; FRTB's buckets for a fund's sector names and for sovereign and local
+government issuers; an FRB under a yield shock; OIS hedges sized on the engine's DV01 (ratio 1.0000); strategy
+returns without -100% days; the daily configuration's risk keys; the report's open breaches; the OIS counterparty
+exposure.
+
 Not checked: any real book, curve history, spread history or OIS quote; a stressed window on a real stress period;
 the revaluation's speed on a large real book (the demo's six positions with 300 days of history take about 2.3 s
 for every table, 3.6 s with the stressed and liquidity-horizon ES; 300 days for a swap book 0.4 s); FRTB's risk weights against a later revision; RBI's IRRBB guidelines for banks (not read);
@@ -602,10 +689,22 @@ attribution; any fund's real limit policy, and the legal-form rows against couns
 large book (about 0.6 s for 7 orders on the test book); the de-risking and allocation parameters against any real
 strategy history (none exists yet).
 
-**Not built**: an option model for callable bonds; reverse stress tests; intraday margin; the mandate-threshold forced
-selling of S9 beyond a notch downgrade with a multiplier; netting of JTD; a VaR of the OIS basis to the G-sec curve
-beyond the two curves' own key rates; for the limits layer, see [The daily process](#the-daily-process) (official
-records, intraday checks, an approval workflow).
+**Not built**: an option model for callable bonds (they are valued to maturity and flagged `callable_to_maturity`,
+`callable_in_the_money` when a call is in the money, so their CS01 and key rates overstate the duration then);
+reverse stress tests; intraday margin; the mandate-threshold forced selling of S9 beyond a notch downgrade with a
+multiplier (S9's purchases can be given their own rating floor with `exclude_strategy`); netting of JTD; a VaR of the
+OIS basis to the G-sec curve beyond the two curves' own key rates; for OIS counterparty risk, bilateral netting, a
+potential future exposure beyond the directions' add-ons, and the counterparty in the single-party and group limits;
+the non-retail OIS user (net worth of Rs 500 crore) and the exposure-norm exemption of an NBFC without public funds,
+both left to counsel (the conservative reading is applied); S3's rich/cheap shocks as shipped scenarios (write them
+through `--scenarios`); for the limits layer, see [The daily process](#the-daily-process) (official records,
+intraday checks, an approval workflow).
+
+**What the VaR leaves out** (every run's notes and the daily report say so): carry and funding (the VaR moves market
+factors only); default (JTD is reported apart); exit costs (the liquidity-adjusted VaR adds the stressed exit cost);
+the option value of callable bonds; and bond-specific basis: a G-sec's or SDL's rich/cheap to its curve unless the
+`resid:` factors are on (`--residual`, `[risk] residual`; flagged `no_residual_factor`), and an issuer's spread beyond
+its rating and tenor bucket.
 
 ## Sources
 

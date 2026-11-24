@@ -226,3 +226,14 @@ def test_an_auction_tail_example_is_shipped_for_s4():
     tail = by["AUCTION_TAIL_10Y"]
     assert {(r.tenor_years, r.size_bp) for r in tail} == {(7.0, 0.0), (10.0, 10.0), (15.0, 0.0)}
     assert all(r.status == "U" and r.component == "gsec_curve" for r in tail)
+
+
+def test_without_a_nav_table_the_cash_is_the_books_nav_less_its_holdings():
+    # a back-test's snapshot: the book's NAV is known, the NAV table's cash column is not
+    ctx = fx.gsec_context(fx.D13, adv=ADV_TABLE)
+    book = rk.risk_book(pd.DataFrame([_gs2054(2e9)]), ctx, day=fx.D13)
+    value = book.positions[0].market_value
+    nav = value + 1e9
+    book = replace(book, nav={("fund", "fund"): nav, ("book", "b"): nav, ("strategy", "b"): nav})
+    fund = st.liquidity(book, ctx)[1].iloc[0]
+    assert fund["share_1d"] == pytest.approx((1e9 + value / 100) / nav)  # Rs 100 crore of cash at day 0

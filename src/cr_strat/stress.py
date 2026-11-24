@@ -34,21 +34,22 @@ interaction (total less the sum alone), per position, book, strategy and fund (`
 borrowing (``positions.funded``); liquidity P&L the exit cost at the scenario's half spreads. Under a preset that
 cannot borrow (``unregulated_company``) funding scenarios are ``not_applicable``, with the reason, never zero.
 
-**Liquidity** (R4). Days to liquidate ``|F| / (participation x ADV)`` (20% of the day's volume, U), ADV from the
-marks' ``volume_cr`` over the last 20 business days (days without a traded mark count as zero volume: U, the
+**Liquidity** (R4). Days to liquidate ``|F| / (participation x ADV)`` (20% of the day's volume, U), ADV from the marks'
+``volume_cr`` over the last 20 business days (a day the marks cover without a traded mark counts as zero volume: U, the
 conservative reading), else the user's ADV table, else proxies (``ADV_PROXIES``, U examples to be replaced); the exit
 cost ``|F| / 100 x h x DV01`` with ``h`` the half spread of ``costs.cost_rule`` (the engine's fill rule), stressed
 ``STRESS_SPREAD_MULTIPLIER`` (3, U) times; shares of NAV saleable in 1, 5 and 20 business days, the longest and the
 value-weighted days, the illiquid share (CCIL class illiquid or none, SDLs, corporate bonds (kind ``corporate``) below
-AA- or unrated, more than 20 days; CP and CD are not illiquid by rating: U) and the liquidity-adjusted VaR (VaR plus
-the stressed cost, U). Positions are netted by ISIN before their days are counted (a sale to settle reduces the
-holding it sells; one ISIN in two books of a scope is one position), and a scope's net cash counts as saleable at day
-0. The ADV from the marks is averaged over the days they cover (from the file's first traded mark or the bond's issue
-date), flagged ``short_adv_window`` below 20; below 5 days the ADV table or a proxy is used where one applies. **Funding liquidity** (R4.4): for an unregistered
-company, the settlement cover of purchases still to settle; for an NBFC, the night's borrowing against its limit, the
-haircut equity, the funding stresses and the structural liquidity ratios of RBI's ALM Directions (cumulative negative
-mismatches at most 10%, 10% and 20% of cumulative outflows in 1-7, 8-14 and 15-30 days: verified notes NR:S18-S20;
-securities slotted by their days to liquidate, U).
+AA- or unrated, more than 20 days; CP and CD are not illiquid by rating: U) and the liquidity-adjusted VaR (VaR plus the
+stressed cost, U). Positions are netted by ISIN before their days are counted (a sale to settle reduces the holding it
+sells; one ISIN in two books of a scope is one position), and a scope's net cash counts as saleable at day 0. The ADV
+from the marks is averaged over the days they cover (from the file's first traded mark or the bond's issue date),
+flagged ``short_adv_window`` below 20; below 5 days the ADV table or a proxy is used where one applies. **Funding
+liquidity** (R4.4): for an unregistered company, the settlement cover of purchases still to settle and the share of NAV
+in cash, T-bills, CMBs and CP (``liquid_asset_share``, both presets); for an NBFC, the night's borrowing against its
+limit, the haircut equity, the funding stresses and the structural liquidity ratios of RBI's ALM Directions (cumulative
+negative mismatches at most 10%, 10% and 20% of cumulative outflows in 1-7, 8-14 and 15-30 days: verified notes
+NR:S18-S20; securities slotted by their days to liquidate, U).
 
 **Limits.** Tested on synthetic books and the specification's vectors only; the scenario sizes marked U are examples
 to be replaced by the fund's own policy, AMFI's stress parameters were not found (search summaries only), RBI's IRRBB
@@ -136,7 +137,8 @@ LIQUIDITY_SUMMARY_COLUMNS = ("date", "as_of", "scope_type", "scope", "share_1d",
 FUNDING_LIQUIDITY_COLUMNS = ("date", "as_of", "book", "legal_form", "applicable", "borrowed", "limit", "headroom",
                              "haircut_equity", "margin", "idle_cash", "pending_purchases", "settlement_cover",
                              "scenario_id", "extra_interest", "extra_equity", "treps_lost", "shortfall", "alm_1_7d",
-                             "alm_8_14d", "alm_15_30d", "notes")
+                             "alm_8_14d", "alm_15_30d", "notes", "liquid_assets", "liquid_asset_share")
+LIQUID_ASSET_KINDS = ("tbill", "cmb", "cp")  # R4.4: cash, T-bills (and CMBs) and CP, as a share of the book's NAV
 _YEAR = 365.0
 
 
@@ -897,7 +899,8 @@ def _finite(value) -> bool:
 def _book_cash(ctx: rk.RiskContext, book: rk.RiskBook) -> dict[str, float]:
     """Each book's net cash on a trade-date view: the NAV row's cash less borrowing plus money lent and receivables,
     less the purchases still to settle and plus the sales still to settle (their market value), so that a pending
-    trade moves money between cash and the bond it is (NaN without the book's NAV row)."""
+    trade moves money between cash and the bond it is. Without a NAV table (a back-test's snapshot) the book's NAV
+    less the value of its positions and swaps, the same trade-date cash; NaN when neither is known."""
     rows: dict[str, Mapping] = {}
     if ctx.nav is not None:
         frame = rk._frame(ctx.nav, "the NAV table")
@@ -908,7 +911,10 @@ def _book_cash(ctx: rk.RiskContext, book: rk.RiskBook) -> dict[str, float]:
     for name in sorted({p.book for p in book.items} | set(rows) - {"fund"}):
         rec = rows.get(name)
         if rec is None:
-            out[name] = math.nan
+            nav = book.nav.get(("book", name), math.nan) if ctx.nav is None else math.nan
+            held = rk._fsum([*(p.market_value for p in book.positions if p.book == name),
+                             *(s.value for s in book.swaps if s.book == name)])
+            out[name] = nav - held if math.isfinite(nav) else math.nan
             continue
         net = rk._fsum(rk._num(rec.get(k), k, blank=0.0) * s for k, s in (("cash", 1), ("repo_borrowed", -1),
                                                                           ("lent", 1), ("receivables", 1)))
@@ -1028,7 +1034,9 @@ def funding_liquidity(funding, positions, book: rk.RiskBook, ctx: rk.RiskContext
     in 1-7, 8-14 and 15-30 days; overnight repo an outflow on day 1, purchases on their settlement, cash on day 1,
     securities in the bucket of their days to liquidate: U slotting) and one row per funding scenario (extra interest
     ``borrowed x dr x H / 365``, extra equity ``dh x value``, TREPS money lost under CCIL's earlier caps, the shortfall
-    when market repo is off)."""
+    when market repo is off). Under either preset every row carries the book's liquid assets (R4.4: the NAV row's cash
+    on a trade-date view, less the trades still to settle at their value, plus the T-bills, CMBs and CP it holds or has
+    bought) and their share of its NAV."""
     d = book.date
     access = ctx.settings.access
     borrows = access.repo or access.treps
@@ -1049,8 +1057,15 @@ def funding_liquidity(funding, positions, book: rk.RiskBook, ctx: rk.RiskContext
         pending_buys = rk._fsum(p.units * p.dirty for p in mine if p.state == "pending" and p.face > 0)
         cash = rk._num(navs.get(name, {}).get("cash"), f"the cash of {name}", blank=math.nan)
         cover = cash / pending_buys if pending_buys > 0 and math.isfinite(cash) else math.nan
+        # R4.4: cash on a trade-date view (less what the trades to settle pay, plus what they receive) plus the
+        # T-bills, CMBs and CP held or bought, over the book's NAV
+        pending = rk._fsum(p.market_value for p in mine if p.state == "pending")
+        liquid = cash - pending + rk._fsum(p.market_value for p in mine if p.kind in LIQUID_ASSET_KINDS) \
+            if math.isfinite(cash) else math.nan
+        book_nav = rk._num(navs.get(name, {}).get("nav"), f"the NAV of {name}", blank=math.nan)
         base = {"date": d, "as_of": rk._iso(book.as_of), "book": name, "legal_form": access.name,
-                "pending_purchases": pending_buys, "settlement_cover": cover}
+                "pending_purchases": pending_buys, "settlement_cover": cover, "liquid_assets": liquid,
+                "liquid_asset_share": liquid / book_nav if math.isfinite(liquid) and book_nav > 0 else math.nan}
         if not borrows:
             rows.append({**base, "applicable": False, "borrowed": 0.0, "limit": math.nan, "headroom": math.nan,
                          "haircut_equity": math.nan, "margin": math.nan, "idle_cash": cash, "scenario_id": "",

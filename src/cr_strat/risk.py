@@ -437,8 +437,9 @@ class RiskContext:
     (``PROXY_COLUMNS``), ``adv`` (``stress.ADV_COLUMNS``), ``seniority`` (``SENIORITY_COLUMNS``), ``nss_table``
     (``returns.read_nss_params``' output, the curve history; default the market data's curves), ``nav`` (the engine's
     ``NAV_COLUMNS`` rows: NAV by book for the percentages), ``funding`` (the engine's ``FUNDING_COLUMNS`` rows, for the
-    funding liquidity of a preset that borrows) and ``spread_matrix`` (``credit_spreads.read_spread_matrix``: peer
-    spreads by rating, for the migration scenarios)."""
+    funding liquidity of a preset that borrows), ``spread_matrix`` (``credit_spreads.read_spread_matrix``: peer
+    spreads by rating, for the migration scenarios) and ``counterparties`` (``limits.COUNTERPARTY_COLUMNS``: each
+    swap's counterparty and its type, for the OIS counterparty exposure and the NBFC's CRAR)."""
 
     market: rt.MarketData
     settings: rt.EngineSettings
@@ -456,6 +457,7 @@ class RiskContext:
     nav: pd.DataFrame | None = None
     funding: pd.DataFrame | None = None
     spread_matrix: pd.DataFrame | None = None
+    counterparties: pd.DataFrame | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.market, rt.MarketData):
@@ -3298,8 +3300,9 @@ UNVERIFIED_RULES = (
     "EWMA lambda 0.94 over up to 550 observations, the weights normalised; the sample covariance with ddof 1",
     "the stressed window searched by the sensitivity method on the factors whose history starts within 30 days of "
     "the earliest",
-    "liquidity: 20% participation, ADV of 20 business days of the marks' volumes, else the user's table, else "
-    "example proxies; stressed spreads 3 times; LVaR = VaR + stressed cost",
+    "liquidity: 20% participation, the ADV of the marks' volumes over the last 20 business days they cover (fewer "
+    "than 5: the user's table or a proxy first), else the user's table, else example proxies; positions netted by "
+    "ISIN and a scope's net cash saleable at day 0; stressed spreads 3 times; LVaR = VaR + stressed cost",
     "every scenario size marked U in stress_scenarios.csv (examples to be replaced by the fund's policy)",
     "a shocked zero rate floored at 0% (floor_pct: the standard leaves the floor to national discretion)",
     "liquidity horizons (MAR33.12 Table 2) by factor class: INR key rates and the T-bill factor 10 days; SDL spreads, "
