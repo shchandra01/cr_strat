@@ -1,12 +1,85 @@
 """Risk measurement: sensitivities, factor histories, value at risk and expected shortfall, and their back-tests.
 
-(Module docstring completed below, once every part is written.)
+**The book** (R1 of the risk specification of 24 Nov 2026). The return engine's positions (``positions.csv`` of
+``cr-strat returns``, ``returns.POSITION_COLUMNS``; or a ``returns.Snapshot`` through ``book_from_snapshot``) of one
+day, read as of a time ``as_of``: each bond as it was known then (``returns.instruments_as_known``: terms, announced
+FRB coupons, ratings and curves public by ``as_of``), priced for the row's settlement at the row's yield, a purchase
+still to settle as the bond it will be; each OIS swap (the run's swap trades) valued on the day's OIS curve public by
+``as_of``, rolled to the day as the engine rolls it. A row whose terms cannot be had or whose bond cannot be priced
+as known then refuses the run, naming the row; a bond without its curve is measured at its yield (``no_curve``); a
+curve older than the day is used and flagged ``stale_curve``.
+
+**Sensitivities** (R1.1-R1.7), in rupees lost per bp rise (positive for a long bond): the yield DV01 (the engine's
+``dv01``, recomputed and flagged ``dv01_differs`` when it is not); the curve DV01 and key-rate DV01s on the zero rates
+of the position's reference curve seen from its settlement (the fitted G-sec NSS curve, the attribution's reference
+map for other kinds, the OIS curve for swaps), with triangle weights between ``KEY_TENORS`` held flat beyond the end
+nodes so that the key rates sum to the parallel curve DV01: analytic for fixed flows, central differences of +-0.5 bp
+for swaps, and also by OIS par quote for swaps (``swap_par_krd``, central; one-sided ``up`` on request); the CS01 on
+the z-spread to the reference curve (``asset_swaps.z_spread``; corporate bonds, CP and CDs), with spread factors
+``corp:<rating bucket>:<tenor bucket>``, ``cd:<tenor bucket>`` and, for SDLs on the G-sec curve, ``sdl_spread:<tenor
+bucket>``; a GoI FRB's index DV01 (``floating.index_dv01``) placed on the G-sec key rates at its next reset (or on the
+``tbill182`` factor when its history is given) and its margin DV01 (``floating.spread_dv01``) on ``frb_dm:<isin>``;
+the convexity at the yield and on the curve (rupees per bp squared); the jump to default ``max(LGD x N + (MV - N), 0)``
+with Basel's LGDs (MAR22: 75% senior, 100% subordinated (AT1 and tier 2), 25% covered; senior when nothing says
+otherwise), for corporate bonds, CP and CDs (SDLs with ``jtd_states``; GoI securities never), without netting. A bond
+without its curve has its yield DV01 placed at its Macaulay duration (``yield_proxy``). Tables: by position
+(``POSITION_RISK_COLUMNS``), every sensitivity (``SENSITIVITY_COLUMNS``), key rates by scope (fund, book, strategy;
+``KEY_RATE_COLUMNS``), CS01 by issuer, group, sector, rating bucket, tenor bucket and rating by tenor
+(``CREDIT_COLUMNS``), JTD by issuer and group (``JTD_COLUMNS``) and every number summed by kind, tenor bucket, issuer,
+group, sector and rating bucket (``SUMMARY_COLUMNS``), each also in years of NAV and percent of NAV where the NAV is
+known.
+
+**Factor histories** (R2.1). Daily changes (bp) of each factor from levels public by ``as_of``: key rates of the
+history of NSS fits (each fit counted from its ``public_from``, else 18:00 on its date, flagged ``default_time``; a
+tenor outside a fit's range takes the nearest in-range key rate's change, flagged), OIS zero rates at the OIS key
+tenors (no fill), and the user's factor table (``FACTOR_HISTORY_COLUMNS``: ``corp:``, ``cd:``, ``sdl_spread:``,
+``frb_dm:``, ``tbill182``, ``resid:`` levels with public times). A change over a gap of 2 to ``max_gap_days`` business
+days is kept scaled by ``1/sqrt(g)`` (``gap_rule``), a longer gap breaks the series. ``factor_changes.csv`` writes them
+(``FACTOR_CHANGE_COLUMNS``).
+
+**VaR and ES** (R2.2-R2.7). Per scope (fund, each book, each strategy) and method: ``hs_sensitivity`` (historical
+simulation, P&L the sensitivities times each day's factor changes, with half the convexity on request), ``hs_full``
+(each scenario revalued in full on the shifted curves and spreads) and ``parametric`` (normal, the sensitivities on an
+EWMA covariance, lambda 0.94 over at most 550 observations with normalised weights, or the sample covariance). A
+scope's factors with at least ``min_obs_hard`` changes are used and the window is the latest ``window`` dates on which
+all of them have one; the others are left out (``coverage`` below one: ``incomplete``) unless the proxy table maps them
+to a factor with history. Fewer than ``min_obs_hard`` observations: refused, with the count; fewer than ``min_obs``:
+flagged ``short_history``. VaR at ``a`` is the ``ceil(n(1 - a))``-th largest loss (``quantile_rule``) and ES the
+Acerbi-Tasche tail mean with the tail ``m = n(1 - a)`` counted exactly (``Fraction``); both are reported at 99% and
+97.5%. The 10-day figures sum overlapping runs of 10 changes (``horizon_rule``; the parametric method scales by the
+square root of time). With ``windows`` including ``stressed``, the stressed ES (MAR33.6) searches the history for the
+window of ``window`` observations with the largest ES on the reduced set of factors that have the longest history
+(those starting within 30 days of the earliest) and scales it by the current full-to-reduced ratio, floored at one;
+``liquidity_horizons`` adds the MAR33.4 cascade of the 10-day ES over the liquidity horizons of each factor class
+(``LIQUIDITY_HORIZONS``). Euler components split each VaR and ES by position and by factor (``VAR_COMPONENT_COLUMNS``).
+
+**Back-tests** (R2.8). The one-day VaR of business day ``d`` against the P&L of ``d + 1``: actual (the engine's
+``nav.csv`` ``pnl``) and hypothetical (``hypothetical_pnl``: the market lines of the attribution on positions held from
+the previous close), counted apart and the larger count used; an exception when the P&L is strictly below minus the
+VaR; a missing VaR or P&L counts as an exception. Kupiec's proportion-of-failures test, Christoffersen's independence
+and conditional-coverage tests (chi-squared tails from ``math.erfc``) and the Basel traffic light (zones from the
+cumulative binomial probability, 95% and 99.99%; MAR32's multipliers at exactly 250 observations).
+``append_var_history`` keeps the daily VaR history the back-test reads (``VAR_HISTORY_COLUMNS``).
+
+**Sources** (cited in our own words; nothing copied): the Basel Framework's market risk standard
+(https://www.bis.org/committees/bcbs/basel-framework/MAR/standard.pdf): MAR21 key tenors, MAR22 LGDs, MAR32
+back-testing and multipliers, MAR33 ES, liquidity horizons and the stressed window, MAR99 the zones for other sample
+sizes; J.P. Morgan/Reuters, RiskMetrics Technical Document, 4th ed. (1996), sec. 5.3, for lambda 0.94 and 550
+observations; Kupiec (J. Derivatives, 1995) and Christoffersen (International Economic Review, 1998) for the tests;
+Acerbi and Tasche (J. Banking & Finance, 2002) for the ES of a finite sample. The conventions marked UNVERIFIED in the constants above and in ``UNVERIFIED_RULES`` (listed
+in every run's ``notes.txt``) are choices for the fund to confirm or change, all settable in ``RiskSettings``.
+
+**Limits.** Tested on synthetic books and the specification's vectors only: no history of real fitted curves or
+spreads has been run through it (the free demo uses the auction table's coarse cut-off yields). Callable bonds are
+valued to maturity (no option model); FRB index risk is first-order at the next reset; the hypothetical P&L reads the
+engine's attribution, whose lines are themselves approximations; the stressed window needs a history covering a stress
+period, which none of the shipped data is. Library code never reads the clock: the same inputs give the same bytes.
 """
 
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timedelta
 from fractions import Fraction
@@ -26,7 +99,7 @@ from cr_strat.corporates import CorporateBond, public_time
 from cr_strat.floating import GoiFloatingRateBond, index_dv01, next_reset, price_from_dm, spread_dv01
 from cr_strat.issuance import tenor_bucket
 from cr_strat.ois import OisCurve, OisSwap, as_time, ois_npv, ois_schedule
-from cr_strat.rating_scale import LT_NOTCH, parse_rating, rating_bucket
+from cr_strat.rating_scale import parse_rating, rating_bucket
 
 # ---------------------------------------------------------------- conventions (each UNVERIFIED unless said)
 
@@ -1984,7 +2057,8 @@ def normal_var_es(sigma: float, alpha_var: float, alpha_es: float, horizon_days:
 @dataclass(frozen=True, eq=False)
 class _Plan:
     """A scope's VaR inputs: the history columns it uses (``factors``, ``cols``), each item's sensitivities on them
-    (``S``, items x factors, rupees per bp, after proxies), the dates with every used factor (``rows``), and coverage."""
+    (``S``, items x factors, rupees per bp, after proxies), the dates with every used factor (``rows``), and
+    coverage."""
 
     items: tuple
     factors: tuple[str, ...]
@@ -2610,7 +2684,7 @@ def var_table(book: RiskBook, history: FactorHistory, settings: RiskSettings | N
                 "flags": _flags(r.flags)}
         rows.append({**base, "alpha_var": r.alpha_var, "var": r.var, "var_pct_nav": _pct(r.var, nav),
                      "alpha_es": r.alpha_es, "es": r.es, "es_pct_nav": _pct(r.es, nav)})
-        if r.alpha_var != r.alpha_es and r.horizon_rule != "liquidity_horizons":
+        if r.alpha_var != r.alpha_es and r.horizon_rule != "liquidity_horizons" and r.status != "refused":
             rows.append({**base, "alpha_var": r.alpha_es, "var": r.var_at_alpha_es,
                          "var_pct_nav": _pct(r.var_at_alpha_es, nav), "alpha_es": r.alpha_var,
                          "es": r.es_at_alpha_var, "es_pct_nav": _pct(r.es_at_alpha_var, nav)})
@@ -2754,7 +2828,8 @@ def christoffersen(indicators: Sequence[int]) -> dict:
 
 
 def binomial_cdf(x: int, T: int, p: float) -> float:
-    """``P(X <= x)`` for ``X ~ Binomial(T, p)``, summed in logs (``math.lgamma``) so that long samples do not overflow."""
+    """``P(X <= x)`` for ``X ~ Binomial(T, p)``, summed in logs (``math.lgamma``) so that long samples do not
+    overflow."""
     if x < 0:
         return 0.0
     if x >= T:
@@ -2766,10 +2841,11 @@ def binomial_cdf(x: int, T: int, p: float) -> float:
 
 def traffic_light(x: int, T: int = 250, p: float = 0.01) -> tuple[str, float, float]:
     """The Basel zone of ``x`` exceptions in ``T`` observations (MAR32.9 Table 1 at 250; MAR99.17 for other sizes):
-    green while ``P(X <= x) < 95%``, amber while below 99.99%, red else; the MAR32 multiplier at exactly 250
-    observations and 1% (NaN otherwise); and the cumulative probability."""
+    green while ``P(X <= x) < 95%``, amber while below 99.99%, red else, and green for no exception at all (below six
+    observations ``P(X <= 0)`` is already above 95%: no exception cannot count against the model); the MAR32
+    multiplier at exactly 250 observations and 1% (NaN otherwise); and the cumulative probability."""
     c = binomial_cdf(x, T, p)
-    zone = "green" if c < GREEN_LIMIT else ("amber" if c < AMBER_LIMIT else "red")
+    zone = "green" if x == 0 or c < GREEN_LIMIT else ("amber" if c < AMBER_LIMIT else "red")
     multiplier = math.nan
     if T == 250 and abs(p - 0.01) < 1e-12:
         multiplier = MAR32_MULTIPLIERS.get(x, MAR32_RED_MULTIPLIER)
@@ -2806,8 +2882,9 @@ def hypothetical_pnl(attribution) -> pd.DataFrame:
 
 def append_var_history(table, var_rows: pd.DataFrame) -> pd.DataFrame:
     """The VaR history (``VAR_HISTORY_COLUMNS``; a frame, a CSV path that may not exist yet, or None) with the day's
-    ``VAR_COLUMNS`` rows of the current window at the levels the back-test reads (VaR at ``alpha_var``) replacing any
-    rows of the same date, sorted by date, scope, method and horizon."""
+    ``VAR_COLUMNS`` rows of the current window (both levels: VaR at ``var_alpha`` and at ``es_alpha``, which the
+    back-test picks by its ``alpha``) replacing any rows of the same date, sorted by date, scope, method, horizon and
+    level."""
     if table is None or (not isinstance(table, pd.DataFrame) and not Path(table).exists()):
         old = pd.DataFrame(columns=list(VAR_HISTORY_COLUMNS))
     else:
@@ -2906,3 +2983,150 @@ def backtest(var_history, nav, attribution=None, *, alpha: float = VAR_ALPHA, wi
                         "christoffersen_p": ch["p_ind"], "lr_cc": lr_cc, "lr_cc_p": chi2_sf(lr_cc, 2),
                         "cumulative_probability": cum, "zone": zone, "multiplier": mult, "notes": "; ".join(notes)})
     return detail, pd.DataFrame(summary, columns=list(BACKTEST_SUMMARY_COLUMNS))
+
+
+# ---------------------------------------------------------------- one call: every table of a day's risk
+
+
+RESULT_FILES = ("position_risk", "sensitivities", "key_rates", "credit", "jtd", "risk_summary", "var",
+                "var_components", "stress", "stress_positions", "stress_worst", "liquidity", "liquidity_summary",
+                "funding_liquidity")
+UNVERIFIED_RULES = (
+    "key tenors 0.25-50 years (FRTB's 0.25-30 plus 40 and 50); OIS key tenors to the curve's last node",
+    "zero-rate bumps of the fitted curves, analytic for fixed flows, central +-0.5 bp otherwise",
+    "SDLs on the G-sec curve plus an sdl_spread factor (sdl_mode spread)",
+    "CS01 on the z-spread to the reference curve; callable bonds valued to maturity (no option model)",
+    "FRB index risk placed on the G-sec key rates at the next reset; margin risk on frb_dm:<isin>",
+    "JTD with Basel LGDs, senior by default; GoI, SDLs and T-bills excluded; no netting",
+    "VaR ceil(n(1-a))-th largest loss with m exact; ES the Acerbi-Tasche tail mean",
+    "gaps of 2-5 business days scaled by 1/sqrt(g), longer gaps break a series; a tenor outside a fit's range "
+    "takes the nearest in-range change; 60 observations the least for a VaR",
+    "the window: the latest dates on which every factor of the scope with at least min_obs_hard observations has "
+    "a change (fewer: left out, coverage below one)",
+    "EWMA lambda 0.94 over up to 550 observations, the weights normalised; the sample covariance with ddof 1",
+    "the stressed window searched by the sensitivity method on the factors whose history starts within 30 days of "
+    "the earliest",
+    "liquidity: 20% participation, ADV of 20 business days of the marks' volumes, else the user's table, else "
+    "example proxies; stressed spreads 3 times; LVaR = VaR + stressed cost",
+    "every scenario size marked U in stress_scenarios.csv (examples to be replaced by the fund's policy)",
+)
+
+
+@dataclass(frozen=True, eq=False)
+class RiskResult:
+    """A day's risk: the book, the factor history it used and every table (``RESULT_FILES``), with notes."""
+
+    book: RiskBook
+    history: FactorHistory
+    position_risk: pd.DataFrame
+    sensitivities: pd.DataFrame
+    key_rates: pd.DataFrame
+    credit: pd.DataFrame
+    jtd: pd.DataFrame
+    risk_summary: pd.DataFrame
+    var: pd.DataFrame
+    var_components: pd.DataFrame
+    stress: pd.DataFrame
+    stress_positions: pd.DataFrame
+    stress_worst: pd.DataFrame
+    liquidity: pd.DataFrame
+    liquidity_summary: pd.DataFrame
+    funding_liquidity: pd.DataFrame
+    var_results: tuple[VarResult, ...] = ()
+    notes: tuple[str, ...] = ()
+
+
+def _preferred_var(results: Sequence[VarResult], settings: RiskSettings) -> dict[tuple[str, str], float]:
+    """The one-day current VaR of each scope for the liquidity-adjusted VaR: full revaluation, else the sensitivity
+    method, else the parametric one, whichever was computed."""
+    out: dict[tuple[str, str], float] = {}
+    for method in ("hs_full", "hs_sensitivity", "parametric"):
+        for r in results:
+            key = (r.scope_type, r.scope)
+            if key in out or r.method != method or r.window != "current" or r.horizon_days != 1 or \
+                    r.horizon_rule == "liquidity_horizons" or not math.isfinite(r.var):
+                continue
+            out[key] = r.var
+    return out
+
+
+def _notes(book: RiskBook, history: FactorHistory, results: Sequence[VarResult], ctx: RiskContext) -> list[str]:
+    notes = [f"risk of {book.date} as of {book.as_of:%Y-%m-%d %H:%M} under the access preset {book.access!r} "
+             "(the fund's legal form is a question for counsel)", *book.notes, *history.notes]
+    flags: dict[str, int] = {}
+    for item in book.items:
+        for f in item.flags:
+            flags[f] = flags.get(f, 0) + 1
+    for f, n in sorted(flags.items()):
+        notes.append(f"{n} position(s) flagged {f}")
+    statuses: dict[str, int] = {}
+    for r in results:
+        statuses[r.status] = statuses.get(r.status, 0) + 1
+    for s, n in sorted(statuses.items()):
+        if s != "ok":
+            notes.append(f"{n} VaR figure(s) {s}")
+    if any("coarse" in r.flags for r in results):
+        notes.append("some VaR figures stand on a history flagged coarse (labelled in their flags): plumbing, not a "
+                     "measure of risk")
+    if not history.dates:
+        notes.append("no factor history public by as_of: no VaR could be computed (risk needs a daily history of "
+                     "fitted curves, licensed)")
+    if not (ctx.settings.access.repo or ctx.settings.access.treps):
+        notes.append(f"funding stress and ALM: not_applicable under {ctx.settings.access.name} (it does not borrow)")
+    notes.extend(f"UNVERIFIED: {rule}" for rule in UNVERIFIED_RULES)
+    return notes
+
+
+def run_risk(positions, ctx: RiskContext, *, day=None, scenarios=None, history: FactorHistory | None = None,
+             participation: float | None = None, stress_multiplier: float | None = None) -> RiskResult:
+    """Everything of R1-R4 for one day's positions in one call: the book (``risk_book``), the factor history as of
+    ``ctx.as_of`` (``factor_history``, unless given), the sensitivity tables, every VaR and ES asked, their Euler
+    components, the stress scenarios (``scenarios``: ``stress.ScenarioRow`` objects, a table, or None for the shipped
+    ones available and effective by ``as_of``), liquidity and funding liquidity."""
+    from cr_strat import stress as st
+    book = risk_book(positions, ctx, day=day)
+    hist = history if history is not None else factor_history(ctx, book)
+    results = tuple(var_results(book, hist, proxies=ctx.proxies))
+    if scenarios is None:
+        rows = st.read_scenarios(as_of=ctx.as_of)
+    elif isinstance(scenarios, (list, tuple)) and all(isinstance(r, st.ScenarioRow) for r in scenarios):
+        day_ = ctx.as_of.date()
+        rows = [r for r in scenarios if (r.available_from is None or r.available_from <= day_)
+                and (r.effective_from is None or r.effective_from <= day_)]
+    else:
+        rows = st.read_scenarios(scenarios, as_of=ctx.as_of)
+    part = st.PARTICIPATION if participation is None else participation
+    mult = st.STRESS_SPREAD_MULTIPLIER if stress_multiplier is None else stress_multiplier
+    sctx = st.StressContext(risk=ctx, participation=part, multiplier=mult)
+    stress, stress_positions = st.run_stress(book, rows, sctx)
+    liq, liq_summary = st.liquidity(book, ctx, participation=part, multiplier=mult,
+                                    var_by_scope=_preferred_var(results, book.settings))
+    funding_liq = st.funding_liquidity(ctx.funding, None, book, ctx, rows)
+    return RiskResult(book=book, history=hist, position_risk=position_risk(book), sensitivities=sensitivities(book),
+                      key_rates=key_rate_table(book), credit=credit_table(book), jtd=jtd_table(book),
+                      risk_summary=summary_table(book), var=var_table(book, hist, results=results),
+                      var_components=var_components(book, hist, results=results), stress=stress,
+                      stress_positions=stress_positions, stress_worst=st.stress_worst(stress), liquidity=liq,
+                      liquidity_summary=liq_summary, funding_liquidity=funding_liq, var_results=results,
+                      notes=tuple(_notes(book, hist, results, ctx)))
+
+
+def write_risk(result: RiskResult, out_dir, *, history: bool = False) -> list[Path]:
+    """Write every table of ``result`` as a CSV (``RESULT_FILES``; with ``history`` also ``factor_changes.csv``,
+    ``FACTOR_CHANGE_COLUMNS``) and its notes to ``notes.txt`` in ``out_dir``; the same result gives the same bytes.
+    Returns the paths written."""
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for name in RESULT_FILES:
+        path = out / f"{name}.csv"
+        getattr(result, name).to_csv(path, index=False, date_format="%Y-%m-%d")
+        paths.append(path)
+    if history:
+        path = out / "factor_changes.csv"
+        result.history.frame().to_csv(path, index=False, date_format="%Y-%m-%d")
+        paths.append(path)
+    notes = out / "notes.txt"
+    notes.write_text("".join(f"{n}\n" for n in result.notes), encoding="utf-8")
+    paths.append(notes)
+    return paths

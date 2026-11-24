@@ -1863,6 +1863,159 @@ def _returns(args: argparse.Namespace) -> int:
     return 0 if len(result.positions) else 1  # 1: nothing could be valued
 
 
+def _float_list(text: str, flag: str) -> tuple[float, ...]:
+    try:
+        values = tuple(float(v) for v in text.split(",") if v.strip())
+    except ValueError:
+        raise ValueError(f"{flag} {text!r}: give numbers separated by commas") from None
+    if not values:
+        raise ValueError(f"{flag} is empty")
+    return values
+
+
+def _risk(args: argparse.Namespace) -> int:
+    """Sensitivities, VaR and ES, stress and liquidity of one day's positions (``risk.run_risk``)."""
+    from cr_strat import risk as risk_layer
+    try:
+        credit_flags = ("corporate_terms", "corporate_schedule", "corporate_options", "corporate_amortisation",
+                        "corporate_steps", "ratings", "corporate_floating", "benchmark_fixings", "frb_terms")
+        for flag in ("positions", "nav", "funding", "swaps", "trades", "master", "issuers", "stock", "nss_params",
+                     "ois_quotes", "fixings", "marks", "factor_history", "residual_history", "scenarios", "adv",
+                     "seniority", "costs", "haircuts", "liquidity", "strategy_books", "proxies", "spread_matrix",
+                     *credit_flags, "frb_coupons", "tbills"):
+            value = getattr(args, flag)
+            if value and not Path(value).exists():
+                raise FileNotFoundError(f"--{flag.replace('_', '-')}: {value} not found")
+        calendar = mumbai_settlement_calendar()
+        calendar = calendar.lenient() if args.project_calendar else calendar
+        positions = risk_layer.read_positions(args.positions)
+        days = sorted({_date_arg(v, "the positions' date") for v in positions["date"]})
+        day = _date_arg(args.date, "--date") if args.date else (days[-1] if days else None)
+        if day is None or day not in days:
+            print(f"nothing to compute: no position on {day} in {args.positions}")
+            return 1
+        valuation = return_engine.EngineSettings(access=return_engine.access_policy(args.access)).valuation_time
+        as_of = _time_arg(args.as_of, "--as-of") if args.as_of else dt.datetime.combine(day, valuation)
+        fixings, times = ({}, None)
+        if args.fixings:
+            series, times = _read_fixings(args.fixings)
+            fixings = {d: float(v) for d, v in series.items()}
+        nss = return_engine.read_nss_params(args.nss_params, calendar=calendar) if args.nss_params else {}
+        credit = {flag: getattr(args, flag) for flag in credit_flags if getattr(args, flag)}
+        market = return_engine.MarketData(
+            marks=_read_csv_text(args.marks) if args.marks else None, curves=nss,
+            ois_curves=_ois_curves_from_quotes(args.ois_quotes, calendar) if args.ois_quotes else {},
+            fixings=fixings, fixing_times=times, haircuts=read_haircuts(args.haircuts) if args.haircuts else None,
+            liquidity=_read_csv_text(args.liquidity) if args.liquidity else None,
+            master=read_master(args.master) if args.master else None,
+            residual_history=_read_csv_text(args.residual_history) if args.residual_history else None,
+            stock=_read_csv_text(args.stock) if args.stock else None,
+            frb_coupons=None if args.no_frb_coupons else (args.frb_coupons or FRB_COUPONS_CSV),
+            tbills=_tbill_results(args, store=None), **credit)
+        reference = dict(return_engine.DEFAULT_REFERENCE)
+        for item in args.reference or []:
+            kind, sep, curve_name = item.partition("=")
+            if not sep or not kind.strip() or not curve_name.strip():
+                raise ValueError(f"--reference {item!r}: give KIND=CURVE, e.g. sdl=sdl")
+            reference[kind.strip().lower()] = curve_name.strip()
+        settings = return_engine.EngineSettings(
+            access=return_engine.access_policy(args.access), project_calendar=args.project_calendar,
+            frb_allow_fewer=args.frb_allow_fewer, frb_allow_stale=args.frb_allow_stale,
+            attribution=return_engine.AttributionSettings(reference=tuple(sorted(reference.items()))),
+            costs=read_cost_table(overrides=args.costs) if args.costs else None)
+        defaults = risk_layer.RiskSettings()
+        risk_settings = risk_layer.RiskSettings(
+            key_tenors=_float_list(args.key_tenors, "--key-tenors") if args.key_tenors else defaults.key_tenors,
+            ois_key_tenors=_float_list(args.ois_key_tenors, "--ois-key-tenors") if args.ois_key_tenors
+            else defaults.ois_key_tenors,
+            var_alpha=args.var_alpha, es_alpha=args.es_alpha, window=args.window, min_obs=args.min_obs,
+            min_obs_hard=args.min_obs_hard, gap_rule=args.gap_rule, max_gap_days=args.max_gap_days,
+            quantile_rule=args.quantile_rule, ewma_lambda=args.ewma_lambda, cov_method=args.cov_method,
+            horizons=tuple(int(h) for h in _float_list(args.horizons, "--horizons")), horizon_rule=args.horizon_rule,
+            scenario_shape=args.scenario_shape, delta_gamma=args.delta_gamma, jtd_states=args.jtd_states,
+            residual=args.residual, sdl_mode=args.sdl_mode,
+            methods=tuple(m.strip() for m in args.methods.split(",") if m.strip()),
+            windows=("current", "stressed") if args.stressed else ("current",),
+            liquidity_horizons=args.liquidity_horizons)
+        ctx = risk_layer.RiskContext(
+            market=market, settings=settings, risk=risk_settings, as_of=as_of,
+            swaps=_read_csv_text(args.swaps) if args.swaps else None,
+            terms=_read_csv_text(args.trades) if args.trades else None,
+            issuers=_read_csv_text(args.issuers) if args.issuers else None,
+            strategy_books=_read_csv_text(args.strategy_books) if args.strategy_books else None,
+            factor_history=_read_csv_text(args.factor_history) if args.factor_history else None,
+            proxies=_read_csv_text(args.proxies) if args.proxies else None,
+            adv=_read_csv_text(args.adv) if args.adv else None,
+            seniority=_read_csv_text(args.seniority) if args.seniority else None, nss_table=nss or None,
+            nav=_read_csv_text(args.nav) if args.nav else None,
+            funding=_read_csv_text(args.funding) if args.funding else None,
+            spread_matrix=_read_csv_text(args.spread_matrix) if args.spread_matrix else None)
+        from cr_strat import stress as stress_layer
+        if args.no_default_scenarios and not args.scenarios:
+            raise ValueError("--no-default-scenarios needs --scenarios (your own table)")
+        if args.no_default_scenarios:
+            scenarios = stress_layer.read_scenarios(args.scenarios, as_of=as_of)
+        else:
+            scenarios = stress_layer.read_scenarios(as_of=as_of, extend=args.scenarios)
+        result = risk_layer.run_risk(positions, ctx, day=day, scenarios=scenarios, participation=args.participation,
+                                     stress_multiplier=args.stress_multiplier)
+        written = risk_layer.write_risk(result, Path(args.out_dir), history=args.write_history)
+        if args.var_history:
+            history = risk_layer.append_var_history(args.var_history, result.var)
+            Path(args.var_history).parent.mkdir(parents=True, exist_ok=True)
+            history.to_csv(args.var_history, index=False)
+            written.append(Path(args.var_history))
+    except (ValueError, TypeError, OSError, KeyError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    for path in written:
+        print(f"wrote {path}")
+    fund = result.var[(result.var["scope_type"] == "fund") & (result.var["window"] == "current")
+                      & (result.var["alpha_var"] == risk_settings.var_alpha)]
+    for rec in fund.to_dict("records"):
+        print(f"fund {rec['method']} {rec['horizon_days']}d: VaR {rec['alpha_var']:.1%} Rs {rec['var']:,.2f}, "
+              f"ES {rec['alpha_es']:.1%} Rs {rec['es']:,.2f} ({rec['status']}, {rec['n_obs']} obs, coverage "
+              f"{rec['coverage']:.4f})")
+    worst = result.stress_worst[result.stress_worst["scope_type"] == "fund"]
+    for rec in worst.to_dict("records"):
+        print(f"fund worst {rec['family']}: {rec['scenario_id']} Rs {rec['pnl']:,.2f}")
+    for note in result.notes:
+        if not note.startswith("UNVERIFIED"):
+            print(f"note: {note}")
+    print(f"note: {sum(n.startswith('UNVERIFIED') for n in result.notes)} UNVERIFIED conventions listed in notes.txt")
+    return 0
+
+
+def _var_backtest(args: argparse.Namespace) -> int:
+    """The VaR history against the next day's P&L: exceptions, Kupiec, Christoffersen, traffic light."""
+    from cr_strat import risk as risk_layer
+    try:
+        for flag in ("var_history", "nav", "attribution"):
+            value = getattr(args, flag)
+            if value and not Path(value).exists():
+                raise FileNotFoundError(f"--{flag.replace('_', '-')}: {value} not found")
+        calendar = mumbai_settlement_calendar()
+        calendar = calendar.lenient() if args.project_calendar else calendar
+        detail, summary = risk_layer.backtest(
+            _read_csv_text(args.var_history), _read_csv_text(args.nav),
+            _read_csv_text(args.attribution) if args.attribution else None, alpha=args.alpha, window=args.window,
+            method=args.method, calendar=calendar, end=_date_arg(args.end, "--end") if args.end else None)
+        out = Path(args.out_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        detail.to_csv(out / "backtest.csv", index=False, date_format="%Y-%m-%d")
+        summary.to_csv(out / "backtest_summary.csv", index=False, date_format="%Y-%m-%d")
+    except (ValueError, TypeError, OSError, KeyError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(f"wrote {out / 'backtest.csv'}")
+    print(f"wrote {out / 'backtest_summary.csv'}")
+    for rec in summary.to_dict("records"):
+        print(f"{rec['scope_type']} {rec['scope']} {rec['method']}: {rec['exceptions']} exception(s) in "
+              f"{rec['observations']} (expected {rec['expected']:.2f}), Kupiec p {rec['kupiec_p']:.4f}, "
+              f"Christoffersen p {rec['christoffersen_p']:.4f}, zone {rec['zone']}")
+    return 0 if len(summary) else 1
+
+
 def _corporate_table_args(p: argparse.ArgumentParser, *, terms_help: str, required: bool = False) -> None:
     """The corporate terms table and its schedule, options and amortisation tables (``corporates``' readers)."""
     p.add_argument("--terms", required=required, help=terms_help)
@@ -2383,6 +2536,96 @@ def main(argv: list[str] | None = None) -> int:
                    help="take the 182-day T-bill results for FRB coupons from --store's tbill_result table")
     p.add_argument("--out-dir", required=True)
     p.set_defaults(func=_returns)
+
+    p = sub.add_parser("risk", help="sensitivities, VaR and ES, stress and liquidity of one day's positions from "
+                                    "cr-strat returns (docs/risk.md)")
+    p.add_argument("--positions", required=True, help="positions.csv of cr-strat returns (returns.POSITION_COLUMNS)")
+    p.add_argument("--nav", help="nav.csv of cr-strat returns: NAV by book, for percentages and the cash")
+    p.add_argument("--funding", help="funding.csv of cr-strat returns: the night's borrowing (presets that borrow)")
+    p.add_argument("--date", help="the positions' day, YYYY-MM-DD (default: the last in --positions)")
+    p.add_argument("--as-of", help="the time everything is known at (default: the day at the valuation time, 20:00)")
+    p.add_argument("--swaps", help="the OIS trades of the run (SWAP_TRADE_COLUMNS): the terms of the OIS rows")
+    p.add_argument("--trades", help="the bond trades of the run (TRADE_COLUMNS): terms the master lacks")
+    p.add_argument("--master", help="security master CSV filling kind, coupon and dates by ISIN")
+    p.add_argument("--issuers", help="issuer table kept by you (risk.ISSUER_COLUMNS: group, sector, seniority)")
+    p.add_argument("--strategy-books", help="book to strategy map (book, strategy, effective_from)")
+    p.add_argument("--stock", help="outstanding stock (isin, date, outstanding_cr), as cr-strat outstanding writes it")
+    p.add_argument("--nss-params", help="NSS curves CSV with public_from (curve-fit --nss-params): today's curve and "
+                                        "the history the VaR reads")
+    p.add_argument("--ois-quotes", help="OIS quotes CSV (date, tenor, rate_pct, overnight_pct, public_from)")
+    p.add_argument("--fixings", help="overnight MIBOR CSV (date, rate_pct, optional public_from)")
+    p.add_argument("--marks", help="the engine's marks (MARK_COLUMNS): volume_cr for the ADV")
+    p.add_argument("--factor-history", help="your factor levels (risk.FACTOR_HISTORY_COLUMNS: corp:, cd:, "
+                                            "sdl_spread:, frb_dm:, tbill182, with public_from)")
+    p.add_argument("--residual-history", help="curvefit residual history (with --residual: resid:<isin> factors)")
+    p.add_argument("--proxies", help="proxy table (factor, proxy, scale, source) for factors without history")
+    p.add_argument("--scenarios", help="your scenario table (stress.SCENARIO_COLUMNS): replaces or adds by "
+                                       "scenario_id to the shipped one")
+    p.add_argument("--no-default-scenarios", action="store_true", help="use only --scenarios")
+    p.add_argument("--adv", help="your average daily volumes (stress.ADV_COLUMNS)")
+    p.add_argument("--seniority", help="seniority by ISIN (isin, seniority, source)")
+    p.add_argument("--spread-matrix", help="peer spread matrix (credit_spreads.read_spread_matrix) for migrations")
+    p.add_argument("--costs", help="your cost table, overriding the defaults (costs.COST_COLUMNS)")
+    p.add_argument("--haircuts", help="haircut table kept by you (funding.read_haircuts)")
+    p.add_argument("--liquidity", help="CCIL liquidity classes kept by you (effective_date, isin, liquidity)")
+    p.add_argument("--access", required=True, choices=sorted(return_engine.ACCESS_PRESETS),
+                   help="the fund's access preset (a question for counsel; no default)")
+    p.add_argument("--methods", default="hs_sensitivity,hs_full,parametric",
+                   help="VaR methods, comma-separated (hs_sensitivity, hs_full, parametric)")
+    p.add_argument("--horizons", default="1,10", help="VaR horizons in days, comma-separated (default 1,10)")
+    p.add_argument("--window", type=int, default=250, help="observations of the current window (default 250)")
+    p.add_argument("--min-obs", type=int, default=250, help="fewer observations: flagged short_history")
+    p.add_argument("--min-obs-hard", type=int, default=60, help="fewer observations: refused (UNVERIFIED 60)")
+    p.add_argument("--var-alpha", type=float, default=0.99)
+    p.add_argument("--es-alpha", type=float, default=0.975)
+    p.add_argument("--stressed", action="store_true", help="also the stressed ES (MAR33.6) of the historical methods")
+    p.add_argument("--liquidity-horizons", action="store_true", help="also the MAR33.4 liquidity-horizon ES")
+    p.add_argument("--key-tenors", help="key tenors in years, comma-separated (default 0.25,...,50; UNVERIFIED)")
+    p.add_argument("--ois-key-tenors", help="OIS key tenors in years (default 0.25,...,10, to the curve's end)")
+    p.add_argument("--quantile-rule", choices=("ceil", "floor_plus_one", "interpolate"), default="ceil")
+    p.add_argument("--gap-rule", choices=("scale", "drop", "raise"), default="scale")
+    p.add_argument("--max-gap-days", type=int, default=5)
+    p.add_argument("--ewma-lambda", type=float, default=0.94)
+    p.add_argument("--cov-method", choices=("ewma", "sample"), default="ewma")
+    p.add_argument("--horizon-rule", choices=("overlapping", "sqrt_time"), default="overlapping")
+    p.add_argument("--scenario-shape", choices=("key_rates", "full_curve"), default="key_rates")
+    p.add_argument("--delta-gamma", action="store_true", help="the sensitivity method adds convexity")
+    p.add_argument("--jtd-states", action="store_true", help="give SDLs a jump-to-default too")
+    p.add_argument("--residual", choices=("in_fit", "loo"), help="resid:<isin> factors from --residual-history")
+    p.add_argument("--sdl-mode", choices=("spread", "own_curve"), default="spread")
+    p.add_argument("--participation", type=float, default=0.20, help="share of a day's volume sold (UNVERIFIED 20%%)")
+    p.add_argument("--stress-multiplier", type=float, default=3.0, help="stressed half spreads (UNVERIFIED 3 times)")
+    p.add_argument("--reference", action="append", metavar="KIND=CURVE",
+                   help="the reference curve of a kind, as cr-strat returns (e.g. sdl=sdl, corporate=ois)")
+    p.add_argument("--project-calendar", action="store_true",
+                   help="treat weekdays of years without a holiday list (2027 on) as business days")
+    p.add_argument("--corporate-terms", help="corporate_terms.csv (corporates)")
+    p.add_argument("--corporate-schedule", help="corporate_schedule.csv")
+    p.add_argument("--corporate-options", help="corporate_options.csv")
+    p.add_argument("--corporate-amortisation", help="corporate_amortisation.csv")
+    p.add_argument("--corporate-steps", help="rating-linked coupon steps (corporates.read_step_rules)")
+    p.add_argument("--ratings", help="rating actions (agency, rating, public_from, isin or issuer_id): ratings as "
+                                     "known at --as-of")
+    p.add_argument("--corporate-floating", help="frb_corp bonds' benchmark terms (floating.read_floating_terms)")
+    p.add_argument("--benchmark-fixings", help="their benchmark fixings (floating.read_fixings)")
+    _frb_args(p, store=False)
+    p.add_argument("--var-history", help="the VaR history CSV to update with today's rows (risk.VAR_HISTORY_COLUMNS)")
+    p.add_argument("--write-history", action="store_true", help="also write factor_changes.csv (the factor history)")
+    p.add_argument("--out-dir", required=True)
+    p.set_defaults(func=_risk)
+
+    p = sub.add_parser("var-backtest", help="back-test a VaR history against the next day's P&L: exceptions, Kupiec, "
+                                            "Christoffersen, the Basel traffic light")
+    p.add_argument("--var-history", required=True, help="the VaR history (cr-strat risk --var-history)")
+    p.add_argument("--nav", required=True, help="nav.csv of cr-strat returns (the actual P&L)")
+    p.add_argument("--attribution", help="attribution.csv of cr-strat returns (the hypothetical P&L)")
+    p.add_argument("--method", help="one VaR method (default: each)")
+    p.add_argument("--alpha", type=float, default=0.99)
+    p.add_argument("--window", type=int, default=250)
+    p.add_argument("--end", help="the last P&L date counted, YYYY-MM-DD")
+    p.add_argument("--project-calendar", action="store_true")
+    p.add_argument("--out-dir", required=True)
+    p.set_defaults(func=_var_backtest)
 
     p = sub.add_parser("rbi-releases", help="auctions, liquidity operations, money-market rates and calendars from "
                                             "saved RBI pages and RSS feeds")
