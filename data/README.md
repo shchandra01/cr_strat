@@ -137,6 +137,30 @@ from what your clearing member gives you. FBIL's MIBOR and MIBOR-OIS need a
 subscription before they are kept as a history
 ([`docs/rates_data_sources.md`](../docs/rates_data_sources.md)).
 
+## Risk inputs: `cr-strat risk` and `cr-strat var-backtest`
+
+`cr-strat risk` reads the return engine's own outputs (`positions.csv`, `nav.csv`, `funding.csv` of
+`cr-strat returns`), the market files the engine reads (`--nss-params` with `public_from`: today's curve and the
+history the VaR reads; `--ois-quotes`, `--fixings`, `--marks` with `volume_cr`; the corporate and FRB tables above)
+and tables you keep. Every table is read as of `--as-of`: a row public later is left out. Layouts, units and what
+each number means: [`docs/risk.md`](../docs/risk.md).
+
+| File (kept by you) | Read by | Main columns |
+|---|---|---|
+| Issuers | `risk --issuers` | `issuer_id`, `name`, `group_id`, `group_name`, `sector` (FRTB's names: `financials`, `basic_materials_energy_industrials`, `consumer_transport`, `technology_telecoms`, `health_care_utilities`, `covered`; any other counts as FRTB's `other`, its largest weight, in `FRTB_CSR`), `seniority` (`senior`, `subordinated`, `covered`), `effective_from`, `effective_to`, `source` |
+| Book to strategy | `risk --strategy-books` | `book`, `strategy`, `effective_from` (default: each book its own strategy) |
+| Seniority by ISIN | `risk --seniority` | `isin`, `seniority`, `source` (else the issuer's, else the terms' tier, else senior) |
+| Factor levels | `risk --factor-history` | `date`, `factor` (`corp:<rating bucket>:<tenor bucket>`, `cd:<tenor bucket>`, `sdl_spread:<tenor bucket>`, `frb_dm:<isin>`, `tbill182`, `resid:<isin>`), `value`, `unit` (`bp` or `pct`), `public_from`, `source` (a source naming `coarse` flags the factor's VaR) |
+| Proxies | `risk --proxies` | `factor` (one without enough history), `proxy` (one with it), `scale`, `source` |
+| Average daily volumes | `risk --adv` | `date`, `isin` (or blank with `kind` and `liquidity` for a class), `adv_cr` (Rs crore a day), `public_from`, `source` |
+| Peer spread matrix | `risk --spread-matrix` | `credit_spreads.read_spread_matrix`'s layout: `rating_bucket` (optionally `instrument_class`, `sector`, `tenor_bucket`), `tenor_years`, `spread_bp`: the spreads a rating migration moves to (else the rating ladder's step) |
+| Scenarios | `risk --scenarios` (with `--no-default-scenarios`: yours only) | `stress.SCENARIO_COLUMNS`: `scenario_id`, `name`, `family`, `component`, `selector`, `shape`, `size_bp`, `tenor_years`, `multiplier`, `horizon_days`, `floor_pct`, `available_from`, `effective_from`, `source`, `status`, `notes`; a row replaces the shipped scenario of the same id (`src/cr_strat/data/stress_scenarios.csv`) |
+| VaR history | written by `risk --var-history`, read by `var-backtest --var-history` | `risk.VAR_HISTORY_COLUMNS`: one row per day, scope, method, horizon and level |
+
+`var-backtest` also reads the engine's `nav.csv` (the actual P&L) and `attribution.csv` (the hypothetical P&L).
+Spread and curve histories come from licensed prices (the exchanges, agency valuations, CCIL's NDS-OM data): keep
+them under their terms; the free auction table is only a coarse stand-in ([`docs/risk.md`](../docs/risk.md)).
+
 ## Corporate bond and FRB terms: `cr-strat corp-price`, `frb-price` and the commands that use them
 
 Typed in by you from term sheets or, for listed ISINs from 18 Aug 2025,

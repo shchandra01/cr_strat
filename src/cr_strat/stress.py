@@ -996,7 +996,8 @@ def _alm(positions: Sequence[rk.RiskPosition], days_of: Mapping, borrowed: float
             else:
                 inflow[key] += -p.units * p.dirty
             continue
-        key = bucket(math.ceil(days_of.get((p.book, p.isin), math.inf)))
+        days = days_of.get((p.book, p.isin), math.inf)
+        key = bucket(math.ceil(days)) if math.isfinite(days) else None  # no ADV: not saleable within 30 days
         if key is not None and p.face > 0:
             inflow[key] += p.market_value
     out, cum_in, cum_out = {}, 0.0, 0.0

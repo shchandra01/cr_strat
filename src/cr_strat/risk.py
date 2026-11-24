@@ -66,8 +66,9 @@ cumulative binomial probability, 95% and 99.99%; MAR32's multipliers at exactly 
 back-testing and multipliers, MAR33 ES, liquidity horizons and the stressed window, MAR99 the zones for other sample
 sizes; J.P. Morgan/Reuters, RiskMetrics Technical Document, 4th ed. (1996), sec. 5.3, for lambda 0.94 and 550
 observations; Kupiec (J. Derivatives, 1995) and Christoffersen (International Economic Review, 1998) for the tests;
-Acerbi and Tasche (J. Banking & Finance, 2002) for the ES of a finite sample. The conventions marked UNVERIFIED in the constants above and in ``UNVERIFIED_RULES`` (listed
-in every run's ``notes.txt``) are choices for the fund to confirm or change, all settable in ``RiskSettings``.
+Acerbi and Tasche (J. Banking & Finance, 2002) for the ES of a finite sample. The conventions marked UNVERIFIED in
+the constants above and in ``UNVERIFIED_RULES`` (listed in every run's ``notes.txt``) are choices for the fund to
+confirm or change, all settable in ``RiskSettings``; docs/risk.md explains every number.
 
 **Limits.** Tested on synthetic books and the specification's vectors only: no history of real fitted curves or
 spreads has been run through it (the free demo uses the auction table's coarse cut-off yields). Callable bonds are

@@ -274,6 +274,56 @@ def test_a_corporate_bond_on_the_gsec_curve_has_a_cs01_on_its_rating_tenor_facto
     assert set(fund["key"]) == {"AA:3-5y", "AA+:5-10y"}
 
 
+def test_every_aggregation_sums_to_its_total_on_a_mixed_book():
+    d, s = date(2026, 11, 20), date(2026, 11, 23)
+    curve = fx.nss(s)
+    sdl = FixedRateBond(7.61, date(2030, 11, 18), SDL)
+    master = pd.DataFrame([*fx.MASTER.to_dict("records"),
+                           {"isin": "SDL2030", "kind": "sdl", "coupon_pct": 7.61, "maturity_date": "2030-11-18",
+                            "state_code": "MH"}])
+    issuers = pd.DataFrame([{"issuer_id": "ISS1", "group_id": "GRP1", "sector": "financials",
+                             "effective_from": "2020-01-01"},
+                            {"issuer_id": "ISS2", "group_id": "GRP1", "sector": "consumer_transport",
+                             "effective_from": "2020-01-01"}])
+    market = rt.MarketData(corporate_terms=pd.DataFrame(NCD_TERMS), master=master,
+                           curves={"gsec": {d: rt.CurveEntry(curve, fx.at(d))}})
+    ctx = rk.RiskContext(market=market, settings=rt.EngineSettings(access=rt.ACCESS_PRESETS["nbfc_non_pd"]),
+                         risk=rk.RiskSettings(), as_of=datetime(2026, 11, 20, 20), issuers=issuers,
+                         nav=pd.DataFrame([{"date": d, "book": "b", "nav": 2e9}, {"date": d, "book": "c", "nav": 2e8}]))
+    rows = [fx.bond_row(fx.GS2036, "GS2036", "gsec", 1e9, d, s, fx.on_curve_yield(fx.GS2036, curve, s)),
+            fx.bond_row(sdl, "SDL2030", "sdl", 2e8, d, s, fx.on_curve_yield(sdl, curve, s, 0.006)), *_ncd_rows()]
+    book = rk.risk_book(pd.DataFrame(rows).sample(frac=1.0, random_state=3), ctx)
+    summary = rk.summary_table(book)
+    fund = summary[summary["scope_type"] == "fund"]
+    total = fund[fund["dimension"] == "total"].iloc[0]
+    want = {"kind": {"gsec", "sdl", "corporate"}, "issuer": {"GOI", "STATE:MH", "ISS1", "ISS2"},
+            "group": {"GOI", "STATE:MH", "GRP1"}, "sector": {"sovereign", "local_government", "financials",
+                                                            "consumer_transport"},
+            "rating_bucket": {"sovereign", "AA", "AA+"}, "tenor_bucket": {"3-5y", "5-10y"}}
+    for dimension, keys in want.items():
+        part = fund[fund["dimension"] == dimension]
+        assert set(part["key"]) == keys, dimension
+        for col in ("positions", "face", "market_value", "dv01_yield", "dv01_curve", "convexity_curve"):
+            assert part[col].sum() == pytest.approx(total[col], rel=1e-12), (dimension, col)
+    assert total["positions"] == 4 and total["pct_nav"] == pytest.approx(total["market_value"] / 2.2e9 * 100)
+    books = summary[(summary["scope_type"] == "book") & (summary["dimension"] == "total")]
+    assert books["dv01_yield"].sum() == pytest.approx(total["dv01_yield"], rel=1e-12)
+    credit = rk.credit_table(book)
+    cf = credit[credit["scope_type"] == "fund"]
+    ncds = [p for p in book.positions if p.kind == "corporate"]
+    for dimension in rk.CREDIT_DIMENSIONS:
+        part = cf[cf["dimension"] == dimension]
+        assert part["cs01"].sum() == pytest.approx(sum(p.cs01 for p in ncds), rel=1e-12), dimension
+        assert part["jtd"].sum() == pytest.approx(7.70e7 + 4.80e7, rel=1e-12) and part["positions"].sum() == 2
+    assert list(cf[cf["dimension"] == "group"]["key"]) == ["GRP1"]
+    keys = rk.key_rate_table(book)
+    kf = keys[(keys["scope_type"] == "fund") & (keys["curve"] == "gsec")]
+    assert kf["krd"].sum() == pytest.approx(total["dv01_curve"], rel=1e-12)  # every position on the G-sec curve
+    assert kf["krd_years"].sum() == pytest.approx(total["dv01_curve"] / (2.2e9 * 1e-4), rel=1e-12)
+    jtd = rk.jtd_table(book)
+    assert set(jtd[jtd["scope_type"] == "fund"]["issuer_id"]) == {"ISS1", "ISS2"}  # no JTD for GoI or SDLs
+
+
 # ---------------------------------------------------------------- the engine's positions and the tables
 
 

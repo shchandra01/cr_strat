@@ -23,7 +23,8 @@ Four parts, as of 19 Nov 2026:
   open market and liquidity operation, calendar, MPC meeting and macro release with the time from which it was public,
   DV01 supply by week and bucket against the stock, auction metrics, forward supply, and event windows for S4.
 
-Each part says how, on which conventions, and what was and was not checked. Everything was built and tested on
+The risk of the engine's books (sensitivities, VaR and ES, back-tests, stress tests and liquidity) is in
+[`risk.md`](risk.md). Each part says how, on which conventions, and what was and was not checked. Everything was built and tested on
 synthetic data with known answers (bonds priced off known curves, OIS quotes from known curves and step paths),
 and run on free data only (auction cut-offs, the RBI store's money-market rates); no secondary-market price, OIS
 quote or MIBOR fixing has been used. Bond cash flows, accrued interest, yields and risk come from
@@ -1557,7 +1558,8 @@ its allotment is a choice not yet made (the master and the auction lines stay cu
 
 **Not built:** inflation-indexed bonds (no pricer: refused); CSA, clearing
 margin or charges on OIS; security-wise repo rates (a short's special rate is the user's, constant over the short); a
-key-rate DV01 table (DV01 is by tenor bucket); funding lines allocated to positions (they stay at book level;
+key-rate DV01 table in the engine (its DV01 is by tenor bucket; key rates, VaR and ES, stress tests and liquidity of
+its books are `cr-strat risk`'s: [`risk.md`](risk.md)); funding lines allocated to positions (they stay at book level;
 `positions.funded` shares the borrowing for reporting); the tradable universe from the issuance ledger (a strategy's
 own job); an auction's own allotment beyond the limits above (pro rata at the cut-off, the 5% non-competitive pool, a
 bid's own yield, T-bill non-competitive bids); a back-test from the command line (`cr-strat returns` runs a list of

@@ -388,3 +388,15 @@ def test_stress_worst_picks_the_lowest_total_of_each_family():
     assert fund.loc["rates_irrbb", "scenario_id"] == "IRRBB_INR_PARALLEL_UP"
     assert fund.loc["rates_irrbb", "pnl"] == pytest.approx(-22_56_44_876.70, abs=0.01)
     assert list(worst.columns) == list(st.STRESS_WORST_COLUMNS)
+
+
+def test_a_bond_without_a_volume_is_not_slotted_in_the_alm_buckets():
+    from dataclasses import replace
+    book, ctx = _corp_book("AA", "financials")  # no stock, no ADV table: no ADV at all
+    detail, summary = st.liquidity(book, ctx)
+    assert math.isinf(detail["days_to_liquidate"].iloc[0]) and "no_adv" in detail["flags"].iloc[0]
+    assert summary[summary["scope_type"] == "fund"]["share_20d"].isna().all()  # no NAV given
+    ctx = replace(ctx, funding=_funding_frame(date(2026, 11, 20), 5e7, book="c"),
+                  nav=pd.DataFrame([{"date": date(2026, 11, 20), "book": "c", "nav": 2e8, "cash": 1e7}]))
+    out = st.funding_liquidity(None, None, book, ctx, st.read_scenarios()).set_index("scenario_id")
+    assert out.loc["", "alm_1_7d"] == pytest.approx((5e7 - 1e7) / 5e7)  # the bond is no inflow within 30 days

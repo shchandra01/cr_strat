@@ -49,7 +49,8 @@ Sources and their terms: [`docs/data_sources.md`](docs/data_sources.md) for this
 pipeline, [`docs/rates_data_sources.md`](docs/rates_data_sources.md) for the rates
 and credit strategies. Day counts, calendars and price-yield rules for G-secs,
 SDLs, STRIPS, T-bills, CP and CD, listed corporate bonds (NCDs) and floating-rate
-bonds, with their sources: [`docs/conventions.md`](docs/conventions.md).
+bonds, with their sources: [`docs/conventions.md`](docs/conventions.md). Risk of the return engine's books
+(sensitivities, VaR and ES, stress tests, liquidity): [`docs/risk.md`](docs/risk.md).
 
 ## Quickstart
 
@@ -105,6 +106,12 @@ cr-strat returns --trades data/raw/trades.csv --flows data/raw/flows.csv --marks
     --access nbfc_non_pd --end 2026-12-14 --project-funding --out-dir data/out/returns  # marks are licensed
     # --reference sdl=sdl: SDLs against an SDL curve of --nss-params; --rate-basis calendar_day: repo-carry's basis
     # --corporate-terms data/raw/corporate_terms.csv (and its tables), --tbills-from-store: corporate bonds, GoI FRBs
+cr-strat risk --positions data/out/returns/positions.csv --nav data/out/returns/nav.csv \
+    --funding data/out/returns/funding.csv --trades data/raw/trades.csv --nss-params data/out/nss_params.csv \
+    --access nbfc_non_pd --date 2026-12-14 --var-history data/out/var_history.csv \
+    --out-dir data/out/risk_20261214     # key rates, CS01, JTD, VaR and ES, stress, liquidity (docs/risk.md)
+cr-strat var-backtest --var-history data/out/var_history.csv --nav data/out/returns/nav.csv \
+    --attribution data/out/returns/attribution.csv --out-dir data/out/backtest   # Kupiec, Christoffersen, zones
 
 cr-strat rbi-releases data/raw/rbi/releases/*.html data/raw/rbi/feeds/*.xml --out-dir data/out/rbi
 cr-strat rbi-store-poll --store data/rbi_store            # one request at most; run it from cron (data/README.md)
@@ -153,6 +160,8 @@ the pressure variable and the price response for each event.
 | `funding` | The RBI store's daily TREPS, market repo, corporate bond repo and call rates as funding tables (dealing days, corridor and quarter-end flags, only rates public and unrevised by a given time), a dated haircut table kept by the user, CCIL's TREPS concentration caps on SDLs and illiquid G-secs (the rule of June 2026, and the earlier one as summarised, UNVERIFIED), and the carry of a repo-funded bond or asset swap, long or short: coupon income, pull to par, repo interest (with a funding spread), the haircut's cost, the OIS legs period by period on the fixings known at that time (corporate bonds on their record-date coupons and principal, also as rows of their terms in `repo-carry`; GoI FRBs on their coupons as known, from the library only); `cr-strat repo-carry` |
 | `costs` | The trading costs of the rates strategies as a dated table (defaults shipped in `src/cr_strat/data/cost_defaults.csv`, each row with its source and status V, P or UNVERIFIED; a user table overrides them): half bid-offer by instrument, CCIL liquidity class and, for corporate bonds, rating bucket, CCIL settlement, repo and TREPS charges, platform, exchange and custody fees, brokerage (a brokered trade needs a rate), GST, stamp duty (debentures 0.0001% on the buyer), the TREPS margin; fills at mid plus or minus the half spread |
 | `returns` | The return engine for the instruments `bonds`, `corporates` and `floating` price (G-secs, SDLs, bills, STRIPS, CP, CD, corporate bonds and GoI FRBs; corporate bonds with the exchange's settlement, record dates and ex-interest accrual, amortisation, calls and puts once their exercise is public, rating steps and `frb_corp` fixings only from when public; FRB coupons only as public, a `coupon_reset` line when a coupon becomes known after it began to accrue): books of bond and OIS trades held from settlement (forwards before it, when-issued trades to the issue date, partial closes, shorts where the access policy allows, redemptions on holidays), valued daily from marks used only from when they were public (stale and model fall-backs flagged), funded overnight in TREPS, market repo or (corporate bonds) corporate bond repo at the RBI store's rates within haircuts, CCIL's caps and the TREPS margin, charged `costs`, with each day's NAV change split into accrual, pull to par, roll-down, curve factors, rich/cheap, convexity, trading, costs, funding and OIS lines that sum to it exactly (an explicit unexplained line); performance and risk; a back-test loop deciding at 20:00 on a snapshot of what was public then (marks, curves, funding, fixings, and through its accessors the event ledger, auctions, the RBI store's tables, macro series, the MPC calendar, the residual history and the master's securities and fixed terms, each cut at that time), with auction bids within RBI's limits; access presets for the fund's legal form, the when-issued and hedging-only rules checked every day; `cr-strat returns` ([`docs/analytics.md`](docs/analytics.md)) |
+| `risk` | Risk of one day's positions of the return engine as known at a time: yield and curve DV01, key-rate DV01s on the fitted G-sec curve (and OIS zero rates and par quotes for swaps) summing to the parallel figure, CS01 on the z-spread, GoI FRB index and margin DV01s, convexity, jump to default with Basel's LGDs, each by position and summed by book, strategy, kind, tenor bucket, key rate, issuer, group, sector and rating bucket; factor histories from the NSS fits and the user's spread levels cut at their public times; historical (sensitivity and full revaluation) and parametric EWMA VaR and ES at 99% and 97.5%, one and ten days, refused or flagged on short or gappy histories, with the stressed ES, the liquidity-horizon ES and Euler components; back-tests against the next day's actual and hypothetical P&L (Kupiec, Christoffersen, the Basel traffic light); `cr-strat risk`, `cr-strat var-backtest` ([`docs/risk.md`](docs/risk.md)) |
+| `stress` | Stress scenarios revalued in full: a shipped table of 37 scenarios with each row's source and status (BCBS's six IRRBB shocks for INR, FRTB's credit spread weights, rating ladders and migrations, FRB index and margin shocks, funding and bid-offer shocks, the 2013, 2018, 2020 and 2022 Indian episodes, each usable only from its end) extended or replaced by the user's; P&L by rates, spread, FRB, funding and liquidity with their interaction; days to liquidate and exit costs, normal and stressed, shares of NAV saleable in 1, 5 and 20 days; funding liquidity and the ALM ratios for a preset that borrows, not applicable for one that cannot ([`docs/risk.md`](docs/risk.md)) |
 | `policy_path` | MPC meeting dates shipped as package data (FY2026-27 with the day each became public, years declared complete, the calendar as known on any day, projection on request), a step model of overnight MIBOR as repo plus a spread, the repo-rate level after each meeting decided after the trade date backed out of one day's OIS quotes, starting from the rate known that day, with what the quotes identify; the MIBOR-repo spread from public rates, repo-rate changes matched to decisions; `cr-strat policy-path` |
 | `htmlparse` | Tables, text and links from saved HTML pages with the standard library: nested tables kept apart, colspan and rowspan expanded; strict number and date cells; firewall-page detection |
 | `rbi_releases` | RBI press releases from saved pages and the RSS feed: GoI, T-bill and SDL auction results, underwriting and switch results, auction announcements. A registry of release types; checks that refuse a release rather than misread it |
@@ -336,9 +345,18 @@ the pressure variable and the price response for each event.
   `unregulated_company`, with no repo, no shorts and OIS for hedging only, since RBI counts any outside liability as
   public funds; `nbfc_non_pd` assumes an RBI-registered NBFC ([`docs/analytics.md`](docs/analytics.md), Which access
   preset fits the fund; a question for counsel).
-  Not built: CSA or margin on OIS, security-wise repo rates, a key-rate DV01 table, the
+  Not built: CSA or margin on OIS, security-wise repo rates, the
   universe from the issuance ledger, an auction's own allotment beyond RBI's bid limits, back-tests from the command
   line, spline curves through the command line (docs/analytics.md lists what each strategy needs before real use).
+  Key-rate DV01s, VaR and stress tests of its books are `cr-strat risk`'s ([`docs/risk.md`](docs/risk.md)).
+- **The risk layer has seen no real history.** `cr-strat risk` is tested on synthetic books and histories with known
+  answers and on the free auction table's coarse cut-off changes only: no licensed curve, spread or OIS history, no
+  stress period. Its VaR needs 250 days of fitted curves with their public times (60 at the least: fewer is refused);
+  credit VaR needs spread histories the fund keeps, else it is incomplete. The scenario sizes marked U (most but
+  BCBS's IRRBB shocks and FRTB's weights) are examples for the fund's own policy, and the conventions marked
+  UNVERIFIED (key tenors, the quantile rule, gap scaling, liquidity participation and spreads, the 0% floor) are
+  listed in every run's `notes.txt`. Callable bonds are valued to maturity; JTD is not netted. Not built: limits,
+  pre-trade checks, allocation, the daily report ([`docs/risk.md`](docs/risk.md)).
 - **The event ledger has seen no price.** Its supply, metrics and windows run on the free auction files and the RBI
   store's four days of Nov 2026; concessions, residual moves and event paths need a licensed price panel and are tested
   on synthetic ones only. It inherits the issuance ledger's gaps (below): no G-sec auctions from 17 Feb 2024 to 3 Apr
